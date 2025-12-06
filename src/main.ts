@@ -86,28 +86,28 @@ infoOverlay.id = 'info';
 document.body.appendChild(infoOverlay);
 
 const defaultSimConfig: SimulationConfig = {
-  gridSize: 28,
-  maxPipeLength: 96,
-  targetPipeCount: 14,
-  growthInterval: 0.18,
+  gridSize: 64,
+  maxPipeLength: 42,
+  targetPipeCount: 10,
+  growthInterval: 1/30,
   turnProbability: 0.35,
   disableTailShrink: false,
 };
 const turnProxy = { turnChance: defaultSimConfig.turnProbability * 100 };
 
 const renderSettings: RenderSettings = {
-  pipeRadius: 0.2,
+  pipeRadius: 0.05,
   tubularSegments: 7,
   radialSegments: 10,
   colorShift: 0.1,
   headLightIntensity: 8,
   headLightRange: 0, // 0 = infinite distance in three.js
-  headLightsEnabled: true,
+  headLightsEnabled: false,
   maxHeadLights: 8,
-  roomRoughness: 0.05,
-  roomMetalness: 1,
+  roomRoughness: 0.25,
+  roomMetalness: 0.75,
   roomReflectivity: 1,
-  roomColor: '#ffffff',
+  roomColor: '#000000',
   showGrid: false,
   pipeMetalness: 0.18,
   pipeRoughness: 0.3,
@@ -226,7 +226,7 @@ let isDragging = false;
 let lastPointerX = 0;
 let lastPointerY = 0;
 let envUpdateTimer = 0;
-const envUpdateInterval = 0.12;
+const envUpdateInterval = 1 / 30; // more frequent cube map updates keep reflections smooth
 
 function onKeyDown(e: KeyboardEvent) {
   if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
