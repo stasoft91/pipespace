@@ -8,6 +8,7 @@ import {
   Color,
   EdgesGeometry,
   AdditiveBlending,
+  PlaneGeometry,
   LineBasicMaterial,
   LineSegments,
   Mesh,
@@ -19,13 +20,10 @@ import {
   SRGBColorSpace,
   TubeGeometry,
   Vector3,
-  CubeCamera,
-  WebGLCubeRenderTarget,
-  HalfFloatType,
-  LinearMipmapLinearFilter,
   Vector2,
   WebGLRenderer,
 } from 'three';
+import { Reflector } from 'three/examples/jsm/objects/Reflector.js';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
@@ -70,6 +68,10 @@ type OrbitSettings = {
 type CameraMode = 'orbit' | 'manual';
 
 const ROOM_PADDING = 20; // gap between grid extents and room walls
+let mirrorInset = 20.01;
+let reflectorResScale = 1;
+let reflectorMaxRes = 4096;
+let mirrorFacesPerFrame = 6; // how many faces update each frame (reduces flicker/load)
 const rand = (min: number, max: number) => Math.random() * (max - min) + min;
 const randInt = (min: number, max: number) => Math.floor(rand(min, max + 1));
 const randBool = (p = 0.5) => Math.random() < p;
@@ -88,7 +90,7 @@ document.body.appendChild(infoOverlay);
 const defaultSimConfig: SimulationConfig = {
   gridSize: 64,
   maxPipeLength: 42,
-  targetPipeCount: 10,
+  targetPipeCount: 64,
   growthInterval: 1/30,
   turnProbability: 1,
   disableTailShrink: false,
@@ -115,18 +117,25 @@ const renderSettings: RenderSettings = {
   glassTransmission: 0.65,
   glassOpacity: 0.35,
   glassIor: 1.2,
-  cornerTension: 2,
+  cornerTension: 0,
   neonEnabled: true,
-  neonStrength: 1.0,
+  neonStrength: 2.0,
   neonSize: 1.0,
   bloomStrength: 2,
   bloomRadius: 1,
   bloomThreshold: 0,
 };
 
+const mirrorGuiSettings = {
+  inset: mirrorInset,
+  resolutionScale: reflectorResScale,
+  maxResolution: reflectorMaxRes,
+  facesPerFrame: mirrorFacesPerFrame,
+};
+
 const orbitSettings: OrbitSettings = {
-  orbitSpeed: 0.22,
-  bobStrength: 0.12,
+  orbitSpeed: 0.42,
+  bobStrength: 0.42,
 };
 
 const cameraControl = {
@@ -155,23 +164,12 @@ renderer.toneMappingExposure = 1.1;
 const scene = new Scene();
 scene.background = new Color('#000000');
 
-const camera = new PerspectiveCamera(100, window.innerWidth / window.innerHeight, 0.1, 500);
+const camera = new PerspectiveCamera(100, window.innerWidth / window.innerHeight, 0.1, 5000);
 scene.add(camera);
-
-const cubeRenderTarget = new WebGLCubeRenderTarget(512, {
-  type: HalfFloatType,
-});
-cubeRenderTarget.texture.generateMipmaps = true;
-cubeRenderTarget.texture.minFilter = LinearMipmapLinearFilter;
-cubeRenderTarget.texture.colorSpace = SRGBColorSpace;
-const cubeCamera = new CubeCamera(0.1, 2000, cubeRenderTarget);
-scene.add(cubeCamera);
-
 
 const room = createRoom(defaultSimConfig.gridSize, renderSettings);
 scene.add(room.mesh);
-room.material.envMap = cubeRenderTarget.texture;
-room.material.envMapIntensity = 1.5;
+let roomMirrors = createRoomMirrors(room.size, renderSettings.roomColor);
 
 let gridLines = createGridOutline(defaultSimConfig.gridSize);
 gridLines.visible = renderSettings.showGrid;
@@ -207,6 +205,34 @@ const state = {
   elapsed: 0,
   fpsSmoothed: 0,
 };
+let frameIndex = 0;
+let mirrorUpdateOffset = 0;
+let mirrorUpdateMask = new Set<number>();
+
+function mirrorTargetSize() {
+  const { innerWidth, innerHeight } = window;
+  const pixelRatio = renderer.getPixelRatio();
+  return {
+    w: Math.min(reflectorMaxRes, innerWidth * pixelRatio * reflectorResScale),
+    h: Math.min(reflectorMaxRes, innerHeight * pixelRatio * reflectorResScale),
+  };
+}
+
+function updateMirrorResolution() {
+  const { w, h } = mirrorTargetSize();
+  roomMirrors.setResolution(w, h);
+}
+
+function updateMirrorMask() {
+  const faces = roomMirrors.faces.length;
+  mirrorUpdateMask = new Set<number>();
+  const count = Math.max(1, Math.min(faces, mirrorFacesPerFrame));
+  for (let i = 0; i < count; i++) {
+    mirrorUpdateMask.add((mirrorUpdateOffset + i) % faces);
+  }
+  mirrorUpdateOffset = (mirrorUpdateOffset + count) % faces;
+  roomMirrors.setUpdateMask(mirrorUpdateMask);
+}
 
 function resize() {
   const { innerWidth, innerHeight } = window;
@@ -215,6 +241,7 @@ function resize() {
   camera.updateProjectionMatrix();
   composer.setSize(innerWidth, innerHeight);
   bloomPass.setSize(innerWidth, innerHeight);
+  updateMirrorResolution();
 }
 
 window.addEventListener('resize', resize);
@@ -225,8 +252,6 @@ const heldKeys = new Set<string>();
 let isDragging = false;
 let lastPointerX = 0;
 let lastPointerY = 0;
-let envUpdateTimer = 0;
-const envUpdateInterval = 1 / 30; // more frequent cube map updates keep reflections smooth
 
 function onKeyDown(e: KeyboardEvent) {
   if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
@@ -282,6 +307,8 @@ function frame(now: number) {
   lastTime = now;
   state.elapsed += dt;
   state.fpsSmoothed = state.fpsSmoothed * 0.9 + (1 / dt) * 0.1;
+  frameIndex++;
+  updateMirrorMask();
 
   if (!state.paused) {
     const allStuck = sim.update(dt);
@@ -320,19 +347,6 @@ function frame(now: number) {
   }
   camera.lookAt(0, 0, 0);
 
-  envUpdateTimer += dt;
-  if (envUpdateTimer >= envUpdateInterval) {
-    envUpdateTimer = 0;
-    const prevRoomVisible = room.mesh.visible;
-    const prevGridVisible = gridLines.visible;
-    room.mesh.visible = false;
-    gridLines.visible = false;
-    cubeCamera.position.set(0, 0, 0);
-    cubeCamera.update(renderer, scene);
-    room.mesh.visible = prevRoomVisible;
-    gridLines.visible = prevGridVisible;
-  }
-
   pipeManager.sync(sim.pipes, renderSettings);
   updateInfo(sim, state);
 
@@ -354,6 +368,7 @@ function setupGui() {
       sim.reset({ gridSize: size });
       pipeManager.resetGridSize(size);
       room.updateSize(size, renderSettings);
+      roomMirrors.update(room.size, renderSettings.roomColor);
       disposeGridLines(gridLines);
       scene.remove(gridLines);
       gridLines = createGridOutline(size);
@@ -396,6 +411,7 @@ function setupGui() {
           sim.reset();
           pipeManager.resetGridSize(sim.config.gridSize);
           room.updateSize(sim.config.gridSize, renderSettings);
+          roomMirrors.update(room.size, renderSettings.roomColor);
           disposeGridLines(gridLines);
           scene.remove(gridLines);
           gridLines = createGridOutline(sim.config.gridSize);
@@ -437,7 +453,7 @@ function setupGui() {
   pipeFolder.add(renderSettings, 'neonEnabled').name('Neon glow').onChange(() => {
     pipeManager.forceGeometryRefresh();
   });
-  pipeFolder.add(renderSettings, 'neonStrength', 0, 2, 0.05).name('Neon intensity').onChange(() => {
+  pipeFolder.add(renderSettings, 'neonStrength', 0, 4, 0.05).name('Neon intensity').onChange(() => {
     pipeManager.forceGeometryRefresh();
   });
   pipeFolder.add(renderSettings, 'neonSize', 0.98, 1.2, 0.005).name('Neon size').onChange(() => {
@@ -466,20 +482,39 @@ function setupGui() {
   lightsFolder.add(renderSettings, 'headLightRange', 0, 999, 0.1).name('Range (0 = inf)');
   lightsFolder.add(renderSettings, 'maxHeadLights', 0, 32, 1).name('Cap');
 
-  const roomFolder = gui.addFolder('Room');
-  roomFolder.add(renderSettings, 'roomRoughness', 0, 1, 0.01).name('Roughness').onChange((v: number) => {
-    room.material.roughness = v;
-  });
-  roomFolder.add(renderSettings, 'roomMetalness', 0, 1, 0.01).name('Metalness').onChange((v: number) => {
-    room.material.metalness = v;
-  });
-  roomFolder.add(renderSettings, 'roomReflectivity', 0, 1, 0.01).name('Reflectivity').onChange((v: number) => {
-    room.material.reflectivity = v;
-  });
-  roomFolder.addColor(renderSettings, 'roomColor').name('Color').onChange((v: string) => {
+  const mirrorFolder = gui.addFolder('Mirrors');
+  mirrorFolder.addColor(renderSettings, 'roomColor').name('Tint').onChange((v: string) => {
     room.material.color.set(v);
+    roomMirrors.update(room.size, v);
   });
-  roomFolder.add(renderSettings, 'showGrid').name('Show grid').onChange((visible: boolean) => {
+  mirrorFolder
+    .add(mirrorGuiSettings, 'inset', 0.01, 20, 0.01)
+    .name('Wall inset')
+    .onChange((v: number) => {
+      mirrorInset = Math.max(0, v);
+      roomMirrors.update(room.size, renderSettings.roomColor);
+    });
+  mirrorFolder
+    .add(mirrorGuiSettings, 'resolutionScale', 0.1, 1, 0.01)
+    .name('Resolution scale')
+    .onChange((v: number) => {
+      reflectorResScale = v;
+      updateMirrorResolution();
+    });
+  mirrorFolder
+    .add(mirrorGuiSettings, 'maxResolution', 256, 4096, 64)
+    .name('Max resolution')
+    .onChange((v: number) => {
+      reflectorMaxRes = v;
+      updateMirrorResolution();
+    });
+  mirrorFolder
+    .add(mirrorGuiSettings, 'facesPerFrame', 1, 6, 1)
+    .name('Faces per frame')
+    .onChange((v: number) => {
+      mirrorFacesPerFrame = Math.max(1, Math.floor(v));
+    });
+  mirrorFolder.add(renderSettings, 'showGrid').name('Show grid').onChange((visible: boolean) => {
     gridLines.visible = visible;
   });
 
@@ -612,6 +647,7 @@ function randomizeAll() {
   room.material.roughness = renderSettings.roomRoughness;
   room.material.metalness = renderSettings.roomMetalness;
   room.material.reflectivity = renderSettings.roomReflectivity;
+  roomMirrors.update(room.size, renderSettings.roomColor);
   rebuildGrid(defaultSimConfig.gridSize);
 
   updatePipeMaterial(renderSettings);
@@ -622,7 +658,6 @@ function randomizeAll() {
 
   gridLines.visible = renderSettings.showGrid;
   state.paused = false;
-  envUpdateTimer = envUpdateInterval;
 
   gridSizeController?.setValue(defaultSimConfig.gridSize);
   targetCountController?.setValue(defaultSimConfig.targetPipeCount);
@@ -649,7 +684,7 @@ function createRoom(
     metalness: settings.roomMetalness,
     reflectivity: settings.roomReflectivity,
     clearcoat: 1,
-    clearcoatRoughness: 0.05,
+    clearcoatRoughness: 0,
     side: BackSide,
   });
   const mesh = new Mesh(geom, mat);
@@ -671,6 +706,102 @@ function createRoom(
       return currentSize;
     },
     updateSize,
+  };
+}
+
+type RoomMirrors = {
+  faces: Reflector[];
+  update: (size: number, color: string) => void;
+  setResolution: (width: number, height: number) => void;
+  setUpdateMask: (mask: Set<number>) => void;
+  dispose: () => void;
+};
+
+function createRoomMirrors(size: number, color: string): RoomMirrors {
+  let updateMask = new Set<number>();
+
+  // keep a live reference so onBeforeRender can hide peer mirrors during capture
+  let faces: Reflector[] = [];
+
+  const makeFace = (
+    position: Vector3,
+    rotate: (mirror: Reflector) => void,
+    faceSize: number,
+    faceColor: string,
+    faceIndex: number
+  ) => {
+    const mirror = new Reflector(new PlaneGeometry(faceSize, faceSize), {
+      clipBias: 0,
+      textureWidth: Math.min(reflectorMaxRes, window.innerWidth * renderer.getPixelRatio() * reflectorResScale),
+      textureHeight: Math.min(reflectorMaxRes, window.innerHeight * renderer.getPixelRatio() * reflectorResScale),
+      color: faceColor,
+    });
+    const baseRender = mirror.onBeforeRender.bind(mirror);
+    mirror.onBeforeRender = (...args) => {
+      if (!updateMask.has(faceIndex)) return;
+       // prevent mirrors from reflecting each other; hide peers during this capture
+      const prevVisible = faces.map((f) => f.visible);
+      faces.forEach((f, i) => {
+        if (i !== faceIndex) f.visible = false;
+      });
+      baseRender(...args);
+      faces.forEach((f, i) => {
+        f.visible = prevVisible[i];
+      });
+    };
+    mirror.position.copy(position);
+    rotate(mirror);
+    return mirror;
+  };
+
+  const buildMirrors = (nextSize: number, nextColor: string) => {
+    const half = nextSize / 2 - mirrorInset;
+    return [
+      makeFace(new Vector3(half, 0, 0), (m) => m.rotateY(-Math.PI / 2), nextSize, nextColor, 0), // +X
+      makeFace(new Vector3(-half, 0, 0), (m) => m.rotateY(Math.PI / 2), nextSize, nextColor, 1), // -X
+      makeFace(new Vector3(0, half, 0), (m) => m.rotateX(Math.PI / 2), nextSize, nextColor, 2), // +Y
+      makeFace(new Vector3(0, -half, 0), (m) => m.rotateX(-Math.PI / 2), nextSize, nextColor, 3), // -Y
+      makeFace(new Vector3(0, 0, half), (m) => m.rotateY(Math.PI), nextSize, nextColor, 4), // +Z
+      makeFace(new Vector3(0, 0, -half), (m) => m.rotateY(0), nextSize, nextColor, 5), // -Z
+    ];
+  };
+
+  faces = buildMirrors(size, color);
+  const addFaces = (list: Reflector[]) => list.forEach((f) => scene.add(f));
+  const disposeFaces = (list: Reflector[]) => {
+    for (const face of list) {
+      scene.remove(face);
+      const target = (face as unknown as { getRenderTarget?: () => any }).getRenderTarget?.();
+      target?.dispose?.();
+      face.geometry.dispose();
+      (face.material as any)?.dispose?.();
+    }
+  };
+
+  addFaces(faces);
+
+  return {
+    get faces() {
+      return faces;
+    },
+    update: (nextSize: number, nextColor: string) => {
+      disposeFaces(faces);
+      faces = buildMirrors(nextSize, nextColor);
+      addFaces(faces);
+    },
+    setResolution: (width: number, height: number) => {
+      for (const face of faces) {
+        const target = (face as unknown as { getRenderTarget?: () => { setSize: (w: number, h: number) => void } }).getRenderTarget?.();
+        target?.setSize(width, height);
+      }
+    },
+    setUpdateMask: (mask: Set<number>) => {
+      updateMask = mask;
+    },
+    dispose: () => {
+      disposeFaces(faces);
+      faces = [];
+    },
   };
 }
 
@@ -888,7 +1019,7 @@ function updatePipeMaterial(settings: RenderSettings) {
   pipeMaterial.opacity = settings.glassEnabled ? settings.glassOpacity : 1;
   pipeMaterial.ior = settings.glassEnabled ? settings.glassIor : 1.0;
   pipeMaterial.thickness = settings.glassEnabled ? 0.4 : 0;
-  pipeMaterial.envMap = cubeRenderTarget.texture;
-  pipeMaterial.envMapIntensity = settings.glassEnabled ? 1.6 : 1.2;
+  pipeMaterial.envMap = null;
+  pipeMaterial.envMapIntensity = 0;
   pipeMaterial.needsUpdate = true;
 }
