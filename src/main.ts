@@ -90,7 +90,7 @@ const defaultSimConfig: SimulationConfig = {
   maxPipeLength: 42,
   targetPipeCount: 10,
   growthInterval: 1/30,
-  turnProbability: 0.35,
+  turnProbability: 1,
   disableTailShrink: false,
 };
 const turnProxy = { turnChance: defaultSimConfig.turnProbability * 100 };
@@ -115,13 +115,13 @@ const renderSettings: RenderSettings = {
   glassTransmission: 0.65,
   glassOpacity: 0.35,
   glassIor: 1.2,
-  cornerTension: 0.25,
+  cornerTension: 2,
   neonEnabled: true,
   neonStrength: 1.0,
   neonSize: 1.0,
-  bloomStrength: 0.8,
-  bloomRadius: 0.35,
-  bloomThreshold: 0.2,
+  bloomStrength: 2,
+  bloomRadius: 1,
+  bloomThreshold: 0,
 };
 
 const orbitSettings: OrbitSettings = {
@@ -153,7 +153,7 @@ renderer.toneMapping = ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.1;
 
 const scene = new Scene();
-scene.background = new Color('#020408');
+scene.background = new Color('#000000');
 
 const camera = new PerspectiveCamera(100, window.innerWidth / window.innerHeight, 0.1, 500);
 scene.add(camera);
@@ -429,7 +429,7 @@ function setupGui() {
     pipeMaterial.metalness = v;
   });
   pipeFolder
-    .add(renderSettings, 'cornerTension', 0, 1, 0.01)
+    .add(renderSettings, 'cornerTension', 0, 3, 0.01)
     .name('Corner smoothness')
     .onChange(() => {
       pipeManager.forceGeometryRefresh();
