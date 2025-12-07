@@ -24,3 +24,4 @@ npm run dev
 - Grid occupancy prevents overlaps; pipes that get stuck enter a dying state and retract.
 - Tube meshes are rebuilt when paths change, using Catmull–Rom curves for smooth bends and per-vertex color gradients for subtle hue shifts.
 
+

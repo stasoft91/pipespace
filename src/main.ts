@@ -40,6 +40,10 @@ type RenderSettings = {
   headLightRange: number;
   headLightsEnabled: boolean;
   maxHeadLights: number;
+  backLightEnabled: boolean;
+  backLightIntensity: number;
+  backLightRange: number;
+  backLightColor: string;
   roomRoughness: number;
   roomMetalness: number;
   roomReflectivity: number;
@@ -65,13 +69,24 @@ type OrbitSettings = {
   bobStrength: number;
 };
 
-type CameraMode = 'orbit' | 'manual';
+type CameraMode = 'orbit' | 'manual' | 'rail';
 
-const ROOM_PADDING = 20; // gap between grid extents and room walls
-let mirrorInset = 20.01;
+let roomPadding = 20; // gap between grid extents and room walls
+const roomGuiSettings = {
+  wallGap: roomPadding,
+};
+let mirrorInset = 15;
 let reflectorResScale = 1;
 let reflectorMaxRes = 4096;
 let mirrorFacesPerFrame = 6; // how many faces update each frame (reduces flicker/load)
+let mirrorEnabled = true;
+let mirrorBlurAmount = 0;
+let mirrorChromaticShift = 0;
+let mirrorWarpStrength = 0;
+let mirrorWarpSpeed = 1.5;
+let mirrorRefractionOffset = 0;
+let mirrorNoiseStrength = 0;
+const BASE_REFLECTOR_SHADER = (Reflector as any).ReflectorShader as any;
 const rand = (min: number, max: number) => Math.random() * (max - min) + min;
 const randInt = (min: number, max: number) => Math.floor(rand(min, max + 1));
 const randBool = (p = 0.5) => Math.random() < p;
@@ -101,11 +116,15 @@ const renderSettings: RenderSettings = {
   pipeRadius: 0.05,
   tubularSegments: 7,
   radialSegments: 10,
-  colorShift: 0.1,
+  colorShift: 0,
   headLightIntensity: 8,
   headLightRange: 0, // 0 = infinite distance in three.js
   headLightsEnabled: false,
   maxHeadLights: 8,
+  backLightEnabled: false,
+  backLightIntensity: 1200,
+  backLightRange: 0,
+  backLightColor: '#ffffff',
   roomRoughness: 0.25,
   roomMetalness: 0.75,
   roomReflectivity: 1,
@@ -131,11 +150,43 @@ const mirrorGuiSettings = {
   resolutionScale: reflectorResScale,
   maxResolution: reflectorMaxRes,
   facesPerFrame: mirrorFacesPerFrame,
+  enabled: mirrorEnabled,
+  blur: mirrorBlurAmount,
+  chromaticShift: mirrorChromaticShift,
+  warpStrength: mirrorWarpStrength,
+  warpSpeed: mirrorWarpSpeed,
+  refractionOffset: mirrorRefractionOffset,
+  noiseStrength: mirrorNoiseStrength,
 };
 
 const orbitSettings: OrbitSettings = {
   orbitSpeed: 0.42,
   bobStrength: 0.42,
+};
+
+const railSettings = {
+  speed: 0.22,
+  radialFactor: 0.78,
+  verticalWave: 0.26,
+  noise: 0.16,
+  posSmoothing: 0.35,
+  targetSmoothing: 0.42,
+  velocitySmoothing: 0.22,
+  lookAhead: 0.18,
+  manualNudge: 0.14,
+  rollStrength: 0.28,
+};
+
+const railState = {
+  phase: 0,
+  desiredPos: new Vector3(),
+  currentPos: new Vector3(),
+  lastPos: new Vector3(),
+  velocity: new Vector3(),
+  rawVelocity: new Vector3(),
+  desiredTarget: new Vector3(),
+  smoothedTarget: new Vector3(),
+  roll: 0,
 };
 
 const cameraControl = {
@@ -166,6 +217,9 @@ scene.background = new Color('#000000');
 
 const camera = new PerspectiveCamera(100, window.innerWidth / window.innerHeight, 0.1, 5000);
 scene.add(camera);
+const cameraLight = new PointLight(renderSettings.backLightColor, renderSettings.backLightIntensity, renderSettings.backLightRange, 2);
+cameraLight.visible = renderSettings.backLightEnabled;
+scene.add(cameraLight);
 
 const room = createRoom(defaultSimConfig.gridSize, renderSettings);
 scene.add(room.mesh);
@@ -186,6 +240,22 @@ let maxLengthController: any;
 let growthIntervalController: any;
 let turnController: any;
 let tailShrinkController: any;
+let cameraModeController: any;
+let orbitSpeedController: any;
+let orbitBobController: any;
+let mouseSensController: any;
+let turnSpeedController: any;
+let pitchSpeedController: any;
+let railSpeedController: any;
+let railRadiusController: any;
+let railWaveController: any;
+let railNoiseController: any;
+let railPosSmoothController: any;
+let railVelSmoothController: any;
+let railTargetSmoothController: any;
+let railLookAheadController: any;
+let railNudgeController: any;
+let railRollController: any;
 
 const composer = new EffectComposer(renderer);
 const renderPass = new RenderPass(scene, camera);
@@ -208,6 +278,12 @@ const state = {
 let frameIndex = 0;
 let mirrorUpdateOffset = 0;
 let mirrorUpdateMask = new Set<number>();
+const ORIGIN = new Vector3(0, 0, 0);
+const CAMERA_MARGIN = 1.5;
+const CAMERA_WALL_EPS = 0.6;
+const tempCamPos = new Vector3();
+const camDir = new Vector3();
+const behind = new Vector3();
 
 function mirrorTargetSize() {
   const { innerWidth, innerHeight } = window;
@@ -221,6 +297,22 @@ function mirrorTargetSize() {
 function updateMirrorResolution() {
   const { w, h } = mirrorTargetSize();
   roomMirrors.setResolution(w, h);
+}
+
+function updateMirrorBlur() {
+  roomMirrors.setBlur(mirrorBlurAmount);
+}
+
+function updateMirrorDistortionUniforms(time: number) {
+  roomMirrors.setDistortion({
+    blur: mirrorBlurAmount,
+    chromaticShift: mirrorChromaticShift,
+    warpStrength: mirrorWarpStrength,
+    warpSpeed: mirrorWarpSpeed,
+    refractionOffset: mirrorRefractionOffset,
+    noiseStrength: mirrorNoiseStrength,
+    time,
+  });
 }
 
 function updateMirrorMask() {
@@ -303,12 +395,14 @@ window.addEventListener('pointerleave', onPointerUp);
 window.addEventListener('wheel', onWheel, { passive: true });
 
 function frame(now: number) {
-  const dt = (now - lastTime) / 1000;
+  const dtRaw = (now - lastTime) / 1000;
+  const dt = Math.min(dtRaw, 0.05); // clamp to avoid large physics jumps on tab switches
   lastTime = now;
   state.elapsed += dt;
   state.fpsSmoothed = state.fpsSmoothed * 0.9 + (1 / dt) * 0.1;
   frameIndex++;
   updateMirrorMask();
+  updateMirrorDistortionUniforms(state.elapsed);
 
   if (!state.paused) {
     const allStuck = sim.update(dt);
@@ -317,15 +411,61 @@ function frame(now: number) {
     }
   }
 
-  const orbitRadius = room.size * 0.4;
+  const orbitRadius = room.size * 0.5;
+  let lookTarget = ORIGIN;
+  let roll = 0;
   if (cameraControl.mode === 'orbit') {
     const orbitPhase = now * 0.001 * orbitSettings.orbitSpeed;
     const bob = Math.sin(now * 0.0007) * orbitSettings.bobStrength;
-    camera.position.set(
+    tempCamPos.set(
       Math.cos(orbitPhase) * orbitRadius,
       orbitRadius * 0.22 + bob * orbitRadius,
       Math.sin(orbitPhase) * orbitRadius
     );
+    keepOrbitInside(tempCamPos);
+    softenCameraToRoom(tempCamPos);
+    camera.position.copy(tempCamPos);
+  } else if (cameraControl.mode === 'rail') {
+    railState.phase += dt * railSettings.speed * Math.PI * 2;
+    const t = railState.phase;
+    const baseRadius = orbitRadius * railSettings.radialFactor;
+    const wobble = Math.sin(t * 1.8) * railSettings.verticalWave * orbitRadius;
+    railState.desiredPos.set(
+      Math.sin(t * 1.3) * baseRadius + Math.sin(t * 2.6) * railSettings.noise * orbitRadius,
+      orbitRadius * 0.2 + wobble,
+      Math.cos(t * 0.9 + Math.PI * 0.25) * baseRadius + Math.cos(t * 2.3) * railSettings.noise * orbitRadius
+    );
+    const nudgeX =
+      (Number(heldKeys.has('ArrowRight')) - Number(heldKeys.has('ArrowLeft'))) * railSettings.manualNudge * orbitRadius;
+    const nudgeZ =
+      (Number(heldKeys.has('ArrowDown')) - Number(heldKeys.has('ArrowUp'))) * railSettings.manualNudge * orbitRadius;
+    railState.desiredPos.x += nudgeX;
+    railState.desiredPos.z += nudgeZ;
+
+    const posAlpha = 1 - Math.exp(-dt / Math.max(railSettings.posSmoothing, 0.001));
+    railState.currentPos.lerp(railState.desiredPos, clamp(posAlpha, 0, 1));
+    clampCameraToRoom(railState.currentPos);
+
+    railState.rawVelocity.copy(railState.currentPos).sub(railState.lastPos).divideScalar(Math.max(dt, 0.0001));
+    const velAlpha = 1 - Math.exp(-dt / Math.max(railSettings.velocitySmoothing, 0.001));
+    railState.velocity.lerp(railState.rawVelocity, clamp(velAlpha, 0, 1));
+    railState.lastPos.copy(railState.currentPos);
+
+    railState.desiredTarget.set(0, 0, 0);
+    railState.desiredTarget.addScaledVector(railState.velocity, railSettings.lookAhead * 0.02 * orbitRadius);
+    railState.desiredTarget.y *= 0.6;
+    const targetBlend =
+      1 - Math.exp(-dt / Math.max(railSettings.targetSmoothing * (railSettings.lookAhead + 0.2), 0.001));
+    railState.smoothedTarget.lerp(railState.desiredTarget, targetBlend);
+
+    camera.position.copy(railState.currentPos);
+    lookTarget = railState.smoothedTarget;
+
+    const lean = Math.min(1, railState.velocity.length() / Math.max(1, orbitRadius * 1.5));
+    const targetRoll = (Math.sin(t * 0.9 + Math.PI * 0.3) * 0.6 + lean * 0.4) * railSettings.rollStrength;
+    const rollAlpha = 1 - Math.exp(-dt / 0.3);
+    railState.roll += (targetRoll - railState.roll) * rollAlpha;
+    roll = railState.roll;
   } else {
     if (cameraControl.distance === 0) {
       cameraControl.distance = orbitRadius;
@@ -345,7 +485,19 @@ function frame(now: number) {
     const dist = cameraControl.distance;
     camera.position.set(cy * cp * dist, sp * dist, sy * cp * dist);
   }
-  camera.lookAt(0, 0, 0);
+  clampCameraToRoom(camera.position);
+  camera.up.set(0, 1, 0);
+  camera.lookAt(lookTarget);
+  if (roll !== 0) {
+    camera.rotateZ(roll);
+  }
+  camera.getWorldDirection(camDir);
+  behind.copy(camDir).multiplyScalar(-0.6);
+  cameraLight.position.copy(camera.position).add(behind);
+  cameraLight.intensity = renderSettings.backLightIntensity;
+  cameraLight.distance = renderSettings.backLightRange;
+  cameraLight.visible = renderSettings.backLightEnabled;
+  (cameraLight.color as Color).set(renderSettings.backLightColor);
 
   pipeManager.sync(sim.pipes, renderSettings);
   updateInfo(sim, state);
@@ -437,7 +589,7 @@ function setupGui() {
   pipeFolder.add(renderSettings, 'pipeRadius', 0.05, 0.6, 0.01).name('Radius');
   pipeFolder.add(renderSettings, 'tubularSegments', 3, 20, 1).name('Smoothness');
   pipeFolder.add(renderSettings, 'radialSegments', 4, 32, 1).name('Radial slices');
-  pipeFolder.add(renderSettings, 'colorShift', 0, 0.6, 0.01).name('Color shift');
+  pipeFolder.add(renderSettings, 'colorShift', 0, 0.4, 0.005).name('Color shift');
   pipeFolder.add(renderSettings, 'pipeRoughness', 0, 1, 0.01).name('Roughness').onChange((v: number) => {
     pipeMaterial.roughness = v;
   });
@@ -488,6 +640,22 @@ function setupGui() {
     roomMirrors.update(room.size, v);
   });
   mirrorFolder
+    .add(roomGuiSettings, 'wallGap', 0, 70, 0.5)
+    .name('Wall gap')
+    .onChange((v: number) => {
+      roomPadding = Math.min(70, Math.max(0, v));
+      roomGuiSettings.wallGap = roomPadding;
+      room.updateSize(sim.config.gridSize, renderSettings);
+      roomMirrors.update(room.size, renderSettings.roomColor);
+      clampCameraToRoom(camera.position);
+      const { min, max } = cameraDistanceBounds();
+      cameraControl.distance = clamp(cameraControl.distance, min, max);
+    });
+  mirrorFolder.add(mirrorGuiSettings, 'enabled').name('Enabled').onChange((v: boolean) => {
+    mirrorEnabled = v;
+    roomMirrors.setEnabled(v);
+  });
+  mirrorFolder
     .add(mirrorGuiSettings, 'inset', 0.01, 20, 0.01)
     .name('Wall inset')
     .onChange((v: number) => {
@@ -502,6 +670,43 @@ function setupGui() {
       updateMirrorResolution();
     });
   mirrorFolder
+    .add(mirrorGuiSettings, 'blur', 0, 1, 0.01)
+    .name('Radial blur')
+    .onChange((v: number) => {
+      mirrorBlurAmount = Math.max(0, Math.min(1, v));
+      updateMirrorBlur();
+    });
+  mirrorFolder
+    .add(mirrorGuiSettings, 'chromaticShift', 0, 0, 0.0005)
+    .name('Chromatic shift')
+    .onChange((v: number) => {
+      mirrorChromaticShift = Math.max(0, v);
+    });
+  mirrorFolder
+    .add(mirrorGuiSettings, 'warpStrength', 0, 0.05, 0.0005)
+    .name('Warp strength')
+    .onChange((v: number) => {
+      mirrorWarpStrength = Math.max(0, v);
+    });
+  mirrorFolder
+    .add(mirrorGuiSettings, 'warpSpeed', 0, 5, 0.05)
+    .name('Warp speed')
+    .onChange((v: number) => {
+      mirrorWarpSpeed = Math.max(0, v);
+    });
+  mirrorFolder
+    .add(mirrorGuiSettings, 'refractionOffset', -0.05, 0.05, 0.0005)
+    .name('Refraction offset')
+    .onChange((v: number) => {
+      mirrorRefractionOffset = v;
+    });
+  mirrorFolder
+    .add(mirrorGuiSettings, 'noiseStrength', 0, 0.01, 0.0002)
+    .name('Noise shimmer')
+    .onChange((v: number) => {
+      mirrorNoiseStrength = Math.max(0, v);
+    });
+  mirrorFolder
     .add(mirrorGuiSettings, 'maxResolution', 256, 4096, 64)
     .name('Max resolution')
     .onChange((v: number) => {
@@ -514,25 +719,75 @@ function setupGui() {
     .onChange((v: number) => {
       mirrorFacesPerFrame = Math.max(1, Math.floor(v));
     });
+  updateMirrorBlur();
   mirrorFolder.add(renderSettings, 'showGrid').name('Show grid').onChange((visible: boolean) => {
     gridLines.visible = visible;
   });
 
+  const camLightFolder = gui.addFolder('Camera light');
+  camLightFolder.add(renderSettings, 'backLightEnabled').name('Enabled');
+  camLightFolder
+    .add(renderSettings, 'backLightIntensity', 0, 50, 0.1)
+    .name('Intensity')
+    .onChange((v: number) => {
+      cameraLight.intensity = v;
+    });
+  camLightFolder
+    .add(renderSettings, 'backLightRange', 0, 420, 1)
+    .name('Range (0=inf)')
+    .onChange((v: number) => {
+      cameraLight.distance = v;
+    });
+  camLightFolder.addColor(renderSettings, 'backLightColor').name('Color').onChange((v: string) => {
+    cameraLight.color.set(v);
+  });
+
   const cameraFolder = gui.addFolder('Camera');
-  cameraFolder
-    .add(cameraControl, 'mode', ['orbit', 'manual'])
-    .name('Mode (orbit/manual)')
+  cameraModeController = cameraFolder
+    .add(cameraControl, 'mode', ['orbit', 'manual', 'rail'])
+    .name('Mode (orbit/manual/rail)')
     .onChange((mode: CameraMode) => {
       cameraControl.mode = mode;
       if (mode === 'manual' && cameraControl.distance === 0) {
         cameraControl.distance = room.size * 0.48;
       }
+      if (mode === 'rail') {
+        railState.phase = 0;
+        railState.currentPos.copy(camera.position);
+        railState.lastPos.copy(camera.position);
+        railState.smoothedTarget.set(0, 0, 0);
+      }
     });
-  cameraFolder.add(orbitSettings, 'orbitSpeed', 0.02, 0.6, 0.01).name('Orbit speed');
-  cameraFolder.add(orbitSettings, 'bobStrength', 0, 0.8, 0.01).name('Bob strength');
-  cameraFolder.add(cameraControl, 'mouseSensitivity', 0.001, 0.02, 0.0005).name('Mouse sens');
-  cameraFolder.add(cameraControl, 'turnSpeed', 0.2, 4, 0.1).name('Turn speed');
-  cameraFolder.add(cameraControl, 'pitchSpeed', 0.2, 4, 0.1).name('Pitch speed');
+  orbitSpeedController = cameraFolder.add(orbitSettings, 'orbitSpeed', 0.02, 0.6, 0.01).name('Orbit speed');
+  orbitBobController = cameraFolder.add(orbitSettings, 'bobStrength', 0, 0.8, 0.01).name('Bob strength');
+  mouseSensController = cameraFolder.add(cameraControl, 'mouseSensitivity', 0.001, 0.02, 0.0005).name('Mouse sens');
+  turnSpeedController = cameraFolder.add(cameraControl, 'turnSpeed', 0.2, 4, 0.1).name('Turn speed');
+  pitchSpeedController = cameraFolder.add(cameraControl, 'pitchSpeed', 0.2, 4, 0.1).name('Pitch speed');
+  const railFolder = cameraFolder.addFolder('Cinematic rail');
+  railSpeedController = railFolder.add(railSettings, 'speed', 0.02, 1.2, 0.01).name('Path speed');
+  railRadiusController = railFolder.add(railSettings, 'radialFactor', 0.2, 1.2, 0.01).name('Radius factor');
+  railWaveController = railFolder.add(railSettings, 'verticalWave', 0, 1, 0.01).name('Vertical wave');
+  railNoiseController = railFolder.add(railSettings, 'noise', 0, 0.8, 0.01).name('Noise');
+  railPosSmoothController = railFolder.add(railSettings, 'posSmoothing', 0.01, 1.5, 0.01).name('Pos smooth (s)');
+  railVelSmoothController = railFolder
+    .add(railSettings, 'velocitySmoothing', 0.01, 1.5, 0.01)
+    .name('Vel smooth (s)');
+  railTargetSmoothController = railFolder
+    .add(railSettings, 'targetSmoothing', 0.01, 1.5, 0.01)
+    .name('Look smooth (s)');
+  railLookAheadController = railFolder.add(railSettings, 'lookAhead', 0, 1, 0.01).name('Look ahead');
+  railNudgeController = railFolder.add(railSettings, 'manualNudge', 0, 0.8, 0.01).name('Arrow nudge');
+  railRollController = railFolder.add(railSettings, 'rollStrength', 0, 1.2, 0.01).name('Roll');
+  cameraFolder
+    .add(
+      {
+        randomize: () => {
+          randomizeCameraSettings();
+        },
+      },
+      'randomize'
+    )
+    .name('Randomize camera');
 
   const postFolder = gui.addFolder('Post FX');
   postFolder.add(renderSettings, 'bloomStrength', 0, 2, 0.01).name('Bloom strength').onChange((v: number) => {
@@ -588,9 +843,103 @@ function rebuildGrid(size: number) {
 
 function cameraDistanceBounds() {
   return {
-    min: Math.max(2, (sim.config.gridSize + ROOM_PADDING) * 0.3),
+    min: Math.max(2, (sim.config.gridSize + roomPadding) * 0.3),
     max: room.size * 0.45,
   };
+}
+
+function cameraBoundsLimit(margin = CAMERA_MARGIN) {
+  const inset = mirrorInset + CAMERA_WALL_EPS;
+  const halfSize = room.size * 0.5;
+  return Math.max(0.5, halfSize - inset - margin);
+}
+
+function clampCameraToRoom(v: Vector3, margin = CAMERA_MARGIN) {
+  const limit = cameraBoundsLimit(margin);
+  v.x = clamp(v.x, -limit, limit);
+  v.y = clamp(v.y, -limit, limit);
+  v.z = clamp(v.z, -limit, limit);
+}
+
+function softLimitAxis(value: number, limit: number, softness = 0.12) {
+  if (!isFinite(value) || limit <= 0) return 0;
+  const abs = Math.abs(value);
+  const safeLimit = Math.max(0.001, limit);
+  const linearZone = safeLimit * (1 - softness);
+  if (abs <= linearZone) return value;
+  const t = (abs - linearZone) / (safeLimit * softness);
+  const eased = 1 - Math.exp(-t * 2); // fast rise, smooth tail
+  const saturated = linearZone + safeLimit * softness * Math.tanh(eased);
+  return Math.sign(value) * saturated;
+}
+
+function softenCameraToRoom(v: Vector3, margin = CAMERA_MARGIN) {
+  const limit = cameraBoundsLimit(margin);
+  v.x = softLimitAxis(v.x, limit);
+  v.y = softLimitAxis(v.y, limit);
+  v.z = softLimitAxis(v.z, limit);
+}
+
+function easeOut(t: number) {
+  return 1 - (1 - t) * (1 - t);
+}
+
+function keepOrbitInside(v: Vector3, margin = CAMERA_MARGIN) {
+  const limit = cameraBoundsLimit(margin);
+  const safe = limit * 0.9;
+  const maxAbs = Math.max(Math.abs(v.x), Math.abs(v.y), Math.abs(v.z));
+  if (maxAbs <= safe || maxAbs < 1e-6) return;
+  const span = Math.max(0.0001, limit - safe);
+  const t = clamp((maxAbs - safe) / span, 0, 1);
+  const scale = 1 - easeOut(t) * (1 - safe / maxAbs);
+  v.multiplyScalar(scale);
+}
+
+function randomizeCameraSettings() {
+  const modes: CameraMode[] = ['orbit', 'manual', 'rail'];
+  const pickedMode = modes[randInt(0, modes.length - 1)];
+
+  orbitSettings.orbitSpeed = rand(0.05, 0.55);
+  orbitSettings.bobStrength = rand(0.04, 0.7);
+
+  cameraControl.mouseSensitivity = rand(0.0012, 0.015);
+  cameraControl.turnSpeed = rand(0.4, 3.2);
+  cameraControl.pitchSpeed = rand(0.4, 3.2);
+  cameraControl.yaw = rand(-Math.PI, Math.PI);
+  cameraControl.pitch = clamp(rand(-0.45, 0.45), -Math.PI / 2 + 0.05, Math.PI / 2 - 0.05);
+
+  const { min, max } = cameraDistanceBounds();
+  cameraControl.distance = clamp(rand(min * 0.9, max * 0.85), min, max);
+  cameraControl.mode = pickedMode;
+
+  railSettings.speed = rand(0.05, 0.9);
+  railSettings.radialFactor = rand(0.35, 1.05);
+  railSettings.verticalWave = rand(0.05, 0.9);
+  railSettings.noise = rand(0.02, 0.65);
+  railSettings.posSmoothing = rand(0.05, 1.2);
+  railSettings.velocitySmoothing = rand(0.05, 1.2);
+  railSettings.targetSmoothing = rand(0.05, 1.2);
+  railSettings.lookAhead = rand(0.05, 0.85);
+  railSettings.manualNudge = rand(0.02, 0.7);
+  railSettings.rollStrength = rand(0.05, 1.0);
+
+  cameraModeController?.setValue(pickedMode);
+  orbitSpeedController?.setValue(orbitSettings.orbitSpeed);
+  orbitBobController?.setValue(orbitSettings.bobStrength);
+  mouseSensController?.setValue(cameraControl.mouseSensitivity);
+  turnSpeedController?.setValue(cameraControl.turnSpeed);
+  pitchSpeedController?.setValue(cameraControl.pitchSpeed);
+
+  railSpeedController?.setValue(railSettings.speed);
+  railRadiusController?.setValue(railSettings.radialFactor);
+  railWaveController?.setValue(railSettings.verticalWave);
+  railNoiseController?.setValue(railSettings.noise);
+  railPosSmoothController?.setValue(railSettings.posSmoothing);
+  railVelSmoothController?.setValue(railSettings.velocitySmoothing);
+  railTargetSmoothController?.setValue(railSettings.targetSmoothing);
+  railLookAheadController?.setValue(railSettings.lookAhead);
+  railNudgeController?.setValue(railSettings.manualNudge);
+  railRollController?.setValue(railSettings.rollStrength);
 }
 
 function clamp(v: number, min: number, max: number) {
@@ -676,7 +1025,7 @@ function createRoom(
   readonly size: number;
   updateSize: (s: number, rs: RenderSettings) => void;
 } {
-  let currentSize = gridSize + ROOM_PADDING * 2;
+  let currentSize = gridSize + roomPadding * 2;
   const geom = new BoxGeometry(currentSize, currentSize, currentSize);
   const mat = new MeshPhysicalMaterial({
     color: new Color(settings.roomColor),
@@ -690,7 +1039,7 @@ function createRoom(
   const mesh = new Mesh(geom, mat);
 
   const updateSize = (newGridSize: number, rs: RenderSettings) => {
-    currentSize = newGridSize + ROOM_PADDING * 2;
+    currentSize = newGridSize + roomPadding * 2;
     mesh.geometry.dispose();
     mesh.geometry = new BoxGeometry(currentSize, currentSize, currentSize);
     mat.roughness = rs.roomRoughness;
@@ -713,15 +1062,39 @@ type RoomMirrors = {
   faces: Reflector[];
   update: (size: number, color: string) => void;
   setResolution: (width: number, height: number) => void;
+  setBlur: (amount: number) => void;
+  setDistortion: (u: {
+    blur: number;
+    chromaticShift: number;
+    warpStrength: number;
+    warpSpeed: number;
+    refractionOffset: number;
+    noiseStrength: number;
+    time: number;
+  }) => void;
+  setEnabled: (enabled: boolean) => void;
   setUpdateMask: (mask: Set<number>) => void;
   dispose: () => void;
 };
 
 function createRoomMirrors(size: number, color: string): RoomMirrors {
   let updateMask = new Set<number>();
+  let enabled = mirrorEnabled;
 
   // keep a live reference so onBeforeRender can hide peer mirrors during capture
   let faces: Reflector[] = [];
+  const mirrorUniforms = new Map<
+    number,
+    {
+      blurAmount?: { value: number };
+      chromaticShift?: { value: number };
+      warpStrength?: { value: number };
+      warpSpeed?: { value: number };
+      refractionOffset?: { value: number };
+      noiseStrength?: { value: number };
+      time?: { value: number };
+    }
+  >();
 
   const makeFace = (
     position: Vector3,
@@ -730,14 +1103,123 @@ function createRoomMirrors(size: number, color: string): RoomMirrors {
     faceColor: string,
     faceIndex: number
   ) => {
+    const mirrorShader = {
+      ...BASE_REFLECTOR_SHADER,
+      uniforms: {
+        ...BASE_REFLECTOR_SHADER.uniforms,
+        blurAmount: { value: mirrorBlurAmount },
+        chromaticShift: { value: mirrorChromaticShift },
+        warpStrength: { value: mirrorWarpStrength },
+        warpSpeed: { value: mirrorWarpSpeed },
+        refractionOffset: { value: mirrorRefractionOffset },
+        noiseStrength: { value: mirrorNoiseStrength },
+        time: { value: 0 },
+      },
+      fragmentShader: `
+        uniform vec3 color;
+        uniform sampler2D tDiffuse;
+        uniform float blurAmount;
+        uniform float chromaticShift;
+        uniform float warpStrength;
+        uniform float warpSpeed;
+        uniform float refractionOffset;
+        uniform float noiseStrength;
+        uniform float time;
+        varying vec4 vUv;
+
+        #include <logdepthbuf_pars_fragment>
+
+        float blendOverlay( float base, float blend ) {
+          return( base < 0.5 ? ( 2.0 * base * blend ) : ( 1.0 - 2.0 * ( 1.0 - base ) * ( 1.0 - blend ) ) );
+        }
+
+        vec3 blendOverlay( vec3 base, vec3 blend ) {
+          return vec3( blendOverlay( base.r, blend.r ), blendOverlay( base.g, blend.g ), blendOverlay( base.b, blend.b ) );
+        }
+
+        vec3 sampleProj(vec4 proj) {
+          return texture2DProj( tDiffuse, proj ).rgb;
+        }
+
+        void main() {
+          #include <logdepthbuf_fragment>
+          vec4 projUv = vUv;
+          vec2 uv = projUv.xy / projUv.w;
+          vec2 dir = uv - vec2(0.5);
+          float len = length(dir);
+          vec2 dirNorm = len < 1e-4 ? vec2(1.0, 0.0) : dir / len;
+
+          // noise shimmer
+          if (noiseStrength > 0.0) {
+            float n = sin(dot(uv * vec2(1733.1, 927.7), vec2(12.9898, 78.233)) + time * 57.0);
+            vec2 noiseVec = vec2(n, fract(n * 1.2154) - 0.5);
+            uv += noiseVec * noiseStrength;
+          }
+
+          // warp
+          float warp = warpStrength;
+          if (warp > 0.0) {
+            float wobble = sin(len * 24.0 + time * warpSpeed * 6.28318);
+            uv += dirNorm * wobble * warp;
+          }
+
+          // refraction-like offset
+          if (abs(refractionOffset) > 0.0001) {
+            uv += dirNorm * refractionOffset;
+          }
+
+          // reconstruct projective coords after UV shifts
+          vec4 projSample = vec4(uv * projUv.w, projUv.zw);
+
+          // base sample
+          vec3 base = sampleProj(projSample);
+          float blur = clamp(blurAmount, 0.0, 1.0);
+
+          if (blur > 0.0) {
+            float radius = mix(0.0, 0.06, blur); // tune radius
+            vec3 accum = base;
+            float weight = 1.0;
+            const int samples = 5;
+            for (int i = 1; i <= samples; i++) {
+              float t = float(i) / float(samples);
+              vec2 offset = dir * radius * t;
+              vec4 offProj = vec4((uv + offset) * projUv.w, projUv.zw);
+              vec3 s = sampleProj(offProj);
+              float w = 1.0 - t * 0.65;
+              accum += s * w;
+              weight += w;
+            }
+            base = accum / weight;
+          }
+
+          // chromatic shift
+          float shift = chromaticShift;
+          if (shift > 0.0) {
+            vec2 cOff = dirNorm * shift;
+            float r = texture2DProj( tDiffuse, vec4((uv + cOff) * projUv.w, projUv.zw) ).r;
+            float g = texture2DProj( tDiffuse, vec4(uv * projUv.w, projUv.zw) ).g;
+            float b = texture2DProj( tDiffuse, vec4((uv - cOff) * projUv.w, projUv.zw) ).b;
+            base = vec3(r, g, b);
+          }
+
+          gl_FragColor = vec4( blendOverlay( base, color ), 1.0 );
+
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }
+      `,
+    };
+
     const mirror = new Reflector(new PlaneGeometry(faceSize, faceSize), {
       clipBias: 0,
       textureWidth: Math.min(reflectorMaxRes, window.innerWidth * renderer.getPixelRatio() * reflectorResScale),
       textureHeight: Math.min(reflectorMaxRes, window.innerHeight * renderer.getPixelRatio() * reflectorResScale),
       color: faceColor,
+      shader: mirrorShader,
     });
     const baseRender = mirror.onBeforeRender.bind(mirror);
     mirror.onBeforeRender = (...args) => {
+      if (!enabled) return;
       if (!updateMask.has(faceIndex)) return;
        // prevent mirrors from reflecting each other; hide peers during this capture
       const prevVisible = faces.map((f) => f.visible);
@@ -751,6 +1233,7 @@ function createRoomMirrors(size: number, color: string): RoomMirrors {
     };
     mirror.position.copy(position);
     rotate(mirror);
+    mirrorUniforms.set(faceIndex, (mirror.material as any).uniforms ?? {});
     return mirror;
   };
 
@@ -785,15 +1268,69 @@ function createRoomMirrors(size: number, color: string): RoomMirrors {
       return faces;
     },
     update: (nextSize: number, nextColor: string) => {
+      mirrorUniforms.clear();
       disposeFaces(faces);
       faces = buildMirrors(nextSize, nextColor);
       addFaces(faces);
+      // ensure new faces pick up current blur
+      for (const uniforms of mirrorUniforms.values()) {
+        const u = uniforms as {
+          blurAmount?: { value: number };
+          chromaticShift?: { value: number };
+          warpStrength?: { value: number };
+          warpSpeed?: { value: number };
+          refractionOffset?: { value: number };
+          noiseStrength?: { value: number };
+          time?: { value: number };
+        };
+        if (u.blurAmount) u.blurAmount.value = mirrorBlurAmount;
+        if (u.chromaticShift) u.chromaticShift.value = mirrorChromaticShift;
+        if (u.warpStrength) u.warpStrength.value = mirrorWarpStrength;
+        if (u.warpSpeed) u.warpSpeed.value = mirrorWarpSpeed;
+        if (u.refractionOffset) u.refractionOffset.value = mirrorRefractionOffset;
+        if (u.time) u.time.value = state.elapsed;
+        if (u.noiseStrength) u.noiseStrength.value = mirrorNoiseStrength;
+      }
     },
     setResolution: (width: number, height: number) => {
       for (const face of faces) {
         const target = (face as unknown as { getRenderTarget?: () => { setSize: (w: number, h: number) => void } }).getRenderTarget?.();
         target?.setSize(width, height);
       }
+    },
+    setBlur: (amount: number) => {
+      for (const uniforms of mirrorUniforms.values()) {
+        const u = uniforms as { blurAmount?: { value: number } };
+        if (u.blurAmount) u.blurAmount.value = amount;
+      }
+    },
+    setDistortion: (u) => {
+      for (const uniforms of mirrorUniforms.values()) {
+        const target = uniforms as {
+          blurAmount?: { value: number };
+          chromaticShift?: { value: number };
+          warpStrength?: { value: number };
+          warpSpeed?: { value: number };
+          refractionOffset?: { value: number };
+          noiseStrength?: { value: number };
+          time?: { value: number };
+        };
+        if (target.blurAmount) target.blurAmount.value = u.blur;
+        if (target.chromaticShift) target.chromaticShift.value = u.chromaticShift;
+        if (target.warpStrength) target.warpStrength.value = u.warpStrength;
+        if (target.warpSpeed) target.warpSpeed.value = u.warpSpeed;
+        if (target.refractionOffset) target.refractionOffset.value = u.refractionOffset;
+        if (target.noiseStrength) target.noiseStrength.value = u.noiseStrength;
+        if (target.time) target.time.value = u.time;
+      }
+    },
+    setEnabled: (v: boolean) => {
+      enabled = v;
+      faces.forEach((f) => {
+        f.visible = v;
+        f.matrixWorldNeedsUpdate = true;
+      });
+      room.mesh.visible = v;
     },
     setUpdateMask: (mask: Set<number>) => {
       updateMask = mask;
@@ -986,13 +1523,13 @@ function createPipeGeometry(pipe: Pipe, gridSize: number, settings: RenderSettin
 
   const uv = geometry.getAttribute('uv');
   const colors = new Float32Array(geometry.attributes.position.count * 3);
-  const baseColor = new Color().setHSL(pipe.colorSeed, 0.65, 0.58);
   let maxV = -Infinity;
 
   for (let i = 0; i < geometry.attributes.position.count; i++) {
-    const v = uv.getY(i);
-    const c = baseColor.clone();
-    c.offsetHSL(settings.colorShift * (v - 0.5), 0, 0.08 * (v - 0.5));
+    const v = uv.getY(i); // 0..1 along tube length
+    const hue = pipe.colorSeed + settings.colorShift * (v - 0.5);
+    const light = clamp(0.35, 0.9, 0.58 + 0.12 * (v - 0.5));
+    const c = new Color().setHSL(hue - Math.floor(hue), 0.65, light);
     colors[i * 3] = c.r;
     colors[i * 3 + 1] = c.g;
     colors[i * 3 + 2] = c.b;
