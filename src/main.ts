@@ -223,7 +223,8 @@ const camera = new PerspectiveCamera(100, window.innerWidth / window.innerHeight
 scene.add(camera);
 syncPipeVisibilityToMainCamera();
 const cameraLight = new PointLight(renderSettings.backLightColor, renderSettings.backLightIntensity, renderSettings.backLightRange, 2);
-cameraLight.layers.enable(PIPE_LAYER);
+// Restrict the camera light to the pipe layer so it lights pipes but doesn't hit room/mirror surfaces
+cameraLight.layers.set(PIPE_LAYER);
 cameraLight.visible = renderSettings.backLightEnabled;
 scene.add(cameraLight);
 
