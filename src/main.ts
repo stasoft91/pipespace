@@ -288,9 +288,15 @@ let mirrorUpdateMask = new Set<number>();
 const ORIGIN = new Vector3(0, 0, 0);
 const CAMERA_MARGIN = 1.5;
 const CAMERA_WALL_EPS = 0.6;
-const tempCamPos = new Vector3();
 const camDir = new Vector3();
 const behind = new Vector3();
+const orbitState = {
+  phase: 0,
+  swayPhase: Math.random() * Math.PI * 2,
+  targetPos: new Vector3(),
+  smoothedPos: new Vector3(),
+};
+let lastCameraMode: CameraMode = cameraControl.mode;
 
 function mirrorTargetSize() {
   const { innerWidth, innerHeight } = window;
@@ -416,6 +422,7 @@ function frame(now: number) {
   state.elapsed += dt;
   state.fpsSmoothed = state.fpsSmoothed * 0.9 + (1 / dt) * 0.1;
   frameIndex++;
+  const enteringOrbit = cameraControl.mode === 'orbit' && lastCameraMode !== 'orbit';
   updateMirrorMask();
   updateMirrorDistortionUniforms(state.elapsed);
 
@@ -430,16 +437,34 @@ function frame(now: number) {
   let lookTarget = ORIGIN;
   let roll = 0;
   if (cameraControl.mode === 'orbit') {
-    const orbitPhase = now * 0.001 * orbitSettings.orbitSpeed;
-    const bob = Math.sin(now * 0.0007) * orbitSettings.bobStrength;
-    tempCamPos.set(
-      Math.cos(orbitPhase) * orbitRadius,
-      orbitRadius * 0.22 + bob * orbitRadius,
-      Math.sin(orbitPhase) * orbitRadius
+    if (enteringOrbit) {
+      resetOrbitState(camera.position);
+    }
+    const orbitRate = Math.max(0.01, orbitSettings.orbitSpeed);
+    orbitState.phase += dt * orbitRate;
+    orbitState.swayPhase += dt * orbitRate * 0.65;
+
+    const easedPhase = orbitState.phase + Math.sin(orbitState.phase * 0.45) * 0.08;
+    const elliptical = 0.9 + Math.sin(orbitState.swayPhase * 0.5) * 0.08;
+    const radius = orbitRadius * elliptical;
+
+    const bob =
+      Math.sin(orbitState.swayPhase * 1.2 + Math.cos(orbitState.phase) * 0.4) *
+      orbitSettings.bobStrength *
+      orbitRadius *
+      0.35;
+
+    orbitState.targetPos.set(
+      Math.cos(easedPhase) * radius,
+      orbitRadius * 0.22 + bob,
+      Math.sin(easedPhase + Math.sin(orbitState.swayPhase) * 0.05) * radius
     );
-    keepOrbitInside(tempCamPos);
-    softenCameraToRoom(tempCamPos);
-    camera.position.copy(tempCamPos);
+    keepOrbitInside(orbitState.targetPos);
+    softenCameraToRoom(orbitState.targetPos);
+
+    const smoothAlpha = 1 - Math.exp(-dt / 0.45);
+    orbitState.smoothedPos.lerp(orbitState.targetPos, clamp(smoothAlpha, 0, 1));
+    camera.position.copy(orbitState.smoothedPos);
   } else if (cameraControl.mode === 'rail') {
     railState.phase += dt * railSettings.speed * Math.PI * 2;
     const t = railState.phase;
@@ -517,6 +542,7 @@ function frame(now: number) {
   pipeManager.sync(sim.pipes, renderSettings);
   updateInfo(sim, state);
 
+  lastCameraMode = cameraControl.mode;
   composer.render();
   requestAnimationFrame(frame);
 }
@@ -853,6 +879,13 @@ function rebuildGrid(size: number) {
   gridLines = createGridOutline(size);
   gridLines.visible = renderSettings.showGrid;
   scene.add(gridLines);
+}
+
+function resetOrbitState(anchor: Vector3 = camera.position) {
+  orbitState.targetPos.copy(anchor);
+  orbitState.smoothedPos.copy(anchor);
+  orbitState.phase = Math.atan2(anchor.z, anchor.x);
+  orbitState.swayPhase = orbitState.phase * 0.35;
 }
 
 function cameraDistanceBounds() {
