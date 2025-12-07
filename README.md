@@ -4,6 +4,8 @@ Browser-based homage to the classic Windows 98 pipes screensaver. Multiple color
 
 ### Quick start
 
+## Try it: https://stasoft91.github.io/pipespace/
+
 ```bash
 npm install
 npm run dev
