@@ -1,14 +1,12 @@
 import './style.css';
 import {
   ACESFilmicToneMapping,
-  BackSide,
   BoxGeometry,
   BufferAttribute,
   CatmullRomCurve3,
   Color,
   EdgesGeometry,
   AdditiveBlending,
-  PlaneGeometry,
   LineBasicMaterial,
   LineSegments,
   Mesh,
@@ -22,6 +20,7 @@ import {
   Vector3,
   Vector2,
   WebGLRenderer,
+  DoubleSide,
 } from 'three';
 import { Reflector } from 'three/examples/jsm/objects/Reflector.js';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
@@ -30,6 +29,8 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import GUI from 'lil-gui';
 import { Pipe, Simulation } from './simulation';
 import type { SimulationConfig, Vec3 } from './simulation';
+import { RasterMirrorSystem, RayMirrorSystem } from './mirrors';
+import type { MirrorReflectionMode, MirrorSystem } from './mirrors';
 
 type RenderSettings = {
   pipeRadius: number;
@@ -70,9 +71,10 @@ type OrbitSettings = {
   bobStrength: number;
 };
 
-type CameraMode = 'orbit' | 'manual' | 'rail';
+type CameraMode = 'wall' | 'orbit' | 'manual' | 'rail';
+type MirrorRenderer = 'raster' | 'ray';
 
-let roomPadding = 0; // gap between grid extents and room walls
+let roomPadding = 15; // gap between grid extents and room walls
 const roomGuiSettings = {
   wallGap: roomPadding,
 };
@@ -80,7 +82,11 @@ let mirrorInset = 0.01;
 let reflectorResScale = 1;
 let reflectorMaxRes = 4096 * 4;
 let mirrorFacesPerFrame = 6; // how many faces update each frame (reduces flicker/load)
+let rayMaxBounces = 3;
 let mirrorEnabled = true;
+let mirrorReflectionMode: MirrorReflectionMode = 'all'; // how mirrors see each other
+let mirrorRenderer: MirrorRenderer = 'ray';
+const RAY_BOUNCE_ATTEN = 0.65;
 let mirrorBlurAmount = 0;
 let mirrorChromaticShift = 0;
 let mirrorWarpStrength = 0;
@@ -102,6 +108,37 @@ document.body.appendChild(canvas);
 const infoOverlay = document.createElement('div');
 infoOverlay.id = 'info';
 document.body.appendChild(infoOverlay);
+
+const recordingOverlay = document.createElement('div');
+recordingOverlay.id = 'recording-progress';
+Object.assign(recordingOverlay.style, {
+  position: 'fixed',
+  left: '50%',
+  top: '18px',
+  transform: 'translateX(-50%)',
+  padding: '6px 10px',
+  background: 'rgba(0, 0, 0, 0.7)',
+  color: '#e7f2ff',
+  fontFamily: 'monospace',
+  fontSize: '12px',
+  border: '1px solid rgba(255,255,255,0.2)',
+  borderRadius: '6px',
+  pointerEvents: 'none',
+  zIndex: '9999',
+  display: 'none',
+});
+document.body.appendChild(recordingOverlay);
+
+function setRecordingProgress(fraction: number | null, label: string) {
+  if (fraction === null) {
+    recordingOverlay.style.display = 'none';
+    return;
+  }
+  const clamped = clamp(fraction, 0, 1);
+  const pct = Math.round(clamped * 100);
+  recordingOverlay.textContent = `${label} ${pct}%`;
+  recordingOverlay.style.display = 'block';
+}
 
 const defaultSimConfig: SimulationConfig = {
   gridSize: 64,
@@ -131,7 +168,7 @@ const renderSettings: RenderSettings = {
   roomReflectivity: 1,
   roomColor: '#ffffff',
   showGrid: false,
-  hidePipesInMainCamera: false,
+  hidePipesInMainCamera: true,
   pipeMetalness: 0.18,
   pipeRoughness: 0.3,
   glassEnabled: false,
@@ -153,6 +190,9 @@ const mirrorGuiSettings = {
   maxResolution: reflectorMaxRes,
   facesPerFrame: mirrorFacesPerFrame,
   enabled: mirrorEnabled,
+  renderer: mirrorRenderer,
+  rayBounces: rayMaxBounces,
+  reflectionMode: mirrorReflectionMode,
   blur: mirrorBlurAmount,
   chromaticShift: mirrorChromaticShift,
   warpStrength: mirrorWarpStrength,
@@ -192,7 +232,8 @@ const railState = {
 };
 
 const cameraControl = {
-  mode: 'orbit' as CameraMode,
+  mode: 'wall' as CameraMode,
+  wallFace: 4, // +Z
   yaw: 0,
   pitch: 0.2,
   distance: 0,
@@ -230,7 +271,55 @@ scene.add(cameraLight);
 
 const room = createRoom(defaultSimConfig.gridSize, renderSettings);
 scene.add(room.mesh);
-let roomMirrors = createRoomMirrors(room.size, renderSettings.roomColor);
+function createMirrorSystem(kind: MirrorRenderer): MirrorSystem {
+  if (kind === 'ray') {
+    return new RayMirrorSystem({
+      scene,
+      roomMesh: room.mesh,
+      pipeLayer: PIPE_LAYER,
+      baseShader: BASE_REFLECTOR_SHADER,
+      size: room.size,
+      color: renderSettings.roomColor,
+      inset: mirrorInset,
+      resolution: mirrorTargetSize(),
+      distortion: {
+        blur: mirrorBlurAmount,
+        chromaticShift: mirrorChromaticShift,
+        warpStrength: mirrorWarpStrength,
+        warpSpeed: mirrorWarpSpeed,
+        refractionOffset: mirrorRefractionOffset,
+        noiseStrength: mirrorNoiseStrength,
+        time: 0,
+      },
+      enabled: mirrorEnabled,
+      maxBounces: rayMaxBounces,
+      bounceAttenuation: RAY_BOUNCE_ATTEN,
+    });
+  }
+
+  return new RasterMirrorSystem({
+    scene,
+    roomMesh: room.mesh,
+    pipeLayer: PIPE_LAYER,
+    baseShader: BASE_REFLECTOR_SHADER,
+    size: room.size,
+    color: renderSettings.roomColor,
+    inset: mirrorInset,
+    resolution: mirrorTargetSize(),
+    distortion: {
+      blur: mirrorBlurAmount,
+      chromaticShift: mirrorChromaticShift,
+      warpStrength: mirrorWarpStrength,
+      warpSpeed: mirrorWarpSpeed,
+      refractionOffset: mirrorRefractionOffset,
+      noiseStrength: mirrorNoiseStrength,
+      time: 0,
+    },
+    enabled: mirrorEnabled,
+  });
+}
+
+let roomMirrors: MirrorSystem = createMirrorSystem(mirrorRenderer);
 
 let gridLines = createGridOutline(defaultSimConfig.gridSize);
 gridLines.visible = renderSettings.showGrid;
@@ -282,6 +371,11 @@ const state = {
   elapsed: 0,
   fpsSmoothed: 0,
 };
+const videoCaptureSettings = {
+  durationSeconds: 10,
+  recording: false,
+};
+let rafHandle: number;
 let frameIndex = 0;
 let mirrorUpdateOffset = 0;
 let mirrorUpdateMask = new Set<number>();
@@ -290,6 +384,15 @@ const CAMERA_MARGIN = 1.5;
 const CAMERA_WALL_EPS = 0.6;
 const camDir = new Vector3();
 const behind = new Vector3();
+const wallNormals = [
+  new Vector3(1, 0, 0),
+  new Vector3(-1, 0, 0),
+  new Vector3(0, 1, 0),
+  new Vector3(0, -1, 0),
+  new Vector3(0, 0, 1),
+  new Vector3(0, 0, -1),
+] as const;
+const wallFacingState = { target: new Vector3() };
 const orbitState = {
   phase: 0,
   swayPhase: Math.random() * Math.PI * 2,
@@ -302,14 +405,14 @@ function mirrorTargetSize() {
   const { innerWidth, innerHeight } = window;
   const pixelRatio = renderer.getPixelRatio();
   return {
-    w: Math.min(reflectorMaxRes, innerWidth * pixelRatio * reflectorResScale),
-    h: Math.min(reflectorMaxRes, innerHeight * pixelRatio * reflectorResScale),
+    width: Math.min(reflectorMaxRes, innerWidth * pixelRatio * reflectorResScale),
+    height: Math.min(reflectorMaxRes, innerHeight * pixelRatio * reflectorResScale),
   };
 }
 
 function updateMirrorResolution() {
-  const { w, h } = mirrorTargetSize();
-  roomMirrors.setResolution(w, h);
+  const { width, height } = mirrorTargetSize();
+  roomMirrors.setResolution(width, height);
 }
 
 function updateMirrorBlur() {
@@ -330,12 +433,45 @@ function updateMirrorDistortionUniforms(time: number) {
 
 function updateMirrorMask() {
   const faces = roomMirrors.faces.length;
+  if (faces === 0) return;
   mirrorUpdateMask = new Set<number>();
-  const count = Math.max(1, Math.min(faces, mirrorFacesPerFrame));
-  for (let i = 0; i < count; i++) {
-    mirrorUpdateMask.add((mirrorUpdateOffset + i) % faces);
+
+  if (mirrorReflectionMode === 'none') {
+    // No mirrors get updated
+    roomMirrors.setUpdateMask(mirrorUpdateMask);
+    return;
   }
-  mirrorUpdateOffset = (mirrorUpdateOffset + count) % faces;
+
+  let candidateFaces: number[] = [];
+  if (mirrorReflectionMode === 'cameraFacing') {
+    // Only update the camera-facing mirror
+    const cameraDir = new Vector3();
+    camera.getWorldDirection(cameraDir);
+    let bestIdx = -1;
+    let bestDot = -Infinity;
+    for (let i = 0; i < faces; i++) {
+      const center = roomMirrors.faces[i].position;
+      const toCenter = center.clone().sub(camera.position).normalize();
+      const dot = cameraDir.dot(toCenter);
+      if (dot > bestDot) {
+        bestDot = dot;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx >= 0) {
+      candidateFaces = [bestIdx];
+    }
+  } else {
+    // 'all' mode: rotate through all faces
+    candidateFaces = Array.from({length: faces}, (_, i) => i);
+  }
+
+  const count = Math.max(1, Math.min(candidateFaces.length, mirrorFacesPerFrame));
+  for (let i = 0; i < count; i++) {
+    const idx = (mirrorUpdateOffset + i) % candidateFaces.length;
+    mirrorUpdateMask.add(candidateFaces[idx]);
+  }
+  mirrorUpdateOffset = (mirrorUpdateOffset + count) % candidateFaces.length;
   roomMirrors.setUpdateMask(mirrorUpdateMask);
 }
 
@@ -419,12 +555,18 @@ function frame(now: number) {
   const dtRaw = (now - lastTime) / 1000;
   const dt = Math.min(dtRaw, 0.05); // clamp to avoid large physics jumps on tab switches
   lastTime = now;
+  stepFrame(dt);
+  rafHandle = requestAnimationFrame(frame);
+}
+
+function stepFrame(dt: number) {
   state.elapsed += dt;
   state.fpsSmoothed = state.fpsSmoothed * 0.9 + (1 / dt) * 0.1;
   frameIndex++;
   const enteringOrbit = cameraControl.mode === 'orbit' && lastCameraMode !== 'orbit';
   updateMirrorMask();
   updateMirrorDistortionUniforms(state.elapsed);
+  roomMirrors.updateFrame?.(renderer, scene, camera);
 
   if (!state.paused) {
     const allStuck = sim.update(dt);
@@ -506,6 +648,15 @@ function frame(now: number) {
     const rollAlpha = 1 - Math.exp(-dt / 0.3);
     railState.roll += (targetRoll - railState.roll) * rollAlpha;
     roll = railState.roll;
+  } else if (cameraControl.mode === 'wall') {
+    const half = room.size * 0.5 - mirrorInset * 0.5;
+    const faceIdx = clamp(Math.round(cameraControl.wallFace ?? 0), 0, wallNormals.length - 1);
+    wallFacingState.target.copy(wallNormals[faceIdx]).setLength(Math.max(0, half));
+    // Position camera near the opposing wall instead of center
+    const opposingNormal = wallNormals[faceIdx].clone().negate();
+    camera.position.copy(opposingNormal).setLength(Math.max(0, half));
+    lookTarget = wallFacingState.target;
+    roll = 0;
   } else {
     if (cameraControl.distance === 0) {
       cameraControl.distance = orbitRadius;
@@ -544,7 +695,217 @@ function frame(now: number) {
 
   lastCameraMode = cameraControl.mode;
   composer.render();
-  requestAnimationFrame(frame);
+}
+
+function pickRecordingMimeType() {
+  if (typeof MediaRecorder === 'undefined') return undefined;
+  const candidates = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+  return candidates.find((type) => MediaRecorder.isTypeSupported(type));
+}
+
+function supportsWebCodecs() {
+  return typeof VideoEncoder !== 'undefined' && typeof createImageBitmap !== 'undefined';
+}
+
+async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | null> {
+  if (!supportsWebCodecs()) return null;
+  const width = canvas.width;
+  const height = canvas.height;
+  const totalFrames = Math.max(1, Math.round(clamp(durationSeconds, 5, 20) * 60));
+
+  const chunks: EncodedVideoChunk[] = [];
+  const encoder = new VideoEncoder({
+    output: (chunk) => {
+      chunks.push(chunk);
+    },
+    error: (e) => {
+      console.error('WebCodecs encoder error', e);
+    },
+  });
+
+  encoder.configure({
+    codec: 'vp09.00.10.08',
+    width,
+    height,
+    bitrate: 125_000_000,
+    framerate: 60,
+  });
+
+  // Pause RAF during offline render
+  const wasRunning = typeof rafHandle === 'number';
+  if (wasRunning) cancelAnimationFrame(rafHandle);
+
+  for (let i = 0; i < totalFrames; i++) {
+    setRecordingProgress(i / totalFrames, 'Encoding (WebCodecs)');
+    stepFrame(1 / 60);
+    const bitmap = await createImageBitmap(canvas);
+    const frame = new VideoFrame(bitmap, { timestamp: i });
+    encoder.encode(frame);
+    frame.close();
+    bitmap.close();
+  }
+
+  await encoder.flush();
+  encoder.close();
+
+  if (!chunks.length) {
+    console.warn('WebCodecs produced no chunks');
+    if (wasRunning) rafHandle = requestAnimationFrame(frame);
+    return null;
+  }
+
+  // Build IVF container (simple and widely supported)
+  const frameCount = chunks.length;
+  const header = new ArrayBuffer(32);
+  const view = new DataView(header);
+  // Signature 'DKIF'
+  view.setUint8(0, 'D'.charCodeAt(0));
+  view.setUint8(1, 'K'.charCodeAt(0));
+  view.setUint8(2, 'I'.charCodeAt(0));
+  view.setUint8(3, 'F'.charCodeAt(0));
+  view.setUint16(4, 0, true); // version
+  view.setUint16(6, 32, true); // header size
+  view.setUint8(8, 'V'.charCodeAt(0));
+  view.setUint8(9, 'P'.charCodeAt(0));
+  view.setUint8(10, '9'.charCodeAt(0));
+  view.setUint8(11, '0'.charCodeAt(0));
+  view.setUint16(12, width, true);
+  view.setUint16(14, height, true);
+  view.setUint32(16, 60, true); // framerate
+  view.setUint32(20, 1, true); // timescale
+  view.setUint32(24, frameCount, true); // frame count
+  view.setUint32(28, 0, true); // unused
+
+  // Calculate total buffer size
+  let totalSize = header.byteLength;
+  for (const chunk of chunks) {
+    totalSize += 12 + chunk.byteLength; // frame header + data
+  }
+
+  const out = new Uint8Array(totalSize);
+  out.set(new Uint8Array(header), 0);
+  let offset = header.byteLength;
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const frameHeader = new DataView(out.buffer, offset, 12);
+    frameHeader.setUint32(0, chunk.byteLength, true);
+    frameHeader.setBigUint64(4, BigInt(i), true);
+    offset += 12;
+    const data = new Uint8Array(chunk.byteLength);
+    chunk.copyTo(data);
+    out.set(data, offset);
+    offset += chunk.byteLength;
+  }
+
+  const blob = new Blob([out], { type: 'video/x-ivf' });
+  if (wasRunning) rafHandle = requestAnimationFrame(frame);
+  setRecordingProgress(null, '');
+  return blob;
+}
+
+async function renderVideoCapture(durationSeconds: number) {
+  if (videoCaptureSettings.recording) return;
+
+  // Prefer offline WebCodecs encoding (decoupled from real-time)
+  if (supportsWebCodecs()) {
+    const blob = await encodeIvfWithWebCodecs(durationSeconds);
+    if (blob) {
+      const url = URL.createObjectURL(blob);
+      const download = document.createElement('a');
+      download.href = url;
+      download.download = `pipes-${clamp(durationSeconds, 5, 20)}s-${Date.now()}.ivf`;
+      download.click();
+      setTimeout(() => URL.revokeObjectURL(url), 10_000);
+      setRecordingProgress(null, '');
+      return;
+    }
+  }
+
+  const targetDuration = clamp(durationSeconds, 5, 20);
+  const mimeType = pickRecordingMimeType();
+  if (!mimeType) {
+    console.warn('MediaRecorder with WebM is not supported in this browser.');
+    return;
+  }
+  if (!canvas.captureStream) {
+    console.warn('captureStream is not supported on this canvas.');
+    return;
+  }
+
+  const stream = canvas.captureStream(60);
+  const track = stream.getVideoTracks()[0];
+  if (track && (track as any).applyConstraints) {
+    (track as any).applyConstraints({ frameRate: 60 }).catch(() => {
+      /* ignore constraint failures */
+    });
+  }
+  const chunks: BlobPart[] = [];
+  let recorder: MediaRecorder;
+  try {
+    recorder = new MediaRecorder(stream, {
+      mimeType,
+      videoBitsPerSecond: 25_000_000,
+    });
+  } catch (err) {
+    console.error('Failed to start video recording', err);
+    stream.getTracks().forEach((t) => t.stop());
+    return;
+  }
+
+  const wasRunning = typeof rafHandle === 'number';
+  if (wasRunning) cancelAnimationFrame(rafHandle);
+
+  const stopped = new Promise<void>((resolve) => {
+    recorder.addEventListener('stop', () => resolve(), { once: true });
+  });
+
+  recorder.addEventListener('dataavailable', (ev) => {
+    if (ev.data && ev.data.size > 0) {
+      chunks.push(ev.data);
+    }
+  });
+  recorder.addEventListener('error', (ev) => {
+    console.error('Recorder error', ev);
+  });
+
+  videoCaptureSettings.recording = true;
+  try {
+    recorder.start();
+    // Allow recorder to initialize
+    await new Promise((r) => setTimeout(r, 0));
+    const totalFrames = Math.max(1, Math.round(targetDuration * 60));
+    for (let i = 0; i < totalFrames; i++) {
+      setRecordingProgress(i / totalFrames, 'Recording (MediaRecorder)');
+      stepFrame(1 / 60);
+      if (track && (track as any).requestFrame) {
+        (track as any).requestFrame();
+      }
+      // Yield to let the capture track publish the frame; rAF keeps cadence stable.
+      await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+    }
+    recorder.stop();
+    await stopped;
+    if (!chunks.length) {
+      console.warn('Recorder produced no data.');
+      return;
+    }
+    const blob = new Blob(chunks, { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const download = document.createElement('a');
+    download.href = url;
+    download.download = `pipes-${targetDuration}s-${Date.now()}.webm`;
+    download.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    setRecordingProgress(null, '');
+  } catch (err) {
+    console.error('Recording failed', err);
+  } finally {
+    stream.getTracks().forEach((t) => t.stop());
+    videoCaptureSettings.recording = false;
+    if (wasRunning) {
+      rafHandle = requestAnimationFrame(frame);
+    }
+  }
 }
 
 function setupGui() {
@@ -625,6 +986,17 @@ function setupGui() {
       'randomize'
     )
     .name('Randomize all');
+  simFolder.add(videoCaptureSettings, 'durationSeconds', 5, 20, 1).name('Video length (s)');
+  simFolder
+    .add(
+      {
+        renderVideo: () => {
+          renderVideoCapture(videoCaptureSettings.durationSeconds);
+        },
+      },
+      'renderVideo'
+    )
+    .name('Render 60fps video');
 
   const pipeFolder = gui.addFolder('Pipes');
   pipeFolder.add(renderSettings, 'pipeRadius', 0.05, 0.6, 0.01).name('Radius');
@@ -703,10 +1075,48 @@ function setupGui() {
     roomMirrors.setEnabled(v);
   });
   mirrorFolder
+    .add(mirrorGuiSettings, 'renderer', { Raster: 'raster', 'Ray (experimental)': 'ray' })
+    .name('Renderer')
+    .onChange((v: MirrorRenderer) => {
+      mirrorRenderer = v;
+      roomMirrors.dispose();
+      roomMirrors = createMirrorSystem(v);
+      updateMirrorResolution();
+      updateMirrorBlur();
+      updateMirrorDistortionUniforms(state.elapsed);
+      updateMirrorMask();
+    });
+  mirrorFolder
+    .add(mirrorGuiSettings, 'rayBounces', 1, 16, 1)
+    .name('Ray bounces')
+    .onChange((v: number) => {
+      rayMaxBounces = Math.max(1, Math.floor(v));
+      mirrorGuiSettings.rayBounces = rayMaxBounces;
+      if (mirrorRenderer === 'ray') {
+        roomMirrors.dispose();
+        roomMirrors = createMirrorSystem('ray');
+        updateMirrorResolution();
+        updateMirrorBlur();
+        updateMirrorDistortionUniforms(state.elapsed);
+        updateMirrorMask();
+      }
+    });
+  mirrorFolder
+    .add(mirrorGuiSettings, 'reflectionMode', {
+      'No inter-reflection': 'none',
+      'Camera-facing only': 'cameraFacing',
+      'All mirrors': 'all',
+    })
+    .name('Reflection mode')
+    .onChange((v: MirrorReflectionMode) => {
+      mirrorReflectionMode = v;
+    });
+  mirrorFolder
     .add(mirrorGuiSettings, 'inset', 0.01, 20, 0.01)
     .name('Wall inset')
     .onChange((v: number) => {
       mirrorInset = Math.max(0, v);
+      roomMirrors.setInset(mirrorInset);
       roomMirrors.update(room.size, renderSettings.roomColor);
     });
   mirrorFolder
@@ -784,8 +1194,8 @@ function setupGui() {
 
   const cameraFolder = gui.addFolder('Camera');
   cameraModeController = cameraFolder
-    .add(cameraControl, 'mode', ['orbit', 'manual', 'rail'])
-    .name('Mode (orbit/manual/rail)')
+    .add(cameraControl, 'mode', ['wall', 'orbit', 'manual', 'rail'])
+    .name('Mode (wall/orbit/manual/rail)')
     .onChange((mode: CameraMode) => {
       cameraControl.mode = mode;
       if (mode === 'manual' && cameraControl.distance === 0) {
@@ -797,6 +1207,12 @@ function setupGui() {
         railState.lastPos.copy(camera.position);
         railState.smoothedTarget.set(0, 0, 0);
       }
+    });
+  cameraFolder
+    .add(cameraControl, 'wallFace', { '+X': 0, '-X': 1, '+Y': 2, '-Y': 3, '+Z': 4, '-Z': 5 })
+    .name('Wall facing')
+    .onChange((v: number) => {
+      cameraControl.wallFace = clamp(Math.round(v), 0, 5);
     });
   orbitSpeedController = cameraFolder.add(orbitSettings, 'orbitSpeed', 0.02, 0.6, 0.01).name('Orbit speed');
   orbitBobController = cameraFolder.add(orbitSettings, 'bobStrength', 0, 0.8, 0.01).name('Bob strength');
@@ -943,7 +1359,7 @@ function keepOrbitInside(v: Vector3, margin = CAMERA_MARGIN) {
 }
 
 function randomizeCameraSettings() {
-  const modes: CameraMode[] = ['orbit', 'manual', 'rail'];
+  const modes: CameraMode[] = ['wall', 'orbit', 'manual', 'rail'];
   const pickedMode = modes[randInt(0, modes.length - 1)];
 
   orbitSettings.orbitSpeed = rand(0.05, 0.55);
@@ -954,6 +1370,7 @@ function randomizeCameraSettings() {
   cameraControl.pitchSpeed = rand(0.4, 3.2);
   cameraControl.yaw = rand(-Math.PI, Math.PI);
   cameraControl.pitch = clamp(rand(-0.45, 0.45), -Math.PI / 2 + 0.05, Math.PI / 2 - 0.05);
+  cameraControl.wallFace = randInt(0, 5);
 
   const { min, max } = cameraDistanceBounds();
   cameraControl.distance = clamp(rand(min * 0.9, max * 0.85), min, max);
@@ -1081,7 +1498,7 @@ function createRoom(
     reflectivity: settings.roomReflectivity,
     clearcoat: 1,
     clearcoatRoughness: 0,
-    side: BackSide,
+    side: DoubleSide,
   });
   const mesh = new Mesh(geom, mat);
 
@@ -1104,292 +1521,6 @@ function createRoom(
     updateSize,
   };
 }
-
-type RoomMirrors = {
-  faces: Reflector[];
-  update: (size: number, color: string) => void;
-  setResolution: (width: number, height: number) => void;
-  setBlur: (amount: number) => void;
-  setDistortion: (u: {
-    blur: number;
-    chromaticShift: number;
-    warpStrength: number;
-    warpSpeed: number;
-    refractionOffset: number;
-    noiseStrength: number;
-    time: number;
-  }) => void;
-  setEnabled: (enabled: boolean) => void;
-  setUpdateMask: (mask: Set<number>) => void;
-  dispose: () => void;
-};
-
-function createRoomMirrors(size: number, color: string): RoomMirrors {
-  let updateMask = new Set<number>();
-  let enabled = mirrorEnabled;
-
-  // keep a live reference so onBeforeRender can hide peer mirrors during capture
-  let faces: Reflector[] = [];
-  const mirrorUniforms = new Map<
-    number,
-    {
-      blurAmount?: { value: number };
-      chromaticShift?: { value: number };
-      warpStrength?: { value: number };
-      warpSpeed?: { value: number };
-      refractionOffset?: { value: number };
-      noiseStrength?: { value: number };
-      time?: { value: number };
-    }
-  >();
-
-  const makeFace = (
-    position: Vector3,
-    rotate: (mirror: Reflector) => void,
-    faceSize: number,
-    faceColor: string,
-    faceIndex: number
-  ) => {
-    const mirrorShader = {
-      ...BASE_REFLECTOR_SHADER,
-      uniforms: {
-        ...BASE_REFLECTOR_SHADER.uniforms,
-        blurAmount: { value: mirrorBlurAmount },
-        chromaticShift: { value: mirrorChromaticShift },
-        warpStrength: { value: mirrorWarpStrength },
-        warpSpeed: { value: mirrorWarpSpeed },
-        refractionOffset: { value: mirrorRefractionOffset },
-        noiseStrength: { value: mirrorNoiseStrength },
-        time: { value: 0 },
-      },
-      fragmentShader: `
-        uniform vec3 color;
-        uniform sampler2D tDiffuse;
-        uniform float blurAmount;
-        uniform float chromaticShift;
-        uniform float warpStrength;
-        uniform float warpSpeed;
-        uniform float refractionOffset;
-        uniform float noiseStrength;
-        uniform float time;
-        varying vec4 vUv;
-
-        #include <logdepthbuf_pars_fragment>
-
-        float blendOverlay( float base, float blend ) {
-          return( base < 0.5 ? ( 2.0 * base * blend ) : ( 1.0 - 2.0 * ( 1.0 - base ) * ( 1.0 - blend ) ) );
-        }
-
-        vec3 blendOverlay( vec3 base, vec3 blend ) {
-          return vec3( blendOverlay( base.r, blend.r ), blendOverlay( base.g, blend.g ), blendOverlay( base.b, blend.b ) );
-        }
-
-        vec3 sampleProj(vec4 proj) {
-          return texture2DProj( tDiffuse, proj ).rgb;
-        }
-
-        void main() {
-          #include <logdepthbuf_fragment>
-          vec4 projUv = vUv;
-          vec2 uv = projUv.xy / projUv.w;
-          vec2 dir = uv - vec2(0.5);
-          float len = length(dir);
-          vec2 dirNorm = len < 1e-4 ? vec2(1.0, 0.0) : dir / len;
-
-          // noise shimmer
-          if (noiseStrength > 0.0) {
-            float n = sin(dot(uv * vec2(1733.1, 927.7), vec2(12.9898, 78.233)) + time * 57.0);
-            vec2 noiseVec = vec2(n, fract(n * 1.2154) - 0.5);
-            uv += noiseVec * noiseStrength;
-          }
-
-          // warp
-          float warp = warpStrength;
-          if (warp > 0.0) {
-            float wobble = sin(len * 24.0 + time * warpSpeed * 6.28318);
-            uv += dirNorm * wobble * warp;
-          }
-
-          // refraction-like offset
-          if (abs(refractionOffset) > 0.0001) {
-            uv += dirNorm * refractionOffset;
-          }
-
-          // reconstruct projective coords after UV shifts
-          vec4 projSample = vec4(uv * projUv.w, projUv.zw);
-
-          // base sample
-          vec3 base = sampleProj(projSample);
-          float blur = clamp(blurAmount, 0.0, 1.0);
-
-          if (blur > 0.0) {
-            float radius = mix(0.0, 0.06, blur); // tune radius
-            vec3 accum = base;
-            float weight = 1.0;
-            const int samples = 5;
-            for (int i = 1; i <= samples; i++) {
-              float t = float(i) / float(samples);
-              vec2 offset = dir * radius * t;
-              vec4 offProj = vec4((uv + offset) * projUv.w, projUv.zw);
-              vec3 s = sampleProj(offProj);
-              float w = 1.0 - t * 0.65;
-              accum += s * w;
-              weight += w;
-            }
-            base = accum / weight;
-          }
-
-          // chromatic shift
-          float shift = chromaticShift;
-          if (shift > 0.0) {
-            vec2 cOff = dirNorm * shift;
-            float r = texture2DProj( tDiffuse, vec4((uv + cOff) * projUv.w, projUv.zw) ).r;
-            float g = texture2DProj( tDiffuse, vec4(uv * projUv.w, projUv.zw) ).g;
-            float b = texture2DProj( tDiffuse, vec4((uv - cOff) * projUv.w, projUv.zw) ).b;
-            base = vec3(r, g, b);
-          }
-
-          gl_FragColor = vec4( blendOverlay( base, color ), 1.0 );
-
-          #include <tonemapping_fragment>
-          #include <colorspace_fragment>
-        }
-      `,
-    };
-
-    const mirror = new Reflector(new PlaneGeometry(faceSize, faceSize), {
-      clipBias: 0,
-      textureWidth: Math.min(reflectorMaxRes, window.innerWidth * renderer.getPixelRatio() * reflectorResScale),
-      textureHeight: Math.min(reflectorMaxRes, window.innerHeight * renderer.getPixelRatio() * reflectorResScale),
-      color: faceColor,
-      shader: mirrorShader,
-    });
-    mirror.camera.layers.enable(PIPE_LAYER);
-    const baseRender = mirror.onBeforeRender.bind(mirror);
-    mirror.onBeforeRender = (...args) => {
-      if (!enabled) return;
-      if (!updateMask.has(faceIndex)) return;
-       // prevent mirrors from reflecting each other; hide peers during this capture
-      const prevVisible = faces.map((f) => f.visible);
-      faces.forEach((f, i) => {
-        if (i !== faceIndex) f.visible = false;
-      });
-      baseRender(...args);
-      faces.forEach((f, i) => {
-        f.visible = prevVisible[i];
-      });
-    };
-    mirror.position.copy(position);
-    rotate(mirror);
-    mirrorUniforms.set(faceIndex, (mirror.material as any).uniforms ?? {});
-    return mirror;
-  };
-
-  const buildMirrors = (nextSize: number, nextColor: string) => {
-    const half = nextSize / 2 - mirrorInset;
-    return [
-      makeFace(new Vector3(half, 0, 0), (m) => m.rotateY(-Math.PI / 2), nextSize, nextColor, 0), // +X
-      makeFace(new Vector3(-half, 0, 0), (m) => m.rotateY(Math.PI / 2), nextSize, nextColor, 1), // -X
-      makeFace(new Vector3(0, half, 0), (m) => m.rotateX(Math.PI / 2), nextSize, nextColor, 2), // +Y
-      makeFace(new Vector3(0, -half, 0), (m) => m.rotateX(-Math.PI / 2), nextSize, nextColor, 3), // -Y
-      makeFace(new Vector3(0, 0, half), (m) => m.rotateY(Math.PI), nextSize, nextColor, 4), // +Z
-      makeFace(new Vector3(0, 0, -half), (m) => m.rotateY(0), nextSize, nextColor, 5), // -Z
-    ];
-  };
-
-  faces = buildMirrors(size, color);
-  const addFaces = (list: Reflector[]) => list.forEach((f) => scene.add(f));
-  const disposeFaces = (list: Reflector[]) => {
-    for (const face of list) {
-      scene.remove(face);
-      const target = (face as unknown as { getRenderTarget?: () => any }).getRenderTarget?.();
-      target?.dispose?.();
-      face.geometry.dispose();
-      (face.material as any)?.dispose?.();
-    }
-  };
-
-  addFaces(faces);
-
-  return {
-    get faces() {
-      return faces;
-    },
-    update: (nextSize: number, nextColor: string) => {
-      mirrorUniforms.clear();
-      disposeFaces(faces);
-      faces = buildMirrors(nextSize, nextColor);
-      addFaces(faces);
-      // ensure new faces pick up current blur
-      for (const uniforms of mirrorUniforms.values()) {
-        const u = uniforms as {
-          blurAmount?: { value: number };
-          chromaticShift?: { value: number };
-          warpStrength?: { value: number };
-          warpSpeed?: { value: number };
-          refractionOffset?: { value: number };
-          noiseStrength?: { value: number };
-          time?: { value: number };
-        };
-        if (u.blurAmount) u.blurAmount.value = mirrorBlurAmount;
-        if (u.chromaticShift) u.chromaticShift.value = mirrorChromaticShift;
-        if (u.warpStrength) u.warpStrength.value = mirrorWarpStrength;
-        if (u.warpSpeed) u.warpSpeed.value = mirrorWarpSpeed;
-        if (u.refractionOffset) u.refractionOffset.value = mirrorRefractionOffset;
-        if (u.time) u.time.value = state.elapsed;
-        if (u.noiseStrength) u.noiseStrength.value = mirrorNoiseStrength;
-      }
-    },
-    setResolution: (width: number, height: number) => {
-      for (const face of faces) {
-        const target = (face as unknown as { getRenderTarget?: () => { setSize: (w: number, h: number) => void } }).getRenderTarget?.();
-        target?.setSize(width, height);
-      }
-    },
-    setBlur: (amount: number) => {
-      for (const uniforms of mirrorUniforms.values()) {
-        const u = uniforms as { blurAmount?: { value: number } };
-        if (u.blurAmount) u.blurAmount.value = amount;
-      }
-    },
-    setDistortion: (u) => {
-      for (const uniforms of mirrorUniforms.values()) {
-        const target = uniforms as {
-          blurAmount?: { value: number };
-          chromaticShift?: { value: number };
-          warpStrength?: { value: number };
-          warpSpeed?: { value: number };
-          refractionOffset?: { value: number };
-          noiseStrength?: { value: number };
-          time?: { value: number };
-        };
-        if (target.blurAmount) target.blurAmount.value = u.blur;
-        if (target.chromaticShift) target.chromaticShift.value = u.chromaticShift;
-        if (target.warpStrength) target.warpStrength.value = u.warpStrength;
-        if (target.warpSpeed) target.warpSpeed.value = u.warpSpeed;
-        if (target.refractionOffset) target.refractionOffset.value = u.refractionOffset;
-        if (target.noiseStrength) target.noiseStrength.value = u.noiseStrength;
-        if (target.time) target.time.value = u.time;
-      }
-    },
-    setEnabled: (v: boolean) => {
-      enabled = v;
-      faces.forEach((f) => {
-        f.visible = v;
-        f.matrixWorldNeedsUpdate = true;
-      });
-      room.mesh.visible = v;
-    },
-    setUpdateMask: (mask: Set<number>) => {
-      updateMask = mask;
-    },
-    dispose: () => {
-      disposeFaces(faces);
-      faces = [];
-    },
-  };
-}
-
 const cellSize = 1;
 const toWorld = (gridSize: number, cell: Vec3): Vector3 => {
   const half = gridSize / 2;
