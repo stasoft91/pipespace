@@ -49,6 +49,7 @@ type RenderSettings = {
   roomReflectivity: number;
   roomColor: string;
   showGrid: boolean;
+  hidePipesInMainCamera: boolean;
   pipeMetalness: number;
   pipeRoughness: number;
   glassEnabled: boolean;
@@ -71,13 +72,13 @@ type OrbitSettings = {
 
 type CameraMode = 'orbit' | 'manual' | 'rail';
 
-let roomPadding = 20; // gap between grid extents and room walls
+let roomPadding = 0; // gap between grid extents and room walls
 const roomGuiSettings = {
   wallGap: roomPadding,
 };
-let mirrorInset = 15;
+let mirrorInset = 0.01;
 let reflectorResScale = 1;
-let reflectorMaxRes = 4096;
+let reflectorMaxRes = 4096 * 4;
 let mirrorFacesPerFrame = 6; // how many faces update each frame (reduces flicker/load)
 let mirrorEnabled = true;
 let mirrorBlurAmount = 0;
@@ -113,7 +114,7 @@ const defaultSimConfig: SimulationConfig = {
 const turnProxy = { turnChance: defaultSimConfig.turnProbability * 100 };
 
 const renderSettings: RenderSettings = {
-  pipeRadius: 0.05,
+  pipeRadius: 0.08,
   tubularSegments: 7,
   radialSegments: 10,
   colorShift: 0,
@@ -128,8 +129,9 @@ const renderSettings: RenderSettings = {
   roomRoughness: 0.25,
   roomMetalness: 0.75,
   roomReflectivity: 1,
-  roomColor: '#000000',
+  roomColor: '#ffffff',
   showGrid: false,
+  hidePipesInMainCamera: false,
   pipeMetalness: 0.18,
   pipeRoughness: 0.3,
   glassEnabled: false,
@@ -138,9 +140,9 @@ const renderSettings: RenderSettings = {
   glassIor: 1.2,
   cornerTension: 0,
   neonEnabled: true,
-  neonStrength: 2.0,
+  neonStrength: 0.69,
   neonSize: 1.0,
-  bloomStrength: 2,
+  bloomStrength: 1,
   bloomRadius: 1,
   bloomThreshold: 0,
 };
@@ -200,6 +202,8 @@ const cameraControl = {
   zoomSpeed: 0.9,
 };
 
+const PIPE_LAYER = 1;
+
 const sim = new Simulation(defaultSimConfig);
 
 const renderer = new WebGLRenderer({
@@ -217,7 +221,9 @@ scene.background = new Color('#000000');
 
 const camera = new PerspectiveCamera(100, window.innerWidth / window.innerHeight, 0.1, 5000);
 scene.add(camera);
+syncPipeVisibilityToMainCamera();
 const cameraLight = new PointLight(renderSettings.backLightColor, renderSettings.backLightIntensity, renderSettings.backLightRange, 2);
+cameraLight.layers.enable(PIPE_LAYER);
 cameraLight.visible = renderSettings.backLightEnabled;
 scene.add(cameraLight);
 
@@ -324,6 +330,14 @@ function updateMirrorMask() {
   }
   mirrorUpdateOffset = (mirrorUpdateOffset + count) % faces;
   roomMirrors.setUpdateMask(mirrorUpdateMask);
+}
+
+function syncPipeVisibilityToMainCamera() {
+  if (renderSettings.hidePipesInMainCamera) {
+    camera.layers.disable(PIPE_LAYER);
+  } else {
+    camera.layers.enable(PIPE_LAYER);
+  }
 }
 
 function resize() {
@@ -538,7 +552,7 @@ function setupGui() {
       defaultSimConfig.maxPipeLength = normalized;
       sim.config.maxPipeLength = normalized === 0 ? 0 : Math.max(4, normalized);
     });
-  growthIntervalController = simFolder.add(defaultSimConfig, 'growthInterval', 0.01, 0.6, 0.01).name('Growth interval').onChange((v: number) => {
+  growthIntervalController = simFolder.add(defaultSimConfig, 'growthInterval', 0.001, 1, 0.001).name('Growth interval').onChange((v: number) => {
     sim.config.growthInterval = Math.max(0.01, v);
   });
   turnController = simFolder
@@ -590,6 +604,12 @@ function setupGui() {
   pipeFolder.add(renderSettings, 'tubularSegments', 3, 20, 1).name('Smoothness');
   pipeFolder.add(renderSettings, 'radialSegments', 4, 32, 1).name('Radial slices');
   pipeFolder.add(renderSettings, 'colorShift', 0, 0.4, 0.005).name('Color shift');
+  pipeFolder
+    .add(renderSettings, 'hidePipesInMainCamera')
+    .name('Hide in main camera')
+    .onChange(() => {
+      syncPipeVisibilityToMainCamera();
+    });
   pipeFolder.add(renderSettings, 'pipeRoughness', 0, 1, 0.01).name('Roughness').onChange((v: number) => {
     pipeMaterial.roughness = v;
   });
@@ -663,13 +683,6 @@ function setupGui() {
       roomMirrors.update(room.size, renderSettings.roomColor);
     });
   mirrorFolder
-    .add(mirrorGuiSettings, 'resolutionScale', 0.1, 1, 0.01)
-    .name('Resolution scale')
-    .onChange((v: number) => {
-      reflectorResScale = v;
-      updateMirrorResolution();
-    });
-  mirrorFolder
     .add(mirrorGuiSettings, 'blur', 0, 1, 0.01)
     .name('Radial blur')
     .onChange((v: number) => {
@@ -677,7 +690,7 @@ function setupGui() {
       updateMirrorBlur();
     });
   mirrorFolder
-    .add(mirrorGuiSettings, 'chromaticShift', 0, 0, 0.0005)
+    .add(mirrorGuiSettings, 'chromaticShift', 0, 0.1, 0.0005)
     .name('Chromatic shift')
     .onChange((v: number) => {
       mirrorChromaticShift = Math.max(0, v);
@@ -707,7 +720,7 @@ function setupGui() {
       mirrorNoiseStrength = Math.max(0, v);
     });
   mirrorFolder
-    .add(mirrorGuiSettings, 'maxResolution', 256, 4096, 64)
+    .add(mirrorGuiSettings, 'maxResolution', 256, 4096 * 4, 64)
     .name('Max resolution')
     .onChange((v: number) => {
       reflectorMaxRes = v;
@@ -727,7 +740,7 @@ function setupGui() {
   const camLightFolder = gui.addFolder('Camera light');
   camLightFolder.add(renderSettings, 'backLightEnabled').name('Enabled');
   camLightFolder
-    .add(renderSettings, 'backLightIntensity', 0, 50, 0.1)
+    .add(renderSettings, 'backLightIntensity', 0, 1200, 0.1)
     .name('Intensity')
     .onChange((v: number) => {
       cameraLight.intensity = v;
@@ -1217,6 +1230,7 @@ function createRoomMirrors(size: number, color: string): RoomMirrors {
       color: faceColor,
       shader: mirrorShader,
     });
+    mirror.camera.layers.enable(PIPE_LAYER);
     const baseRender = mirror.onBeforeRender.bind(mirror);
     mirror.onBeforeRender = (...args) => {
       if (!enabled) return;
@@ -1367,11 +1381,13 @@ class PipeVisual {
     this.material = material;
     this.gridSize = gridSize;
     this.mesh = new Mesh(undefined, this.material);
+    this.mesh.layers.set(PIPE_LAYER);
     this.glow = undefined;
     this.glowMaterial = undefined;
     this.light = new PointLight(0xffffff, 0, 0, 2);
     this.light.castShadow = false;
     this.light.visible = false;
+    this.light.layers.set(PIPE_LAYER);
     this.update(pipe, settings, false);
   }
 
@@ -1427,6 +1443,7 @@ class PipeVisual {
           opacity: settings.neonStrength,
         });
         this.glow = new Mesh(this.mesh.geometry, this.glowMaterial);
+        this.glow.layers.set(PIPE_LAYER);
       }
       this.glowMaterial.opacity = settings.neonStrength;
       this.glow.scale.setScalar(settings.neonSize);
