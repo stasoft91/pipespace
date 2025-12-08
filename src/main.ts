@@ -29,7 +29,7 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import GUI from 'lil-gui';
 import { Pipe, Simulation } from './simulation';
 import type { SimulationConfig, Vec3 } from './simulation';
-import { RasterMirrorSystem, RayMirrorSystem } from './mirrors';
+import { PhysicalRayMirrorSystem, RasterMirrorSystem, RayMirrorSystem } from './mirrors';
 import type { MirrorReflectionMode, MirrorSystem } from './mirrors';
 
 type RenderSettings = {
@@ -72,7 +72,7 @@ type OrbitSettings = {
 };
 
 type CameraMode = 'wall' | 'orbit' | 'manual' | 'rail';
-type MirrorRenderer = 'raster' | 'ray';
+type MirrorRenderer = 'raster' | 'ray' | 'physicalRay';
 
 let roomPadding = 15; // gap between grid extents and room walls
 const roomGuiSettings = {
@@ -86,7 +86,8 @@ let rayMaxBounces = 3;
 let mirrorEnabled = true;
 let mirrorReflectionMode: MirrorReflectionMode = 'all'; // how mirrors see each other
 let mirrorRenderer: MirrorRenderer = 'ray';
-const RAY_BOUNCE_ATTEN = 0.65;
+let mirrorBounceAttenuation = 0.65;
+let mirrorBounceAttenuationMode: 'skipFirst' | 'allBounces' = 'skipFirst';
 let mirrorBlurAmount = 0;
 let mirrorChromaticShift = 0;
 let mirrorWarpStrength = 0;
@@ -199,6 +200,8 @@ const mirrorGuiSettings = {
   warpSpeed: mirrorWarpSpeed,
   refractionOffset: mirrorRefractionOffset,
   noiseStrength: mirrorNoiseStrength,
+  bounceAttenuation: mirrorBounceAttenuation,
+  bounceAttenuationMode: mirrorBounceAttenuationMode,
 };
 
 const orbitSettings: OrbitSettings = {
@@ -272,6 +275,31 @@ scene.add(cameraLight);
 const room = createRoom(defaultSimConfig.gridSize, renderSettings);
 scene.add(room.mesh);
 function createMirrorSystem(kind: MirrorRenderer): MirrorSystem {
+  if (kind === 'physicalRay') {
+    return new PhysicalRayMirrorSystem({
+      scene,
+      roomMesh: room.mesh,
+      pipeLayer: PIPE_LAYER,
+      baseShader: BASE_REFLECTOR_SHADER,
+      size: room.size,
+      color: renderSettings.roomColor,
+      inset: mirrorInset,
+      resolution: mirrorTargetSize(),
+      distortion: {
+        blur: mirrorBlurAmount,
+        chromaticShift: mirrorChromaticShift,
+        warpStrength: mirrorWarpStrength,
+        warpSpeed: mirrorWarpSpeed,
+        refractionOffset: mirrorRefractionOffset,
+        noiseStrength: mirrorNoiseStrength,
+        time: 0,
+      },
+      enabled: mirrorEnabled,
+      maxBounces: rayMaxBounces,
+      bounceAttenuation: mirrorBounceAttenuation,
+      bounceAttenuationMode: mirrorBounceAttenuationMode,
+    });
+  }
   if (kind === 'ray') {
     return new RayMirrorSystem({
       scene,
@@ -293,7 +321,8 @@ function createMirrorSystem(kind: MirrorRenderer): MirrorSystem {
       },
       enabled: mirrorEnabled,
       maxBounces: rayMaxBounces,
-      bounceAttenuation: RAY_BOUNCE_ATTEN,
+      bounceAttenuation: mirrorBounceAttenuation,
+      bounceAttenuationMode: mirrorBounceAttenuationMode,
     });
   }
 
@@ -1075,7 +1104,11 @@ function setupGui() {
     roomMirrors.setEnabled(v);
   });
   mirrorFolder
-    .add(mirrorGuiSettings, 'renderer', { Raster: 'raster', 'Ray (experimental)': 'ray' })
+    .add(mirrorGuiSettings, 'renderer', {
+      Raster: 'raster',
+      'Ray (experimental)': 'ray',
+      'Ray tunnel (recursive)': 'physicalRay',
+    })
     .name('Renderer')
     .onChange((v: MirrorRenderer) => {
       mirrorRenderer = v;
@@ -1092,9 +1125,41 @@ function setupGui() {
     .onChange((v: number) => {
       rayMaxBounces = Math.max(1, Math.floor(v));
       mirrorGuiSettings.rayBounces = rayMaxBounces;
-      if (mirrorRenderer === 'ray') {
+      if (mirrorRenderer === 'ray' || mirrorRenderer === 'physicalRay') {
         roomMirrors.dispose();
-        roomMirrors = createMirrorSystem('ray');
+        roomMirrors = createMirrorSystem(mirrorRenderer);
+        updateMirrorResolution();
+        updateMirrorBlur();
+        updateMirrorDistortionUniforms(state.elapsed);
+        updateMirrorMask();
+      }
+    });
+  mirrorFolder
+    .add(mirrorGuiSettings, 'bounceAttenuation', 0, 10, 0.05)
+    .name('Bounce attenuation')
+    .onChange((v: number) => {
+      mirrorBounceAttenuation = clamp(v, 0, 10);
+      mirrorGuiSettings.bounceAttenuation = mirrorBounceAttenuation;
+      if (mirrorRenderer === 'ray' || mirrorRenderer === 'physicalRay') {
+        roomMirrors.dispose();
+        roomMirrors = createMirrorSystem(mirrorRenderer);
+        updateMirrorResolution();
+        updateMirrorBlur();
+        updateMirrorDistortionUniforms(state.elapsed);
+        updateMirrorMask();
+      }
+    });
+  mirrorFolder
+    .add(mirrorGuiSettings, 'bounceAttenuationMode', {
+      'Skip first bounce': 'skipFirst',
+      'Scale all bounces': 'allBounces',
+    })
+    .name('Attenuation math')
+    .onChange((v: 'skipFirst' | 'allBounces') => {
+      mirrorBounceAttenuationMode = v;
+      if (mirrorRenderer === 'ray' || mirrorRenderer === 'physicalRay') {
+        roomMirrors.dispose();
+        roomMirrors = createMirrorSystem(mirrorRenderer);
         updateMirrorResolution();
         updateMirrorBlur();
         updateMirrorDistortionUniforms(state.elapsed);
