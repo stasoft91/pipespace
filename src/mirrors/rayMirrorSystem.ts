@@ -10,6 +10,7 @@ type MirrorUniformBag = {
   refractionOffset?: { value: number };
   noiseStrength?: { value: number };
   time?: { value: number };
+  surfaceIntensity?: { value: number };
 };
 
 type RayMirrorSystemOptions = {
@@ -238,6 +239,7 @@ export class RayMirrorSystem implements MirrorSystem {
   }
 
   private applyDistortionUniforms() {
+    const intensity = this.computeSurfaceIntensity();
     for (const uniforms of this.mirrorUniforms.values()) {
       if (uniforms.blurAmount) uniforms.blurAmount.value = this.distortion.blur;
       if (uniforms.chromaticShift) uniforms.chromaticShift.value = this.distortion.chromaticShift;
@@ -246,7 +248,13 @@ export class RayMirrorSystem implements MirrorSystem {
       if (uniforms.refractionOffset) uniforms.refractionOffset.value = this.distortion.refractionOffset;
       if (uniforms.noiseStrength) uniforms.noiseStrength.value = this.distortion.noiseStrength;
       if (uniforms.time) uniforms.time.value = this.distortion.time;
+      if (uniforms.surfaceIntensity) uniforms.surfaceIntensity.value = intensity;
     }
+  }
+
+  private computeSurfaceIntensity() {
+    // Map attenuation directly to a multiplier; allow >1 to visibly brighten tunnels.
+    return Math.max(0, this.bounceAttenuation);
   }
 
   private addFaces(list: Reflector[]) {
@@ -296,10 +304,12 @@ export class RayMirrorSystem implements MirrorSystem {
         refractionOffset: { value: this.distortion.refractionOffset },
         noiseStrength: { value: this.distortion.noiseStrength },
         time: { value: this.distortion.time ?? 0 },
+        surfaceIntensity: { value: this.computeSurfaceIntensity() },
       },
       fragmentShader: `
         uniform vec3 color;
         uniform sampler2D tDiffuse;
+        uniform float surfaceIntensity;
         varying vec4 vUv;
 
         #include <logdepthbuf_pars_fragment>
@@ -315,6 +325,7 @@ export class RayMirrorSystem implements MirrorSystem {
         void main() {
           #include <logdepthbuf_fragment>
           vec4 base = texture2DProj( tDiffuse, vUv );
+          base.rgb *= surfaceIntensity;
           base.rgb = clamp(base.rgb * 0.5, 0.0, 1.5); // stronger clamp to reduce persistent glare
           gl_FragColor = vec4( blendOverlay( base.rgb, color ), 1.0 );
 
