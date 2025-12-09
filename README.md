@@ -27,3 +27,4 @@ npm run dev
 - Tube meshes are rebuilt when paths change, using Catmull–Rom curves for smooth bends and per-vertex color gradients for subtle hue shifts.
 
 
+

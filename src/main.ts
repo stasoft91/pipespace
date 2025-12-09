@@ -5,8 +5,10 @@ import {
   BufferAttribute,
   CatmullRomCurve3,
   Color,
+  CurvePath,
   EdgesGeometry,
   AdditiveBlending,
+  LineCurve3,
   LineBasicMaterial,
   LineSegments,
   Mesh,
@@ -32,7 +34,10 @@ import type { SimulationConfig, Vec3 } from './simulation';
 import { PhysicalRayMirrorSystem, RasterMirrorSystem, RayMirrorSystem } from './mirrors';
 import type { MirrorReflectionMode, MirrorSystem } from './mirrors';
 
+type PathType = 'polyline' | 'catmullrom' | 'centripetal' | 'chordal';
+
 type RenderSettings = {
+  pathType: PathType;
   pipeRadius: number;
   tubularSegments: number;
   radialSegments: number;
@@ -102,6 +107,7 @@ const randColorHex = () => {
   const c = new Color().setHSL(Math.random(), rand(0.35, 0.85), rand(0.45, 0.7));
   return `#${c.getHexString()}`;
 };
+const PATH_TYPES: PathType[] = ['polyline', 'catmullrom', 'centripetal', 'chordal'];
 const canvas = document.createElement('canvas');
 canvas.id = 'pipes-canvas';
 document.body.appendChild(canvas);
@@ -152,6 +158,7 @@ const defaultSimConfig: SimulationConfig = {
 const turnProxy = { turnChance: defaultSimConfig.turnProbability * 100 };
 
 const renderSettings: RenderSettings = {
+  pathType: 'catmullrom',
   pipeRadius: 0.08,
   tubularSegments: 7,
   radialSegments: 10,
@@ -1033,6 +1040,17 @@ function setupGui() {
   pipeFolder.add(renderSettings, 'radialSegments', 4, 32, 1).name('Radial slices');
   pipeFolder.add(renderSettings, 'colorShift', 0, 0.4, 0.005).name('Color shift');
   pipeFolder
+    .add(renderSettings, 'pathType', {
+      'Polyline (no smoothing)': 'polyline',
+      'Catmull-Rom (uniform)': 'catmullrom',
+      'Catmull-Rom (centripetal)': 'centripetal',
+      'Catmull-Rom (chordal)': 'chordal',
+    })
+    .name('Path type')
+    .onChange(() => {
+      pipeManager.forceGeometryRefresh();
+    });
+  pipeFolder
     .add(renderSettings, 'hidePipesInMainCamera')
     .name('Hide in main camera')
     .onChange(() => {
@@ -1488,6 +1506,7 @@ function randomizeAll() {
   renderSettings.tubularSegments = randInt(6, 16);
   renderSettings.radialSegments = randInt(6, 22);
   renderSettings.colorShift = rand(0, 0.35);
+  renderSettings.pathType = PATH_TYPES[randInt(0, PATH_TYPES.length - 1)];
   renderSettings.headLightIntensity = rand(4, 14);
   renderSettings.headLightRange = randBool(0.3) ? 0 : rand(8, 60);
   renderSettings.headLightsEnabled = randBool(0.85);
@@ -1604,6 +1623,7 @@ class PipeVisual {
   private lastColorShift = renderSettings.colorShift;
   private lastRadialSegments = renderSettings.radialSegments;
   private lastCornerTension = renderSettings.cornerTension;
+  private lastPathType: PathType = renderSettings.pathType;
   private material: MeshPhysicalMaterial;
   private gridSize: number;
 
@@ -1628,7 +1648,8 @@ class PipeVisual {
       settings.tubularSegments !== this.lastSegments ||
       settings.colorShift !== this.lastColorShift ||
       settings.radialSegments !== this.lastRadialSegments ||
-      settings.cornerTension !== this.lastCornerTension;
+      settings.cornerTension !== this.lastCornerTension ||
+      settings.pathType !== this.lastPathType;
 
     if (needsGeometry) {
       this.mesh.geometry?.dispose();
@@ -1643,6 +1664,7 @@ class PipeVisual {
       this.lastColorShift = settings.colorShift;
       this.lastRadialSegments = settings.radialSegments;
       this.lastCornerTension = settings.cornerTension;
+      this.lastPathType = settings.pathType;
     }
 
     const headPos = toWorld(this.gridSize, pipe.head);
@@ -1764,8 +1786,25 @@ function createPipeGeometry(pipe: Pipe, gridSize: number, settings: RenderSettin
   }
   if (path.length === 1) path.push(path[0].clone().add(new Vector3(0.001, 0.001, 0.001)));
 
-  const curve = new CatmullRomCurve3(path, false, 'catmullrom', settings.cornerTension);
-  const tubularSegments = Math.max(6, Math.floor(settings.tubularSegments * path.length));
+  const curve =
+    settings.pathType === 'polyline'
+      ? (() => {
+          const curvePath = new CurvePath<Vector3>();
+          for (let i = 0; i < path.length - 1; i++) {
+            curvePath.add(new LineCurve3(path[i], path[i + 1]));
+          }
+          return curvePath;
+        })()
+      : new CatmullRomCurve3(
+          path,
+          false,
+          settings.pathType === 'catmullrom' ? 'catmullrom' : settings.pathType,
+          settings.cornerTension
+        );
+
+  const baseSegments =
+    settings.pathType === 'polyline' ? Math.max(1, path.length - 1) : Math.max(1, path.length);
+  const tubularSegments = Math.max(6, Math.floor(settings.tubularSegments * baseSegments));
   const geometry = new TubeGeometry(curve, tubularSegments, settings.pipeRadius, settings.radialSegments, false);
 
   const uv = geometry.getAttribute('uv');
