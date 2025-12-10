@@ -1,4 +1,4 @@
-import { DoubleSide, Mesh, PlaneGeometry, Scene, Vector3 } from 'three';
+import { DoubleSide, Mesh, PerspectiveCamera, PlaneGeometry, Scene, Vector3, WebGLRenderer } from 'three';
 import { Reflector } from 'three/examples/jsm/objects/Reflector.js';
 import type { MirrorDistortionUniforms, MirrorSystem } from './types';
 
@@ -10,9 +10,10 @@ type MirrorUniformBag = {
   refractionOffset?: { value: number };
   noiseStrength?: { value: number };
   time?: { value: number };
+  surfaceIntensity?: { value: number };
 };
 
-type RasterMirrorSystemOptions = {
+type RayMirrorSystemAllFacesOptions = {
   scene: Scene;
   roomMesh: Mesh;
   pipeLayer: number;
@@ -23,20 +24,27 @@ type RasterMirrorSystemOptions = {
   resolution: { width: number; height: number };
   distortion: MirrorDistortionUniforms;
   enabled: boolean;
+  maxBounces: number;
+  bounceAttenuation?: number;
+  bounceAttenuationMode?: 'skipFirst' | 'allBounces';
   showRoomMesh?: boolean;
 };
 
-export class RasterMirrorSystem implements MirrorSystem {
+/**
+ * Variation of the experimental ray mirror system that renders every face each
+ * pass without prioritizing the camera-facing mirror. This trades the facing
+ * heuristics for uniform inter-reflection regardless of viewer direction.
+ */
+export class RayMirrorSystemAllFaces implements MirrorSystem {
   private scene: Scene;
   private roomMesh: Mesh;
   private pipeLayer: number;
   private baseShader: any;
+  private maxBounces: number;
   private showRoomMesh: boolean;
 
   private facesList: Reflector[] = [];
-  private faceCenters: Vector3[] = [];
   private mirrorUniforms = new Map<number, MirrorUniformBag>();
-  private updateMask = new Set<number>();
 
   private size: number;
   private color: string;
@@ -44,12 +52,19 @@ export class RasterMirrorSystem implements MirrorSystem {
   private resolution: { width: number; height: number };
   private distortion: MirrorDistortionUniforms;
   private enabled: boolean;
+  private bounceAttenuation: number;
+  private bounceAttenuationMode: 'skipFirst' | 'allBounces';
 
-  constructor(opts: RasterMirrorSystemOptions) {
+  private baseRenders: Array<
+    (renderer: WebGLRenderer, scene: Scene, camera: PerspectiveCamera, geometry?: any, material?: any, group?: any) => void
+  > = [];
+
+  constructor(opts: RayMirrorSystemAllFacesOptions) {
     this.scene = opts.scene;
     this.roomMesh = opts.roomMesh;
     this.pipeLayer = opts.pipeLayer;
     this.baseShader = opts.baseShader;
+    this.maxBounces = Math.max(1, Math.floor(opts.maxBounces));
     this.showRoomMesh = opts.showRoomMesh ?? true;
 
     this.size = opts.size;
@@ -58,6 +73,8 @@ export class RasterMirrorSystem implements MirrorSystem {
     this.resolution = opts.resolution;
     this.distortion = opts.distortion;
     this.enabled = opts.enabled;
+    this.bounceAttenuation = Math.max(0, opts.bounceAttenuation ?? 0.65);
+    this.bounceAttenuationMode = opts.bounceAttenuationMode ?? 'skipFirst';
 
     this.facesList = this.buildMirrors(this.size, this.color);
     this.addFaces(this.facesList);
@@ -71,11 +88,6 @@ export class RasterMirrorSystem implements MirrorSystem {
 
   setInset(inset: number) {
     this.inset = inset;
-  }
-
-
-  updateFrame(): void {
-    // raster mode updates via onBeforeRender hooks driven by main render pass
   }
 
   update(size: number, color: string) {
@@ -112,15 +124,46 @@ export class RasterMirrorSystem implements MirrorSystem {
     this.applyEnabledState();
   }
 
-  setUpdateMask(mask: Set<number>) {
-    this.updateMask = mask;
+  setUpdateMask(_mask: Set<number>) {
+    // Intentionally ignored so all faces always capture.
+  }
+
+  updateFrame(renderer: WebGLRenderer, scene: Scene, camera: PerspectiveCamera) {
+    if (!this.enabled) return;
+    if (this.facesList.length === 0) return;
+
+    // Always render every face each pass to keep inter-reflections alive from any view.
+    const indices = this.facesList.map((_, i) => i);
+    const baseExposure = renderer.toneMappingExposure ?? 1;
+    const baseExposureScaled = baseExposure * 0.4; // dim captures to avoid persistent glare
+    const roomVisible = this.roomMesh.visible;
+
+    // Hide the opaque room shell so mirrored cameras outside the box can see inside.
+    this.roomMesh.visible = false;
+
+    for (let bounce = 0; bounce < this.maxBounces; bounce++) {
+      const exp = this.bounceAttenuationMode === 'allBounces' ? bounce + 1 : Math.max(1, bounce);
+      const atten = Math.pow(this.bounceAttenuation, exp);
+      renderer.toneMappingExposure = baseExposureScaled * atten;
+      for (const idx of indices) {
+        const baseRender = this.baseRenders[idx];
+        const mirror = this.facesList[idx];
+        if (!baseRender || !mirror) continue;
+        mirror.forceUpdate = true; // always update so back-facing mirrors still capture
+        baseRender(renderer, scene, camera);
+        mirror.forceUpdate = false;
+      }
+    }
+
+    this.roomMesh.visible = roomVisible;
+    renderer.toneMappingExposure = baseExposure;
   }
 
   dispose() {
     this.disposeFaces(this.facesList);
     this.facesList = [];
     this.mirrorUniforms.clear();
-    this.faceCenters = [];
+    this.baseRenders = [];
   }
 
   private applyEnabledState() {
@@ -132,6 +175,7 @@ export class RasterMirrorSystem implements MirrorSystem {
   }
 
   private applyDistortionUniforms() {
+    const intensity = this.computeSurfaceIntensity();
     for (const uniforms of this.mirrorUniforms.values()) {
       if (uniforms.blurAmount) uniforms.blurAmount.value = this.distortion.blur;
       if (uniforms.chromaticShift) uniforms.chromaticShift.value = this.distortion.chromaticShift;
@@ -140,7 +184,13 @@ export class RasterMirrorSystem implements MirrorSystem {
       if (uniforms.refractionOffset) uniforms.refractionOffset.value = this.distortion.refractionOffset;
       if (uniforms.noiseStrength) uniforms.noiseStrength.value = this.distortion.noiseStrength;
       if (uniforms.time) uniforms.time.value = this.distortion.time;
+      if (uniforms.surfaceIntensity) uniforms.surfaceIntensity.value = intensity;
     }
+  }
+
+  private computeSurfaceIntensity() {
+    // Map attenuation directly to a multiplier; allow >1 to visibly brighten tunnels.
+    return Math.max(0, this.bounceAttenuation);
   }
 
   private addFaces(list: Reflector[]) {
@@ -158,7 +208,7 @@ export class RasterMirrorSystem implements MirrorSystem {
   }
 
   private buildMirrors(size: number, color: string): Reflector[] {
-    this.faceCenters = [];
+    this.baseRenders = [];
     const half = size / 2 - this.inset;
     return [
       this.makeFace(new Vector3(half, 0, 0), (m) => m.rotateY(-Math.PI / 2), size, color, 0), // +X
@@ -177,7 +227,6 @@ export class RasterMirrorSystem implements MirrorSystem {
     faceColor: string,
     faceIndex: number
   ) {
-    this.faceCenters[faceIndex] = position.clone();
     const mirrorShader = {
       ...this.baseShader,
       uniforms: {
@@ -189,17 +238,12 @@ export class RasterMirrorSystem implements MirrorSystem {
         refractionOffset: { value: this.distortion.refractionOffset },
         noiseStrength: { value: this.distortion.noiseStrength },
         time: { value: this.distortion.time ?? 0 },
+        surfaceIntensity: { value: this.computeSurfaceIntensity() },
       },
       fragmentShader: `
         uniform vec3 color;
         uniform sampler2D tDiffuse;
-        uniform float blurAmount;
-        uniform float chromaticShift;
-        uniform float warpStrength;
-        uniform float warpSpeed;
-        uniform float refractionOffset;
-        uniform float noiseStrength;
-        uniform float time;
+        uniform float surfaceIntensity;
         varying vec4 vUv;
 
         #include <logdepthbuf_pars_fragment>
@@ -212,72 +256,12 @@ export class RasterMirrorSystem implements MirrorSystem {
           return vec3( blendOverlay( base.r, blend.r ), blendOverlay( base.g, blend.g ), blendOverlay( base.b, blend.b ) );
         }
 
-        vec3 sampleProj(vec4 proj) {
-          return texture2DProj( tDiffuse, proj ).rgb;
-        }
-
         void main() {
           #include <logdepthbuf_fragment>
-          vec4 projUv = vUv;
-          vec2 uv = projUv.xy / projUv.w;
-          vec2 dir = uv - vec2(0.5);
-          float len = length(dir);
-          vec2 dirNorm = len < 1e-4 ? vec2(1.0, 0.0) : dir / len;
-
-          // noise shimmer
-          if (noiseStrength > 0.0) {
-            float n = sin(dot(uv * vec2(1733.1, 927.7), vec2(12.9898, 78.233)) + time * 57.0);
-            vec2 noiseVec = vec2(n, fract(n * 1.2154) - 0.5);
-            uv += noiseVec * noiseStrength;
-          }
-
-          // warp
-          float warp = warpStrength;
-          if (warp > 0.0) {
-            float wobble = sin(len * 24.0 + time * warpSpeed * 6.28318);
-            uv += dirNorm * wobble * warp;
-          }
-
-          // refraction-like offset
-          if (abs(refractionOffset) > 0.0001) {
-            uv += dirNorm * refractionOffset;
-          }
-
-          // reconstruct projective coords after UV shifts
-          vec4 projSample = vec4(uv * projUv.w, projUv.zw);
-
-          // base sample
-          vec3 base = sampleProj(projSample);
-          float blur = clamp(blurAmount, 0.0, 1.0);
-
-          if (blur > 0.0) {
-            float radius = mix(0.0, 0.06, blur); // tune radius
-            vec3 accum = base;
-            float weight = 1.0;
-            const int samples = 5;
-            for (int i = 1; i <= samples; i++) {
-              float t = float(i) / float(samples);
-              vec2 offset = dir * radius * t;
-              vec4 offProj = vec4((uv + offset) * projUv.w, projUv.zw);
-              vec3 s = sampleProj(offProj);
-              float w = 1.0 - t * 0.65;
-              accum += s * w;
-              weight += w;
-            }
-            base = accum / weight;
-          }
-
-          // chromatic shift
-          float shift = chromaticShift;
-          if (shift > 0.0) {
-            vec2 cOff = dirNorm * shift;
-            float r = texture2DProj( tDiffuse, vec4((uv + cOff) * projUv.w, projUv.zw) ).r;
-            float g = texture2DProj( tDiffuse, vec4(uv * projUv.w, projUv.zw) ).g;
-            float b = texture2DProj( tDiffuse, vec4((uv - cOff) * projUv.w, projUv.zw) ).b;
-            base = vec3(r, g, b);
-          }
-
-          gl_FragColor = vec4( blendOverlay( base, color ), 1.0 );
+          vec4 base = texture2DProj( tDiffuse, vUv );
+          base.rgb *= surfaceIntensity;
+          base.rgb = clamp(base.rgb * 0.5, 0.0, 1.5); // stronger clamp to reduce persistent glare
+          gl_FragColor = vec4( blendOverlay( base.rgb, color ), 1.0 );
 
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
@@ -295,12 +279,23 @@ export class RasterMirrorSystem implements MirrorSystem {
     (mirror.material as any).side = DoubleSide;
     mirror.frustumCulled = false;
     mirror.camera.layers.enable(this.pipeLayer);
+
     const baseRender = mirror.onBeforeRender.bind(mirror);
-    mirror.onBeforeRender = (...args) => {
+    // disable automatic per-draw updates; we'll drive multi-bounce manually
+    mirror.onBeforeRender = () => {};
+
+    this.baseRenders[faceIndex] = (
+      renderer: WebGLRenderer,
+      scene: Scene,
+      camera: PerspectiveCamera,
+      geometry?: any,
+      material?: any,
+      group?: any
+    ) => {
       if (!this.enabled) return;
-      if (!this.updateMask.has(faceIndex)) return;
-      baseRender(...args);
+      baseRender(renderer, scene, camera, geometry, material, group);
     };
+
     mirror.position.copy(position);
     rotate(mirror);
     this.mirrorUniforms.set(faceIndex, (mirror.material as any).uniforms ?? {});

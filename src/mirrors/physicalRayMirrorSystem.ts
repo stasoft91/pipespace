@@ -27,6 +27,7 @@ type PhysicalRayMirrorSystemOptions = {
   maxBounces: number;
   bounceAttenuation?: number;
   bounceAttenuationMode?: 'skipFirst' | 'allBounces';
+  showRoomMesh?: boolean;
 };
 
 /**
@@ -43,6 +44,7 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
   private maxBounces: number;
   private bounceAttenuation: number;
   private bounceAttenuationMode: 'skipFirst' | 'allBounces';
+  private showRoomMesh: boolean;
 
   private facesList: Reflector[] = [];
   private mirrorUniforms = new Map<number, MirrorUniformBag>();
@@ -78,6 +80,7 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
     this.maxBounces = Math.max(1, Math.floor(opts.maxBounces));
     this.bounceAttenuation = Math.max(0, opts.bounceAttenuation ?? 0.65);
     this.bounceAttenuationMode = opts.bounceAttenuationMode ?? 'skipFirst';
+    this.showRoomMesh = opts.showRoomMesh ?? true;
 
     this.size = opts.size;
     this.color = opts.color;
@@ -288,7 +291,7 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
       f.visible = this.enabled;
       f.matrixWorldNeedsUpdate = true;
     });
-    this.roomMesh.visible = this.enabled;
+    this.roomMesh.visible = this.enabled && this.showRoomMesh;
   }
 
   private applyDistortionUniforms() {

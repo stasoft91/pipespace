@@ -27,6 +27,7 @@ type RayMirrorSystemOptions = {
   maxBounces: number;
   bounceAttenuation?: number;
   bounceAttenuationMode?: 'skipFirst' | 'allBounces';
+  showRoomMesh?: boolean;
 };
 
 /**
@@ -40,6 +41,7 @@ export class RayMirrorSystem implements MirrorSystem {
   private pipeLayer: number;
   private baseShader: any;
   private maxBounces: number;
+  private showRoomMesh: boolean;
 
   private facesList: Reflector[] = [];
   private faceCenters: Vector3[] = [];
@@ -67,6 +69,7 @@ export class RayMirrorSystem implements MirrorSystem {
     this.pipeLayer = opts.pipeLayer;
     this.baseShader = opts.baseShader;
     this.maxBounces = Math.max(1, Math.floor(opts.maxBounces));
+    this.showRoomMesh = opts.showRoomMesh ?? true;
 
     this.size = opts.size;
     this.color = opts.color;
@@ -181,7 +184,7 @@ export class RayMirrorSystem implements MirrorSystem {
       f.visible = this.enabled;
       f.matrixWorldNeedsUpdate = true;
     });
-    this.roomMesh.visible = this.enabled;
+    this.roomMesh.visible = this.enabled && this.showRoomMesh;
   }
 
   private sortFacesByFacing(indices: number[], camera: PerspectiveCamera) {

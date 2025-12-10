@@ -2,6 +2,7 @@ import './style.css';
 import {
   ACESFilmicToneMapping,
   BoxGeometry,
+  CylinderGeometry,
   BufferAttribute,
   CatmullRomCurve3,
   Color,
@@ -18,11 +19,13 @@ import {
   PointLight,
   Scene,
   SRGBColorSpace,
+  Group,
   TubeGeometry,
   Vector3,
   Vector2,
   WebGLRenderer,
   DoubleSide,
+  Quaternion,
 } from 'three';
 import { Reflector } from 'three/examples/jsm/objects/Reflector.js';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
@@ -31,7 +34,7 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import GUI from 'lil-gui';
 import { Pipe, Simulation } from './simulation';
 import type { SimulationConfig, Vec3 } from './simulation';
-import { PhysicalRayMirrorSystem, RasterMirrorSystem, RayMirrorSystem } from './mirrors';
+import { PhysicalRayMirrorSystem, RasterMirrorSystem, RayMirrorSystem, RayMirrorSystemAllFaces } from './mirrors';
 import type { MirrorReflectionMode, MirrorSystem } from './mirrors';
 
 type PathType = 'polyline' | 'catmullrom' | 'centripetal' | 'chordal';
@@ -42,14 +45,17 @@ type RenderSettings = {
   tubularSegments: number;
   radialSegments: number;
   colorShift: number;
-  headLightIntensity: number;
-  headLightRange: number;
-  headLightsEnabled: boolean;
-  maxHeadLights: number;
   backLightEnabled: boolean;
   backLightIntensity: number;
   backLightRange: number;
   backLightColor: string;
+  edgeNeonEnabled: boolean;
+  edgeNeonColor: string;
+  edgeHueTravelEnabled: boolean;
+  edgeHueTravelPeriod: number;
+  edgeNeonStrength: number;
+  edgeNeonShowMeshes: boolean;
+  edgeNeonWidth: number;
   roomRoughness: number;
   roomMetalness: number;
   roomReflectivity: number;
@@ -77,7 +83,7 @@ type OrbitSettings = {
 };
 
 type CameraMode = 'wall' | 'orbit' | 'manual' | 'rail';
-type MirrorRenderer = 'raster' | 'ray' | 'physicalRay';
+type MirrorRenderer = 'raster' | 'ray' | 'rayAllFaces' | 'physicalRay';
 
 let roomPadding = 15; // gap between grid extents and room walls
 const roomGuiSettings = {
@@ -163,14 +169,17 @@ const renderSettings: RenderSettings = {
   tubularSegments: 7,
   radialSegments: 10,
   colorShift: 0,
-  headLightIntensity: 8,
-  headLightRange: 0, // 0 = infinite distance in three.js
-  headLightsEnabled: false,
-  maxHeadLights: 8,
   backLightEnabled: false,
   backLightIntensity: 1200,
   backLightRange: 0,
   backLightColor: '#ffffff',
+  edgeNeonEnabled: true,
+  edgeNeonColor: '#3de1ff',
+  edgeHueTravelEnabled: false,
+  edgeHueTravelPeriod: 8,
+  edgeNeonStrength: 1.2,
+  edgeNeonShowMeshes: true,
+  edgeNeonWidth: 0.07,
   roomRoughness: 0.25,
   roomMetalness: 0.75,
   roomReflectivity: 1,
@@ -247,6 +256,7 @@ const cameraControl = {
   yaw: 0,
   pitch: 0.2,
   distance: 0,
+  zoomFactor: 1,
   turnSpeed: 1.8,
   pitchSpeed: 1.4,
   mouseSensitivity: 0.0035,
@@ -271,6 +281,7 @@ const scene = new Scene();
 scene.background = new Color('#000000');
 
 const camera = new PerspectiveCamera(100, window.innerWidth / window.innerHeight, 0.1, 5000);
+applyCameraZoom(cameraControl.zoomFactor);
 scene.add(camera);
 syncPipeVisibilityToMainCamera();
 const cameraLight = new PointLight(renderSettings.backLightColor, renderSettings.backLightIntensity, renderSettings.backLightRange, 2);
@@ -282,6 +293,7 @@ scene.add(cameraLight);
 const room = createRoom(defaultSimConfig.gridSize, renderSettings);
 scene.add(room.mesh);
 function createMirrorSystem(kind: MirrorRenderer): MirrorSystem {
+  const showRoomMesh = kind === 'raster';
   if (kind === 'physicalRay') {
     return new PhysicalRayMirrorSystem({
       scene,
@@ -305,6 +317,33 @@ function createMirrorSystem(kind: MirrorRenderer): MirrorSystem {
       maxBounces: rayMaxBounces,
       bounceAttenuation: mirrorBounceAttenuation,
       bounceAttenuationMode: mirrorBounceAttenuationMode,
+      showRoomMesh,
+    });
+  }
+  if (kind === 'rayAllFaces') {
+    return new RayMirrorSystemAllFaces({
+      scene,
+      roomMesh: room.mesh,
+      pipeLayer: PIPE_LAYER,
+      baseShader: BASE_REFLECTOR_SHADER,
+      size: room.size,
+      color: renderSettings.roomColor,
+      inset: mirrorInset,
+      resolution: mirrorTargetSize(),
+      distortion: {
+        blur: mirrorBlurAmount,
+        chromaticShift: mirrorChromaticShift,
+        warpStrength: mirrorWarpStrength,
+        warpSpeed: mirrorWarpSpeed,
+        refractionOffset: mirrorRefractionOffset,
+        noiseStrength: mirrorNoiseStrength,
+        time: 0,
+      },
+      enabled: mirrorEnabled,
+      maxBounces: rayMaxBounces,
+      bounceAttenuation: mirrorBounceAttenuation,
+      bounceAttenuationMode: mirrorBounceAttenuationMode,
+      showRoomMesh,
     });
   }
   if (kind === 'ray') {
@@ -330,6 +369,7 @@ function createMirrorSystem(kind: MirrorRenderer): MirrorSystem {
       maxBounces: rayMaxBounces,
       bounceAttenuation: mirrorBounceAttenuation,
       bounceAttenuationMode: mirrorBounceAttenuationMode,
+      showRoomMesh,
     });
   }
 
@@ -352,6 +392,7 @@ function createMirrorSystem(kind: MirrorRenderer): MirrorSystem {
       time: 0,
     },
     enabled: mirrorEnabled,
+    showRoomMesh,
   });
 }
 
@@ -364,6 +405,7 @@ scene.add(gridLines);
 const pipeMaterial = new MeshPhysicalMaterial({ vertexColors: true });
 updatePipeMaterial(renderSettings);
 
+let edgeNeons!: EdgeNeonSystem;
 let pipeManager!: PipeVisualManager;
 let bloomPass!: UnrealBloomPass;
 let gridSizeController: any;
@@ -378,6 +420,8 @@ let orbitBobController: any;
 let mouseSensController: any;
 let turnSpeedController: any;
 let pitchSpeedController: any;
+let cameraZoomController: any;
+let cameraDistanceController: any;
 let railSpeedController: any;
 let railRadiusController: any;
 let railWaveController: any;
@@ -600,9 +644,6 @@ function stepFrame(dt: number) {
   state.fpsSmoothed = state.fpsSmoothed * 0.9 + (1 / dt) * 0.1;
   frameIndex++;
   const enteringOrbit = cameraControl.mode === 'orbit' && lastCameraMode !== 'orbit';
-  updateMirrorMask();
-  updateMirrorDistortionUniforms(state.elapsed);
-  roomMirrors.updateFrame?.(renderer, scene, camera);
 
   if (!state.paused) {
     const allStuck = sim.update(dt);
@@ -727,6 +768,12 @@ function stepFrame(dt: number) {
   (cameraLight.color as Color).set(renderSettings.backLightColor);
 
   pipeManager.sync(sim.pipes, renderSettings);
+  edgeNeons.sync(room.size, mirrorInset, renderSettings, state.elapsed);
+  // Update mirrors after the camera and scene have settled for this frame
+  camera.updateMatrixWorld();
+  updateMirrorMask();
+  updateMirrorDistortionUniforms(state.elapsed);
+  roomMirrors.updateFrame?.(renderer, scene, camera);
   updateInfo(sim, state);
 
   lastCameraMode = cameraControl.mode;
@@ -964,6 +1011,9 @@ function setupGui() {
       gridLines = createGridOutline(size);
       gridLines.visible = renderSettings.showGrid;
       scene.add(gridLines);
+      const bounds = cameraDistanceBounds();
+      cameraControl.distance = clamp(cameraControl.distance, bounds.min, bounds.max);
+      refreshCameraDistanceController();
     });
   targetCountController = simFolder.add(defaultSimConfig, 'targetPipeCount', 1, 64, 1).name('Pipe cap').onChange((v: number) => {
     sim.config.targetPipeCount = v;
@@ -1007,6 +1057,7 @@ function setupGui() {
           gridLines = createGridOutline(sim.config.gridSize);
           gridLines.visible = renderSettings.showGrid;
           scene.add(gridLines);
+          refreshCameraDistanceController();
         },
       },
       'reset'
@@ -1094,11 +1145,24 @@ function setupGui() {
     updatePipeMaterial(renderSettings);
   });
 
-  const lightsFolder = gui.addFolder('Head lights');
-  lightsFolder.add(renderSettings, 'headLightsEnabled').name('Enabled');
-  lightsFolder.add(renderSettings, 'headLightIntensity', 0, 20, 0.1).name('Intensity');
-  lightsFolder.add(renderSettings, 'headLightRange', 0, 999, 0.1).name('Range (0 = inf)');
-  lightsFolder.add(renderSettings, 'maxHeadLights', 0, 32, 1).name('Cap');
+  const edgeNeonFolder = gui.addFolder('Edge neon');
+  edgeNeonFolder.add(renderSettings, 'edgeNeonEnabled').name('Enabled (shares neon size)');
+  edgeNeonFolder.addColor(renderSettings, 'edgeNeonColor').name('Color');
+  edgeNeonFolder.add(renderSettings, 'edgeNeonStrength', 0, 200, 0.05).name('Intensity');
+  edgeNeonFolder.add(renderSettings, 'edgeNeonShowMeshes').name('Show beams');
+  edgeNeonFolder
+    .add(renderSettings, 'edgeNeonWidth', 0.02, 0.5, 0.005)
+    .name('Width')
+    .onChange((v: number) => {
+      renderSettings.edgeNeonWidth = clamp(v, 0.02, 0.5);
+    });
+  edgeNeonFolder.add(renderSettings, 'edgeHueTravelEnabled').name('Hue travel');
+  edgeNeonFolder
+    .add(renderSettings, 'edgeHueTravelPeriod', 0.01, 60, 0.01)
+    .name('Hue period (s)')
+    .onChange((v: number) => {
+      renderSettings.edgeHueTravelPeriod = Math.max(0.01, v);
+    });
 
   const mirrorFolder = gui.addFolder('Mirrors');
   mirrorFolder.addColor(renderSettings, 'roomColor').name('Tint').onChange((v: string) => {
@@ -1116,6 +1180,7 @@ function setupGui() {
       clampCameraToRoom(camera.position);
       const { min, max } = cameraDistanceBounds();
       cameraControl.distance = clamp(cameraControl.distance, min, max);
+      refreshCameraDistanceController();
     });
   mirrorFolder.add(mirrorGuiSettings, 'enabled').name('Enabled').onChange((v: boolean) => {
     mirrorEnabled = v;
@@ -1125,6 +1190,7 @@ function setupGui() {
     .add(mirrorGuiSettings, 'renderer', {
       Raster: 'raster',
       'Ray (experimental)': 'ray',
+      'Ray (all faces)': 'rayAllFaces',
       'Ray tunnel (recursive)': 'physicalRay',
     })
     .name('Renderer')
@@ -1140,30 +1206,30 @@ function setupGui() {
   mirrorFolder
     .add(mirrorGuiSettings, 'rayBounces', 1, 16, 1)
     .name('Ray bounces')
-    .onChange((v: number) => {
-      rayMaxBounces = Math.max(1, Math.floor(v));
-      mirrorGuiSettings.rayBounces = rayMaxBounces;
-      if (mirrorRenderer === 'ray' || mirrorRenderer === 'physicalRay') {
-        roomMirrors.dispose();
-        roomMirrors = createMirrorSystem(mirrorRenderer);
-        updateMirrorResolution();
-        updateMirrorBlur();
-        updateMirrorDistortionUniforms(state.elapsed);
+      .onChange((v: number) => {
+        rayMaxBounces = Math.max(1, Math.floor(v));
+        mirrorGuiSettings.rayBounces = rayMaxBounces;
+        if (mirrorRenderer === 'ray' || mirrorRenderer === 'rayAllFaces' || mirrorRenderer === 'physicalRay') {
+          roomMirrors.dispose();
+          roomMirrors = createMirrorSystem(mirrorRenderer);
+          updateMirrorResolution();
+          updateMirrorBlur();
+          updateMirrorDistortionUniforms(state.elapsed);
         updateMirrorMask();
       }
     });
   mirrorFolder
     .add(mirrorGuiSettings, 'bounceAttenuation', 0, 10, 0.05)
     .name('Bounce attenuation')
-    .onChange((v: number) => {
-      mirrorBounceAttenuation = clamp(v, 0, 10);
-      mirrorGuiSettings.bounceAttenuation = mirrorBounceAttenuation;
-      if (mirrorRenderer === 'ray' || mirrorRenderer === 'physicalRay') {
-        roomMirrors.dispose();
-        roomMirrors = createMirrorSystem(mirrorRenderer);
-        updateMirrorResolution();
-        updateMirrorBlur();
-        updateMirrorDistortionUniforms(state.elapsed);
+      .onChange((v: number) => {
+        mirrorBounceAttenuation = clamp(v, 0, 10);
+        mirrorGuiSettings.bounceAttenuation = mirrorBounceAttenuation;
+        if (mirrorRenderer === 'ray' || mirrorRenderer === 'rayAllFaces' || mirrorRenderer === 'physicalRay') {
+          roomMirrors.dispose();
+          roomMirrors = createMirrorSystem(mirrorRenderer);
+          updateMirrorResolution();
+          updateMirrorBlur();
+          updateMirrorDistortionUniforms(state.elapsed);
         updateMirrorMask();
       }
     });
@@ -1172,15 +1238,15 @@ function setupGui() {
       'Skip first bounce': 'skipFirst',
       'Scale all bounces': 'allBounces',
     })
-    .name('Attenuation math')
-    .onChange((v: 'skipFirst' | 'allBounces') => {
-      mirrorBounceAttenuationMode = v;
-      if (mirrorRenderer === 'ray' || mirrorRenderer === 'physicalRay') {
-        roomMirrors.dispose();
-        roomMirrors = createMirrorSystem(mirrorRenderer);
-        updateMirrorResolution();
-        updateMirrorBlur();
-        updateMirrorDistortionUniforms(state.elapsed);
+      .name('Attenuation math')
+      .onChange((v: 'skipFirst' | 'allBounces') => {
+        mirrorBounceAttenuationMode = v;
+        if (mirrorRenderer === 'ray' || mirrorRenderer === 'rayAllFaces' || mirrorRenderer === 'physicalRay') {
+          roomMirrors.dispose();
+          roomMirrors = createMirrorSystem(mirrorRenderer);
+          updateMirrorResolution();
+          updateMirrorBlur();
+          updateMirrorDistortionUniforms(state.elapsed);
         updateMirrorMask();
       }
     });
@@ -1280,12 +1346,14 @@ function setupGui() {
     .add(cameraControl, 'mode', ['wall', 'orbit', 'manual', 'rail'])
     .name('Mode (wall/orbit/manual/rail)')
     .onChange((mode: CameraMode) => {
-      cameraControl.mode = mode;
-      if (mode === 'manual' && cameraControl.distance === 0) {
-        cameraControl.distance = room.size * 0.48;
-      }
-      if (mode === 'rail') {
-        railState.phase = 0;
+  cameraControl.mode = mode;
+  if (mode === 'manual' && cameraControl.distance === 0) {
+    cameraControl.distance = room.size * 0.48;
+  }
+  refreshCameraDistanceController();
+  cameraZoomController?.setValue(cameraControl.zoomFactor);
+  if (mode === 'rail') {
+    railState.phase = 0;
         railState.currentPos.copy(camera.position);
         railState.lastPos.copy(camera.position);
         railState.smoothedTarget.set(0, 0, 0);
@@ -1302,6 +1370,23 @@ function setupGui() {
   mouseSensController = cameraFolder.add(cameraControl, 'mouseSensitivity', 0.001, 0.02, 0.0005).name('Mouse sens');
   turnSpeedController = cameraFolder.add(cameraControl, 'turnSpeed', 0.2, 4, 0.1).name('Turn speed');
   pitchSpeedController = cameraFolder.add(cameraControl, 'pitchSpeed', 0.2, 4, 0.1).name('Pitch speed');
+  const { min: zoomMin, max: zoomMax } = cameraDistanceBounds();
+  cameraDistanceController = cameraFolder
+    .add(cameraControl, 'distance', zoomMin, zoomMax, 0.1)
+    .name('Manual zoom')
+    .onChange((v: number) => {
+      const bounds = cameraDistanceBounds();
+      cameraControl.distance = clamp(v, bounds.min, bounds.max);
+      refreshCameraDistanceController();
+    });
+  cameraZoomController = cameraFolder
+    .add(cameraControl, 'zoomFactor', 0.01, 2, 0.01)
+    .name('Camera zoom (all modes)')
+    .onChange((v: number) => {
+      applyCameraZoom(v);
+      cameraZoomController?.setValue(cameraControl.zoomFactor);
+    });
+  refreshCameraDistanceController();
   const railFolder = cameraFolder.addFolder('Cinematic rail');
   railSpeedController = railFolder.add(railSettings, 'speed', 0.02, 1.2, 0.01).name('Path speed');
   railRadiusController = railFolder.add(railSettings, 'radialFactor', 0.2, 1.2, 0.01).name('Radius factor');
@@ -1394,6 +1479,21 @@ function cameraDistanceBounds() {
   };
 }
 
+function applyCameraZoom(factor: number) {
+  const clamped = clamp(factor, 0.01, 2);
+  cameraControl.zoomFactor = clamped;
+  camera.zoom = clamped;
+  camera.updateProjectionMatrix();
+}
+
+function refreshCameraDistanceController() {
+  if (!cameraDistanceController) return;
+  const { min, max } = cameraDistanceBounds();
+  cameraDistanceController.min(min);
+  cameraDistanceController.max(max);
+  cameraDistanceController.setValue(clamp(cameraControl.distance, min, max));
+}
+
 function cameraBoundsLimit(margin = CAMERA_MARGIN) {
   const inset = mirrorInset + CAMERA_WALL_EPS;
   const halfSize = room.size * 0.5;
@@ -1476,6 +1576,8 @@ function randomizeCameraSettings() {
   mouseSensController?.setValue(cameraControl.mouseSensitivity);
   turnSpeedController?.setValue(cameraControl.turnSpeed);
   pitchSpeedController?.setValue(cameraControl.pitchSpeed);
+  refreshCameraDistanceController();
+  cameraZoomController?.setValue(cameraControl.zoomFactor);
 
   railSpeedController?.setValue(railSettings.speed);
   railRadiusController?.setValue(railSettings.radialFactor);
@@ -1507,10 +1609,6 @@ function randomizeAll() {
   renderSettings.radialSegments = randInt(6, 22);
   renderSettings.colorShift = rand(0, 0.35);
   renderSettings.pathType = PATH_TYPES[randInt(0, PATH_TYPES.length - 1)];
-  renderSettings.headLightIntensity = rand(4, 14);
-  renderSettings.headLightRange = randBool(0.3) ? 0 : rand(8, 60);
-  renderSettings.headLightsEnabled = randBool(0.85);
-  renderSettings.maxHeadLights = randInt(4, 18);
   renderSettings.roomRoughness = rand(0, 0.25);
   renderSettings.roomMetalness = rand(0.7, 1);
   renderSettings.roomReflectivity = rand(0.85, 1);
@@ -1526,6 +1624,13 @@ function randomizeAll() {
   renderSettings.neonEnabled = randBool(0.8);
   renderSettings.neonStrength = rand(0.4, 1.4);
   renderSettings.neonSize = 1;
+  renderSettings.edgeNeonEnabled = randBool(0.9);
+  renderSettings.edgeNeonColor = randColorHex();
+  renderSettings.edgeHueTravelEnabled = randBool(0.5);
+  renderSettings.edgeHueTravelPeriod = rand(2, 14);
+  renderSettings.edgeNeonStrength = rand(0.6, 6);
+  renderSettings.edgeNeonShowMeshes = randBool(0.8);
+  renderSettings.edgeNeonWidth = rand(0.03, 0.18);
   renderSettings.bloomStrength = rand(0.4, 1.2);
   renderSettings.bloomRadius = rand(0.2, 0.6);
   renderSettings.bloomThreshold = rand(0.08, 0.3);
@@ -1562,6 +1667,7 @@ function randomizeAll() {
   growthIntervalController?.setValue(defaultSimConfig.growthInterval);
   turnController?.setValue(turnProxy.turnChance);
   tailShrinkController?.setValue(defaultSimConfig.disableTailShrink);
+  refreshCameraDistanceController();
 }
 
 function createRoom(
@@ -1605,6 +1711,170 @@ function createRoom(
     updateSize,
   };
 }
+
+class EdgeNeonSystem {
+  private group = new Group();
+  private scene: Scene;
+  private baseMaterial = new MeshBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.9,
+    toneMapped: false,
+  });
+  private glowMaterial = new MeshBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.8,
+    blending: AdditiveBlending,
+    depthWrite: false,
+    toneMapped: false,
+  });
+  private geometry: CylinderGeometry | null = null;
+  private meshes: Mesh[] = [];
+  private glowMeshes: Mesh[] = [];
+  private lights: PointLight[] = [];
+  private lastRoomSize = 0;
+  private lastInset = 0;
+  private lastRadius = 0;
+  private baseColor = new Color();
+  private animatedColor = new Color();
+  private hsl = { h: 0, s: 0, l: 0 };
+  private up = new Vector3(0, 1, 0);
+  private tmpDir = new Vector3();
+  private tmpQuat = new Quaternion();
+
+  constructor(scene: Scene) {
+    this.scene = scene;
+    this.group.visible = false;
+    this.scene.add(this.group);
+  }
+
+  sync(roomSize: number, wallInset: number, settings: RenderSettings, time: number) {
+    const targetWidth = settings.edgeNeonWidth ?? settings.pipeRadius * 0.9;
+    const width = Math.min(0.5, Math.max(0.02, targetWidth));
+    const radius = Math.min(0.25, Math.max(0.01, width * 0.5));
+    const inset = Math.max(0.08, wallInset + 0.12);
+    if (
+      !this.geometry ||
+      Math.abs(roomSize - this.lastRoomSize) > 1e-4 ||
+      Math.abs(inset - this.lastInset) > 1e-4 ||
+      Math.abs(radius - this.lastRadius) > 1e-4
+    ) {
+      this.rebuild(roomSize, inset, radius);
+    }
+    this.updateAppearance(settings, time);
+  }
+
+  private rebuild(roomSize: number, inset: number, radius: number) {
+    this.disposeGeometry();
+    const half = Math.max(radius * 2, roomSize * 0.5 - inset);
+    const length = Math.max(radius * 4, half * 2);
+    this.geometry = new CylinderGeometry(radius, radius, length, 12, 1, true);
+    const offsets = [-half, half];
+    for (const y of offsets) {
+      for (const z of offsets) {
+        this.createEdge(new Vector3(-half, y, z), new Vector3(half, y, z), roomSize);
+      }
+    }
+    for (const x of offsets) {
+      for (const z of offsets) {
+        this.createEdge(new Vector3(x, -half, z), new Vector3(x, half, z), roomSize);
+      }
+    }
+    for (const x of offsets) {
+      for (const y of offsets) {
+        this.createEdge(new Vector3(x, y, -half), new Vector3(x, y, half), roomSize);
+      }
+    }
+    this.lastRoomSize = roomSize;
+    this.lastInset = inset;
+    this.lastRadius = radius;
+  }
+
+  private createEdge(start: Vector3, end: Vector3, roomSize: number) {
+    if (!this.geometry) return;
+    const mesh = new Mesh(this.geometry, this.baseMaterial);
+    const glow = new Mesh(this.geometry, this.glowMaterial);
+    const mid = new Vector3().addVectors(start, end).multiplyScalar(0.5);
+    this.tmpDir.copy(end).sub(start).normalize();
+    this.tmpQuat.setFromUnitVectors(this.up, this.tmpDir);
+    mesh.position.copy(mid);
+    mesh.quaternion.copy(this.tmpQuat);
+    glow.position.copy(mid);
+    glow.quaternion.copy(this.tmpQuat);
+    this.group.add(mesh, glow);
+    this.meshes.push(mesh);
+    this.glowMeshes.push(glow);
+
+    // Populate a few point lights along the edge to cast light into the room.
+    const span = start.distanceTo(end);
+    const segments = Math.min(12, Math.max(3, Math.round(span / 12)));
+    for (let i = 0; i < segments; i++) {
+      const t = (i + 0.5) / segments;
+      const pos = new Vector3().lerpVectors(start, end, t);
+      const light = new PointLight(this.baseColor.clone(), 0, Math.max(roomSize * 0.75, span * 0.6), 1.35);
+      light.position.copy(pos);
+      this.scene.add(light);
+      this.lights.push(light);
+    }
+  }
+
+  private updateAppearance(settings: RenderSettings, time: number) {
+    const active = settings.edgeNeonEnabled;
+    const showMeshes = settings.edgeNeonShowMeshes !== false;
+    this.group.visible = active && showMeshes;
+    this.baseColor.set(settings.edgeNeonColor);
+    this.baseColor.getHSL(this.hsl);
+    let hue = this.hsl.h;
+    if (settings.edgeHueTravelEnabled) {
+      const period = Math.max(0.01, settings.edgeHueTravelPeriod);
+      hue = (hue + time / period) % 1;
+    }
+    this.animatedColor.setHSL(hue, this.hsl.s, this.hsl.l);
+    const intensity = Math.max(0, settings.edgeNeonStrength);
+    this.baseMaterial.color.copy(this.animatedColor);
+    this.baseMaterial.opacity = Math.min(1, Math.max(0.05, intensity * 0.6));
+    this.glowMaterial.color.copy(this.animatedColor).multiplyScalar(Math.max(0.01, intensity));
+    this.glowMaterial.opacity = 1;
+    const glowScale = settings.neonSize;
+    for (const glow of this.glowMeshes) {
+      glow.scale.setScalar(glowScale);
+    }
+    const lightDistance = Math.max(2, this.lastRoomSize * 0.75);
+    const lightIntensity = active ? intensity * 35 : 0;
+    for (const light of this.lights) {
+      light.visible = active;
+      light.color.copy(this.animatedColor);
+      light.intensity = lightIntensity;
+      light.distance = lightDistance;
+      light.decay = 1.35;
+    }
+  }
+
+  private disposeGeometry() {
+    for (const mesh of this.meshes) {
+      this.group.remove(mesh);
+    }
+    for (const glow of this.glowMeshes) {
+      this.group.remove(glow);
+    }
+    for (const light of this.lights) {
+      this.scene.remove(light);
+    }
+    this.meshes = [];
+    this.glowMeshes = [];
+    this.lights = [];
+    this.geometry?.dispose();
+    this.geometry = null;
+  }
+
+  dispose() {
+    this.disposeGeometry();
+    this.scene.remove(this.group);
+    this.baseMaterial.dispose();
+    this.glowMaterial.dispose();
+  }
+}
 const cellSize = 1;
 const toWorld = (gridSize: number, cell: Vec3): Vector3 => {
   const half = gridSize / 2;
@@ -1615,8 +1885,6 @@ class PipeVisual {
   mesh: Mesh;
   glow?: Mesh;
   glowMaterial?: MeshBasicMaterial;
-  light: PointLight;
-  headColor = new Color();
   private lastVersion = -1;
   private lastRadius = renderSettings.pipeRadius;
   private lastSegments = renderSettings.tubularSegments;
@@ -1634,14 +1902,10 @@ class PipeVisual {
     this.mesh.layers.set(PIPE_LAYER);
     this.glow = undefined;
     this.glowMaterial = undefined;
-    this.light = new PointLight(0xffffff, 0, 0, 2);
-    this.light.castShadow = false;
-    this.light.visible = false;
-    this.light.layers.set(PIPE_LAYER);
-    this.update(pipe, settings, false);
+    this.update(pipe, settings);
   }
 
-  update(pipe: Pipe, settings: RenderSettings, headLightOn: boolean): void {
+  update(pipe: Pipe, settings: RenderSettings): void {
     const needsGeometry =
       pipe.version !== this.lastVersion ||
       settings.pipeRadius !== this.lastRadius ||
@@ -1653,7 +1917,7 @@ class PipeVisual {
 
     if (needsGeometry) {
       this.mesh.geometry?.dispose();
-      this.mesh.geometry = createPipeGeometry(pipe, this.gridSize, settings, this.headColor);
+      this.mesh.geometry = createPipeGeometry(pipe, this.gridSize, settings);
       if (this.glow) {
         this.glow.geometry.dispose();
         this.glow.geometry = this.mesh.geometry;
@@ -1666,23 +1930,6 @@ class PipeVisual {
       this.lastCornerTension = settings.cornerTension;
       this.lastPathType = settings.pathType;
     }
-
-    const headPos = toWorld(this.gridSize, pipe.head);
-    if (pipe.headLerp < 1 && pipe.cells.length > 1) {
-      const prev = toWorld(this.gridSize, pipe.prevHead);
-      headPos.lerpVectors(prev, headPos, pipe.headLerp);
-    }
-
-    this.light.visible = headLightOn;
-    if (headLightOn) {
-      this.light.intensity = settings.headLightIntensity;
-      this.light.distance = settings.headLightRange;
-      this.light.decay = 1.2;
-      this.light.color.copy(this.headColor);
-    } else {
-      this.light.intensity = 0;
-    }
-    this.light.position.copy(headPos);
 
     if (settings.neonEnabled) {
       if (!this.glow || !this.glowMaterial) {
@@ -1720,7 +1967,6 @@ class PipeVisual {
 
 class PipeVisualManager {
   private visuals = new Map<number, PipeVisual>();
-  private headLightIds = new Set<number>();
   private scene: Scene;
   private material: MeshPhysicalMaterial;
   private gridSize: number;
@@ -1745,27 +1991,23 @@ class PipeVisualManager {
     const activeIds = new Set(pipes.map((p) => p.id));
     for (const [id, visual] of this.visuals.entries()) {
       if (!activeIds.has(id)) {
-        this.scene.remove(visual.mesh, visual.light);
+        this.scene.remove(visual.mesh);
         if (visual.glow) this.scene.remove(visual.glow);
         visual.dispose();
         this.visuals.delete(id);
       }
     }
 
-    const sortedByBirth = [...pipes].sort((a, b) => b.birthIndex - a.birthIndex).slice(0, settings.maxHeadLights);
-    this.headLightIds = new Set(sortedByBirth.map((p) => p.id));
-
     for (const pipe of pipes) {
       let visual = this.visuals.get(pipe.id);
       if (!visual) {
         visual = new PipeVisual(this.material, this.gridSize, pipe, settings);
         this.visuals.set(pipe.id, visual);
-        this.scene.add(visual.mesh, visual.light);
+        this.scene.add(visual.mesh);
         const glow = visual.glow;
         if (glow) this.scene.add(glow);
       }
-      const hasHeadLight = settings.headLightsEnabled && this.headLightIds.has(pipe.id);
-      visual.update(pipe, settings, hasHeadLight);
+      visual.update(pipe, settings);
       const glowMesh = visual.glow as Mesh | undefined;
       if (glowMesh) {
         const present = this.scene.children.some((child) => child === glowMesh);
@@ -1777,7 +2019,7 @@ class PipeVisualManager {
   }
 }
 
-function createPipeGeometry(pipe: Pipe, gridSize: number, settings: RenderSettings, headColor: Color) {
+function createPipeGeometry(pipe: Pipe, gridSize: number, settings: RenderSettings) {
   const path = pipe.cells.map((cell) => toWorld(gridSize, cell));
   if (pipe.headLerp < 1 && pipe.cells.length > 1) {
     const last = path.length - 1;
@@ -1809,7 +2051,6 @@ function createPipeGeometry(pipe: Pipe, gridSize: number, settings: RenderSettin
 
   const uv = geometry.getAttribute('uv');
   const colors = new Float32Array(geometry.attributes.position.count * 3);
-  let maxV = -Infinity;
 
   for (let i = 0; i < geometry.attributes.position.count; i++) {
     const v = uv.getY(i); // 0..1 along tube length
@@ -1819,16 +2060,13 @@ function createPipeGeometry(pipe: Pipe, gridSize: number, settings: RenderSettin
     colors[i * 3] = c.r;
     colors[i * 3 + 1] = c.g;
     colors[i * 3 + 2] = c.b;
-    if (v >= maxV) {
-      headColor.copy(c);
-      maxV = v;
-    }
   }
 
   geometry.setAttribute('color', new BufferAttribute(colors, 3));
   return geometry;
 }
 
+edgeNeons = new EdgeNeonSystem(scene);
 pipeManager = new PipeVisualManager(scene, pipeMaterial, defaultSimConfig.gridSize);
 requestAnimationFrame(frame);
 setupGui();
