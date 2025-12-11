@@ -32,6 +32,7 @@ import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import GUI from 'lil-gui';
+import { ModulationManager, type LfoConfig } from './modulation';
 import { Pipe, Simulation } from './simulation';
 import type { SimulationConfig, Vec3 } from './simulation';
 import { PhysicalRayMirrorSystem, RasterMirrorSystem, RayMirrorSystem, RayMirrorSystemAllFaces } from './mirrors';
@@ -82,8 +83,11 @@ type OrbitSettings = {
   bobStrength: number;
 };
 
-type CameraMode = 'wall' | 'orbit' | 'manual' | 'rail';
+type CameraMode = 'wall' | 'wallDrift' | 'orbit' | 'manual' | 'rail';
 type MirrorRenderer = 'raster' | 'ray' | 'rayAllFaces' | 'physicalRay';
+const modulation = new ModulationManager();
+const modulationGlobals = { bpm: 120 };
+let modulationBaseSetters: Record<string, (v: number) => void> = {};
 
 let roomPadding = 15; // gap between grid extents and room walls
 const roomGuiSettings = {
@@ -112,6 +116,19 @@ const randBool = (p = 0.5) => Math.random() < p;
 const randColorHex = () => {
   const c = new Color().setHSL(Math.random(), rand(0.35, 0.85), rand(0.45, 0.7));
   return `#${c.getHexString()}`;
+};
+const hueFromHex = (hex: string) => {
+  const c = new Color(hex);
+  const hsl = { h: 0, s: 0, l: 0 };
+  c.getHSL(hsl);
+  return hsl.h;
+};
+const applyHueToHex = (hex: string, hue: number) => {
+  const base = new Color(hex);
+  const hsl = { h: 0, s: 0, l: 0 };
+  base.getHSL(hsl);
+  const next = new Color().setHSL(((hue % 1) + 1) % 1, hsl.s, hsl.l);
+  return `#${next.getHexString()}`;
 };
 const PATH_TYPES: PathType[] = ['polyline', 'catmullrom', 'centripetal', 'chordal'];
 const canvas = document.createElement('canvas');
@@ -223,6 +240,11 @@ const mirrorGuiSettings = {
 const orbitSettings: OrbitSettings = {
   orbitSpeed: 0.42,
   bobStrength: 0.42,
+};
+
+const wallDriftSettings = {
+  movement: 0.35,
+  bobStrength: 0.22,
 };
 
 const railSettings = {
@@ -422,6 +444,8 @@ let turnSpeedController: any;
 let pitchSpeedController: any;
 let cameraZoomController: any;
 let cameraDistanceController: any;
+let wallMovementController: any;
+let wallBobController: any;
 let railSpeedController: any;
 let railRadiusController: any;
 let railWaveController: any;
@@ -445,6 +469,8 @@ const makeBloom = () =>
 bloomPass = makeBloom();
 composer.addPass(renderPass);
 composer.addPass(bloomPass);
+modulation.setGlobalBpm(modulationGlobals.bpm);
+modulationBaseSetters = setupModulationTargets();
 
 const state = {
   paused: false,
@@ -460,6 +486,8 @@ let frameIndex = 0;
 let mirrorUpdateOffset = 0;
 let mirrorUpdateMask = new Set<number>();
 const ORIGIN = new Vector3(0, 0, 0);
+const WORLD_UP = new Vector3(0, 1, 0);
+const WORLD_FORWARD = new Vector3(0, 0, 1);
 const CAMERA_MARGIN = 1.5;
 const CAMERA_WALL_EPS = 0.6;
 const camDir = new Vector3();
@@ -473,6 +501,13 @@ const wallNormals = [
   new Vector3(0, 0, -1),
 ] as const;
 const wallFacingState = { target: new Vector3() };
+const wallDriftState = {
+  travelPhase: Math.random() * Math.PI * 2,
+  bobPhase: Math.random() * Math.PI * 2,
+  target: new Vector3(),
+  tangentA: new Vector3(),
+  tangentB: new Vector3(),
+};
 const orbitState = {
   phase: 0,
   swayPhase: Math.random() * Math.PI * 2,
@@ -642,8 +677,10 @@ function frame(now: number) {
 function stepFrame(dt: number) {
   state.elapsed += dt;
   state.fpsSmoothed = state.fpsSmoothed * 0.9 + (1 / dt) * 0.1;
+  modulation.update(state.elapsed, dt);
   frameIndex++;
   const enteringOrbit = cameraControl.mode === 'orbit' && lastCameraMode !== 'orbit';
+  const enteringWallDrift = cameraControl.mode === 'wallDrift' && lastCameraMode !== 'wallDrift';
 
   if (!state.paused) {
     const allStuck = sim.update(dt);
@@ -725,6 +762,38 @@ function stepFrame(dt: number) {
     const rollAlpha = 1 - Math.exp(-dt / 0.3);
     railState.roll += (targetRoll - railState.roll) * rollAlpha;
     roll = railState.roll;
+  } else if (cameraControl.mode === 'wallDrift') {
+    if (enteringWallDrift) {
+      resetWallDriftState();
+    }
+    const half = room.size * 0.5 - mirrorInset * 0.5;
+    const faceIdx = clamp(Math.round(cameraControl.wallFace ?? 0), 0, wallNormals.length - 1);
+    const faceNormal = wallNormals[faceIdx];
+    const opposingNormal = faceNormal.clone().negate();
+    const moveSpeed = 0.7 + wallDriftSettings.movement * 0.6;
+    wallDriftState.travelPhase += dt * moveSpeed;
+    wallDriftState.bobPhase += dt * (0.9 + wallDriftSettings.movement * 0.8);
+    buildWallBasis(faceNormal, wallDriftState.tangentA, wallDriftState.tangentB);
+
+    const driftRange = Math.max(0, half * wallDriftSettings.movement);
+    wallDriftState.target.copy(faceNormal).setLength(Math.max(0, half));
+    if (driftRange > 0) {
+      const sweepA = Math.sin(wallDriftState.travelPhase * 0.85) * driftRange;
+      const sweepB =
+        Math.sin(wallDriftState.travelPhase * 1.1 + Math.cos(wallDriftState.bobPhase) * 0.5) * driftRange;
+      wallDriftState.target.addScaledVector(wallDriftState.tangentA, sweepA);
+      wallDriftState.target.addScaledVector(wallDriftState.tangentB, sweepB);
+    }
+
+    const bobOffset =
+      Math.sin(wallDriftState.bobPhase * 1.25 + Math.sin(wallDriftState.travelPhase) * 0.35) *
+      wallDriftSettings.bobStrength *
+      half *
+      0.28;
+    camera.position.copy(opposingNormal).setLength(Math.max(0, half));
+    camera.position.addScaledVector(wallDriftState.tangentB, bobOffset);
+    lookTarget = wallDriftState.target;
+    roll = 0;
   } else if (cameraControl.mode === 'wall') {
     const half = room.size * 0.5 - mirrorInset * 0.5;
     const faceIdx = clamp(Math.round(cameraControl.wallFace ?? 0), 0, wallNormals.length - 1);
@@ -1017,6 +1086,7 @@ function setupGui() {
     });
   targetCountController = simFolder.add(defaultSimConfig, 'targetPipeCount', 1, 64, 1).name('Pipe cap').onChange((v: number) => {
     sim.config.targetPipeCount = v;
+    modulationBaseSetters['sim.targetCount']?.(sim.config.targetPipeCount);
   });
   maxLengthController = simFolder
     .add(defaultSimConfig, 'maxPipeLength', 0, 300, 1)
@@ -1025,17 +1095,21 @@ function setupGui() {
       const normalized = Math.max(0, Math.floor(v));
       defaultSimConfig.maxPipeLength = normalized;
       sim.config.maxPipeLength = normalized === 0 ? 0 : Math.max(4, normalized);
+      modulationBaseSetters['sim.maxLength']?.(defaultSimConfig.maxPipeLength);
     });
   growthIntervalController = simFolder.add(defaultSimConfig, 'growthInterval', 0.001, 1, 0.001).name('Growth interval').onChange((v: number) => {
     sim.config.growthInterval = Math.max(0.01, v);
+    modulationBaseSetters['sim.growthInterval']?.(sim.config.growthInterval);
   });
   turnController = simFolder
     .add(turnProxy, 'turnChance', 0, 100, 1)
     .name('Turn probability %')
     .onChange((v: number) => {
       const normalized = Math.min(1, Math.max(0, v / 100));
+      turnProxy.turnChance = v;
       defaultSimConfig.turnProbability = normalized;
       sim.config.turnProbability = normalized;
+      modulationBaseSetters['sim.turnChance']?.(turnProxy.turnChance);
     });
   tailShrinkController = simFolder
     .add(defaultSimConfig, 'disableTailShrink')
@@ -1058,6 +1132,7 @@ function setupGui() {
           gridLines.visible = renderSettings.showGrid;
           scene.add(gridLines);
           refreshCameraDistanceController();
+          modulation.syncBaseFromTargets();
         },
       },
       'reset'
@@ -1086,10 +1161,30 @@ function setupGui() {
     .name('Render 60fps video');
 
   const pipeFolder = gui.addFolder('Pipes');
-  pipeFolder.add(renderSettings, 'pipeRadius', 0.05, 0.6, 0.01).name('Radius');
-  pipeFolder.add(renderSettings, 'tubularSegments', 3, 20, 1).name('Smoothness');
-  pipeFolder.add(renderSettings, 'radialSegments', 4, 32, 1).name('Radial slices');
-  pipeFolder.add(renderSettings, 'colorShift', 0, 0.4, 0.005).name('Color shift');
+  pipeFolder
+    .add(renderSettings, 'pipeRadius', 0.05, 0.6, 0.01)
+    .name('Radius')
+    .onChange((v: number) => {
+      modulationBaseSetters['pipes.radius']?.(v);
+    });
+  pipeFolder
+    .add(renderSettings, 'tubularSegments', 3, 20, 1)
+    .name('Smoothness')
+    .onChange((v: number) => {
+      modulationBaseSetters['pipes.tubularSegments']?.(v);
+    });
+  pipeFolder
+    .add(renderSettings, 'radialSegments', 4, 32, 1)
+    .name('Radial slices')
+    .onChange((v: number) => {
+      modulationBaseSetters['pipes.radialSegments']?.(v);
+    });
+  pipeFolder
+    .add(renderSettings, 'colorShift', 0, 0.4, 0.005)
+    .name('Color shift')
+    .onChange((v: number) => {
+      modulationBaseSetters['pipes.colorShift']?.(v);
+    });
   pipeFolder
     .add(renderSettings, 'pathType', {
       'Polyline (no smoothing)': 'polyline',
@@ -1109,24 +1204,29 @@ function setupGui() {
     });
   pipeFolder.add(renderSettings, 'pipeRoughness', 0, 1, 0.01).name('Roughness').onChange((v: number) => {
     pipeMaterial.roughness = v;
+    modulationBaseSetters['pipes.roughness']?.(v);
   });
   pipeFolder.add(renderSettings, 'pipeMetalness', 0, 1, 0.01).name('Metalness').onChange((v: number) => {
     pipeMaterial.metalness = v;
+    modulationBaseSetters['pipes.metalness']?.(v);
   });
   pipeFolder
     .add(renderSettings, 'cornerTension', 0, 3, 0.01)
     .name('Corner smoothness')
     .onChange(() => {
       pipeManager.forceGeometryRefresh();
+      modulationBaseSetters['pipes.cornerTension']?.(renderSettings.cornerTension);
     });
   pipeFolder.add(renderSettings, 'neonEnabled').name('Neon glow').onChange(() => {
     pipeManager.forceGeometryRefresh();
   });
   pipeFolder.add(renderSettings, 'neonStrength', 0, 4, 0.05).name('Neon intensity').onChange(() => {
     pipeManager.forceGeometryRefresh();
+    modulationBaseSetters['pipes.neonStrength']?.(renderSettings.neonStrength);
   });
   pipeFolder.add(renderSettings, 'neonSize', 0.98, 1.2, 0.005).name('Neon size').onChange(() => {
     pipeManager.forceGeometryRefresh();
+    modulationBaseSetters['pipes.neonSize']?.(renderSettings.neonSize);
   });
   pipeFolder.add(renderSettings, 'glassEnabled').name('Glass mode').onChange((enabled: boolean) => {
     renderSettings.glassEnabled = enabled;
@@ -1135,26 +1235,37 @@ function setupGui() {
   pipeFolder.add(renderSettings, 'glassTransmission', 0, 1, 0.01).name('Glass transmission').onChange((v: number) => {
     renderSettings.glassTransmission = v;
     updatePipeMaterial(renderSettings);
+    modulationBaseSetters['pipes.glassTransmission']?.(v);
   });
   pipeFolder.add(renderSettings, 'glassOpacity', 0, 1, 0.01).name('Glass opacity').onChange((v: number) => {
     renderSettings.glassOpacity = v;
     updatePipeMaterial(renderSettings);
+    modulationBaseSetters['pipes.glassOpacity']?.(v);
   });
   pipeFolder.add(renderSettings, 'glassIor', 1, 2.5, 0.01).name('Glass IOR').onChange((v: number) => {
     renderSettings.glassIor = v;
     updatePipeMaterial(renderSettings);
+    modulationBaseSetters['pipes.glassIor']?.(v);
   });
 
   const edgeNeonFolder = gui.addFolder('Edge neon');
   edgeNeonFolder.add(renderSettings, 'edgeNeonEnabled').name('Enabled (shares neon size)');
-  edgeNeonFolder.addColor(renderSettings, 'edgeNeonColor').name('Color');
-  edgeNeonFolder.add(renderSettings, 'edgeNeonStrength', 0, 200, 0.05).name('Intensity');
+  edgeNeonFolder.addColor(renderSettings, 'edgeNeonColor').name('Color').onChange(() => {
+    modulationBaseSetters['edge.hue']?.(hueFromHex(renderSettings.edgeNeonColor));
+  });
+  edgeNeonFolder
+    .add(renderSettings, 'edgeNeonStrength', 0, 200, 0.05)
+    .name('Intensity')
+    .onChange((v: number) => {
+      modulationBaseSetters['edge.neonStrength']?.(v);
+    });
   edgeNeonFolder.add(renderSettings, 'edgeNeonShowMeshes').name('Show beams');
   edgeNeonFolder
     .add(renderSettings, 'edgeNeonWidth', 0.02, 0.5, 0.005)
     .name('Width')
     .onChange((v: number) => {
       renderSettings.edgeNeonWidth = clamp(v, 0.02, 0.5);
+      modulationBaseSetters['edge.width']?.(renderSettings.edgeNeonWidth);
     });
   edgeNeonFolder.add(renderSettings, 'edgeHueTravelEnabled').name('Hue travel');
   edgeNeonFolder
@@ -1162,12 +1273,14 @@ function setupGui() {
     .name('Hue period (s)')
     .onChange((v: number) => {
       renderSettings.edgeHueTravelPeriod = Math.max(0.01, v);
+      modulationBaseSetters['edge.huePeriod']?.(renderSettings.edgeHueTravelPeriod);
     });
 
   const mirrorFolder = gui.addFolder('Mirrors');
   mirrorFolder.addColor(renderSettings, 'roomColor').name('Tint').onChange((v: string) => {
     room.material.color.set(v);
     roomMirrors.update(room.size, v);
+    modulationBaseSetters['room.hue']?.(hueFromHex(renderSettings.roomColor));
   });
   mirrorFolder
     .add(roomGuiSettings, 'wallGap', 0, 70, 0.5)
@@ -1181,6 +1294,7 @@ function setupGui() {
       const { min, max } = cameraDistanceBounds();
       cameraControl.distance = clamp(cameraControl.distance, min, max);
       refreshCameraDistanceController();
+      modulationBaseSetters['room.wallGap']?.(roomPadding);
     });
   mirrorFolder.add(mirrorGuiSettings, 'enabled').name('Enabled').onChange((v: boolean) => {
     mirrorEnabled = v;
@@ -1267,6 +1381,7 @@ function setupGui() {
       mirrorInset = Math.max(0, v);
       roomMirrors.setInset(mirrorInset);
       roomMirrors.update(room.size, renderSettings.roomColor);
+      modulationBaseSetters['mirror.inset']?.(mirrorInset);
     });
   mirrorFolder
     .add(mirrorGuiSettings, 'blur', 0, 1, 0.01)
@@ -1274,36 +1389,42 @@ function setupGui() {
     .onChange((v: number) => {
       mirrorBlurAmount = Math.max(0, Math.min(1, v));
       updateMirrorBlur();
+      modulationBaseSetters['mirror.blur']?.(mirrorBlurAmount);
     });
   mirrorFolder
     .add(mirrorGuiSettings, 'chromaticShift', 0, 0.1, 0.0005)
     .name('Chromatic shift')
     .onChange((v: number) => {
       mirrorChromaticShift = Math.max(0, v);
+      modulationBaseSetters['mirror.chromaticShift']?.(mirrorChromaticShift);
     });
   mirrorFolder
     .add(mirrorGuiSettings, 'warpStrength', 0, 0.05, 0.0005)
     .name('Warp strength')
     .onChange((v: number) => {
       mirrorWarpStrength = Math.max(0, v);
+      modulationBaseSetters['mirror.warpStrength']?.(mirrorWarpStrength);
     });
   mirrorFolder
     .add(mirrorGuiSettings, 'warpSpeed', 0, 5, 0.05)
     .name('Warp speed')
     .onChange((v: number) => {
       mirrorWarpSpeed = Math.max(0, v);
+      modulationBaseSetters['mirror.warpSpeed']?.(mirrorWarpSpeed);
     });
   mirrorFolder
     .add(mirrorGuiSettings, 'refractionOffset', -0.05, 0.05, 0.0005)
     .name('Refraction offset')
     .onChange((v: number) => {
       mirrorRefractionOffset = v;
+      modulationBaseSetters['mirror.refractionOffset']?.(mirrorRefractionOffset);
     });
   mirrorFolder
     .add(mirrorGuiSettings, 'noiseStrength', 0, 0.01, 0.0002)
     .name('Noise shimmer')
     .onChange((v: number) => {
       mirrorNoiseStrength = Math.max(0, v);
+      modulationBaseSetters['mirror.noiseStrength']?.(mirrorNoiseStrength);
     });
   mirrorFolder
     .add(mirrorGuiSettings, 'maxResolution', 256, 4096 * 4, 64)
@@ -1311,12 +1432,14 @@ function setupGui() {
     .onChange((v: number) => {
       reflectorMaxRes = v;
       updateMirrorResolution();
+      modulationBaseSetters['mirror.maxResolution']?.(reflectorMaxRes);
     });
   mirrorFolder
     .add(mirrorGuiSettings, 'facesPerFrame', 1, 6, 1)
     .name('Faces per frame')
     .onChange((v: number) => {
       mirrorFacesPerFrame = Math.max(1, Math.floor(v));
+      modulationBaseSetters['mirror.facesPerFrame']?.(mirrorFacesPerFrame);
     });
   updateMirrorBlur();
   mirrorFolder.add(renderSettings, 'showGrid').name('Show grid').onChange((visible: boolean) => {
@@ -1330,33 +1453,39 @@ function setupGui() {
     .name('Intensity')
     .onChange((v: number) => {
       cameraLight.intensity = v;
+      modulationBaseSetters['light.backIntensity']?.(v);
     });
   camLightFolder
     .add(renderSettings, 'backLightRange', 0, 420, 1)
     .name('Range (0=inf)')
     .onChange((v: number) => {
       cameraLight.distance = v;
+      modulationBaseSetters['light.backRange']?.(v);
     });
   camLightFolder.addColor(renderSettings, 'backLightColor').name('Color').onChange((v: string) => {
     cameraLight.color.set(v);
+    modulationBaseSetters['light.backHue']?.(hueFromHex(renderSettings.backLightColor));
   });
 
   const cameraFolder = gui.addFolder('Camera');
   cameraModeController = cameraFolder
-    .add(cameraControl, 'mode', ['wall', 'orbit', 'manual', 'rail'])
-    .name('Mode (wall/orbit/manual/rail)')
+    .add(cameraControl, 'mode', ['wall', 'wallDrift', 'orbit', 'manual', 'rail'])
+    .name('Mode (wall/drift/orbit/manual/rail)')
     .onChange((mode: CameraMode) => {
-  cameraControl.mode = mode;
-  if (mode === 'manual' && cameraControl.distance === 0) {
-    cameraControl.distance = room.size * 0.48;
-  }
-  refreshCameraDistanceController();
-  cameraZoomController?.setValue(cameraControl.zoomFactor);
-  if (mode === 'rail') {
-    railState.phase = 0;
+      cameraControl.mode = mode;
+      if (mode === 'manual' && cameraControl.distance === 0) {
+        cameraControl.distance = room.size * 0.48;
+      }
+      refreshCameraDistanceController();
+      cameraZoomController?.setValue(cameraControl.zoomFactor);
+      if (mode === 'rail') {
+        railState.phase = 0;
         railState.currentPos.copy(camera.position);
         railState.lastPos.copy(camera.position);
         railState.smoothedTarget.set(0, 0, 0);
+      }
+      if (mode === 'wallDrift') {
+        resetWallDriftState();
       }
     });
   cameraFolder
@@ -1365,11 +1494,51 @@ function setupGui() {
     .onChange((v: number) => {
       cameraControl.wallFace = clamp(Math.round(v), 0, 5);
     });
-  orbitSpeedController = cameraFolder.add(orbitSettings, 'orbitSpeed', 0.02, 0.6, 0.01).name('Orbit speed');
-  orbitBobController = cameraFolder.add(orbitSettings, 'bobStrength', 0, 0.8, 0.01).name('Bob strength');
-  mouseSensController = cameraFolder.add(cameraControl, 'mouseSensitivity', 0.001, 0.02, 0.0005).name('Mouse sens');
-  turnSpeedController = cameraFolder.add(cameraControl, 'turnSpeed', 0.2, 4, 0.1).name('Turn speed');
-  pitchSpeedController = cameraFolder.add(cameraControl, 'pitchSpeed', 0.2, 4, 0.1).name('Pitch speed');
+  const wallDriftFolder = cameraFolder.addFolder('Wall drift');
+  wallMovementController = wallDriftFolder
+    .add(wallDriftSettings, 'movement', 0, 1, 0.01)
+    .name('Movement')
+    .onChange((v: number) => {
+      wallDriftSettings.movement = clamp(v, 0, 1);
+      modulationBaseSetters['camera.wallMovement']?.(wallDriftSettings.movement);
+    });
+  wallBobController = wallDriftFolder
+    .add(wallDriftSettings, 'bobStrength', 0, 1, 0.01)
+    .name('Bob')
+    .onChange((v: number) => {
+      wallDriftSettings.bobStrength = clamp(v, 0, 1);
+      modulationBaseSetters['camera.wallBob']?.(wallDriftSettings.bobStrength);
+    });
+  orbitSpeedController = cameraFolder
+    .add(orbitSettings, 'orbitSpeed', 0.02, 0.6, 0.01)
+    .name('Orbit speed')
+    .onChange((v: number) => {
+      modulationBaseSetters['camera.orbitSpeed']?.(v);
+    });
+  orbitBobController = cameraFolder
+    .add(orbitSettings, 'bobStrength', 0, 0.8, 0.01)
+    .name('Bob strength')
+    .onChange((v: number) => {
+      modulationBaseSetters['camera.bobStrength']?.(v);
+    });
+  mouseSensController = cameraFolder
+    .add(cameraControl, 'mouseSensitivity', 0.001, 0.02, 0.0005)
+    .name('Mouse sens')
+    .onChange((v: number) => {
+      modulationBaseSetters['camera.mouseSensitivity']?.(v);
+    });
+  turnSpeedController = cameraFolder
+    .add(cameraControl, 'turnSpeed', 0.2, 4, 0.1)
+    .name('Turn speed')
+    .onChange((v: number) => {
+      modulationBaseSetters['camera.turnSpeed']?.(v);
+    });
+  pitchSpeedController = cameraFolder
+    .add(cameraControl, 'pitchSpeed', 0.2, 4, 0.1)
+    .name('Pitch speed')
+    .onChange((v: number) => {
+      modulationBaseSetters['camera.pitchSpeed']?.(v);
+    });
   const { min: zoomMin, max: zoomMax } = cameraDistanceBounds();
   cameraDistanceController = cameraFolder
     .add(cameraControl, 'distance', zoomMin, zoomMax, 0.1)
@@ -1378,6 +1547,7 @@ function setupGui() {
       const bounds = cameraDistanceBounds();
       cameraControl.distance = clamp(v, bounds.min, bounds.max);
       refreshCameraDistanceController();
+      modulationBaseSetters['camera.distance']?.(cameraControl.distance);
     });
   cameraZoomController = cameraFolder
     .add(cameraControl, 'zoomFactor', 0.01, 2, 0.01)
@@ -1385,13 +1555,34 @@ function setupGui() {
     .onChange((v: number) => {
       applyCameraZoom(v);
       cameraZoomController?.setValue(cameraControl.zoomFactor);
+      modulationBaseSetters['camera.zoom']?.(cameraControl.zoomFactor);
     });
   refreshCameraDistanceController();
   const railFolder = cameraFolder.addFolder('Cinematic rail');
-  railSpeedController = railFolder.add(railSettings, 'speed', 0.02, 1.2, 0.01).name('Path speed');
-  railRadiusController = railFolder.add(railSettings, 'radialFactor', 0.2, 1.2, 0.01).name('Radius factor');
-  railWaveController = railFolder.add(railSettings, 'verticalWave', 0, 1, 0.01).name('Vertical wave');
-  railNoiseController = railFolder.add(railSettings, 'noise', 0, 0.8, 0.01).name('Noise');
+  railSpeedController = railFolder
+    .add(railSettings, 'speed', 0.02, 1.2, 0.01)
+    .name('Path speed')
+    .onChange((v: number) => {
+      modulationBaseSetters['rail.speed']?.(v);
+    });
+  railRadiusController = railFolder
+    .add(railSettings, 'radialFactor', 0.2, 1.2, 0.01)
+    .name('Radius factor')
+    .onChange((v: number) => {
+      modulationBaseSetters['rail.radialFactor']?.(v);
+    });
+  railWaveController = railFolder
+    .add(railSettings, 'verticalWave', 0, 1, 0.01)
+    .name('Vertical wave')
+    .onChange((v: number) => {
+      modulationBaseSetters['rail.verticalWave']?.(v);
+    });
+  railNoiseController = railFolder
+    .add(railSettings, 'noise', 0, 0.8, 0.01)
+    .name('Noise')
+    .onChange((v: number) => {
+      modulationBaseSetters['rail.noise']?.(v);
+    });
   railPosSmoothController = railFolder.add(railSettings, 'posSmoothing', 0.01, 1.5, 0.01).name('Pos smooth (s)');
   railVelSmoothController = railFolder
     .add(railSettings, 'velocitySmoothing', 0.01, 1.5, 0.01)
@@ -1399,9 +1590,29 @@ function setupGui() {
   railTargetSmoothController = railFolder
     .add(railSettings, 'targetSmoothing', 0.01, 1.5, 0.01)
     .name('Look smooth (s)');
+  railPosSmoothController.onChange((v: number) => {
+    modulationBaseSetters['rail.posSmoothing']?.(v);
+  });
+  railVelSmoothController.onChange((v: number) => {
+    modulationBaseSetters['rail.velocitySmoothing']?.(v);
+  });
+  railTargetSmoothController.onChange((v: number) => {
+    modulationBaseSetters['rail.targetSmoothing']?.(v);
+  });
   railLookAheadController = railFolder.add(railSettings, 'lookAhead', 0, 1, 0.01).name('Look ahead');
+  railLookAheadController.onChange((v: number) => {
+    modulationBaseSetters['rail.lookAhead']?.(v);
+  });
   railNudgeController = railFolder.add(railSettings, 'manualNudge', 0, 0.8, 0.01).name('Arrow nudge');
-  railRollController = railFolder.add(railSettings, 'rollStrength', 0, 1.2, 0.01).name('Roll');
+  railNudgeController.onChange((v: number) => {
+    modulationBaseSetters['rail.manualNudge']?.(v);
+  });
+  railRollController = railFolder
+    .add(railSettings, 'rollStrength', 0, 1.2, 0.01)
+    .name('Roll')
+    .onChange((v: number) => {
+      modulationBaseSetters['rail.rollStrength']?.(v);
+    });
   cameraFolder
     .add(
       {
@@ -1416,13 +1627,753 @@ function setupGui() {
   const postFolder = gui.addFolder('Post FX');
   postFolder.add(renderSettings, 'bloomStrength', 0, 2, 0.01).name('Bloom strength').onChange((v: number) => {
     bloomPass.strength = v;
+    modulationBaseSetters['post.bloomStrength']?.(v);
   });
   postFolder.add(renderSettings, 'bloomRadius', 0, 1, 0.01).name('Bloom radius').onChange((v: number) => {
     bloomPass.radius = v;
+    modulationBaseSetters['post.bloomRadius']?.(v);
   });
   postFolder.add(renderSettings, 'bloomThreshold', 0, 1, 0.01).name('Bloom threshold').onChange((v: number) => {
     bloomPass.threshold = v;
+    modulationBaseSetters['post.bloomThreshold']?.(v);
   });
+
+  setupModulationGui(gui);
+}
+
+function setupModulationTargets() {
+  const setters: Record<string, (v: number) => void> = {};
+  const register = (
+    id: string,
+    group: string,
+    label: string,
+    config: { min?: number; max?: number; range?: number; get: () => number; set: (v: number) => void }
+  ) => {
+    modulation.registerTarget({
+      id,
+      label,
+      group,
+      min: config.min,
+      max: config.max,
+      range: config.range,
+      getCurrent: config.get,
+      apply: config.set,
+    });
+    setters[id] = (v: number) => modulation.setBaseValue(id, v);
+  };
+
+  register('sim.turnChance', 'Simulation', 'Turn probability %', {
+    min: 0,
+    max: 100,
+    range: 100,
+    get: () => turnProxy.turnChance,
+    set: (v: number) => {
+      const pct = clamp(v, 0, 100);
+      turnProxy.turnChance = pct;
+      const normalized = pct / 100;
+      defaultSimConfig.turnProbability = normalized;
+      sim.config.turnProbability = normalized;
+    },
+  });
+  register('sim.growthInterval', 'Simulation', 'Growth interval (s)', {
+    min: 0.01,
+    max: 1,
+    range: 1,
+    get: () => defaultSimConfig.growthInterval,
+    set: (v: number) => {
+      const clamped = clamp(v, 0.01, 1);
+      defaultSimConfig.growthInterval = clamped;
+      sim.config.growthInterval = clamped;
+    },
+  });
+  register('sim.targetCount', 'Simulation', 'Pipe cap', {
+    min: 1,
+    max: 128,
+    range: 127,
+    get: () => defaultSimConfig.targetPipeCount,
+    set: (v: number) => {
+      const clamped = clamp(Math.round(v), 1, 128);
+      defaultSimConfig.targetPipeCount = clamped;
+      sim.config.targetPipeCount = clamped;
+    },
+  });
+  register('sim.maxLength', 'Simulation', 'Max length (0=inf)', {
+    min: 0,
+    max: 300,
+    range: 300,
+    get: () => defaultSimConfig.maxPipeLength,
+    set: (v: number) => {
+      const normalized = Math.max(0, Math.floor(v));
+      defaultSimConfig.maxPipeLength = normalized;
+      sim.config.maxPipeLength = normalized === 0 ? 0 : Math.max(4, normalized);
+    },
+  });
+
+  register('room.roughness', 'Room', 'Roughness', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.roomRoughness,
+    set: (v: number) => {
+      renderSettings.roomRoughness = clamp(v, 0, 1);
+      room.material.roughness = renderSettings.roomRoughness;
+    },
+  });
+  register('room.metalness', 'Room', 'Metalness', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.roomMetalness,
+    set: (v: number) => {
+      renderSettings.roomMetalness = clamp(v, 0, 1);
+      room.material.metalness = renderSettings.roomMetalness;
+    },
+  });
+  register('room.reflectivity', 'Room', 'Reflectivity', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.roomReflectivity,
+    set: (v: number) => {
+      renderSettings.roomReflectivity = clamp(v, 0, 1);
+      room.material.reflectivity = renderSettings.roomReflectivity;
+    },
+  });
+  register('room.hue', 'Room', 'Tint hue', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => hueFromHex(renderSettings.roomColor),
+    set: (v: number) => {
+      const next = applyHueToHex(renderSettings.roomColor, v);
+      renderSettings.roomColor = next;
+      room.material.color.set(next);
+      roomMirrors.update(room.size, next);
+    },
+  });
+  register('room.wallGap', 'Room', 'Wall gap', {
+    min: 0,
+    max: 70,
+    range: 70,
+    get: () => roomPadding,
+    set: (v: number) => {
+      roomPadding = clamp(v, 0, 70);
+      roomGuiSettings.wallGap = roomPadding;
+      room.updateSize(sim.config.gridSize, renderSettings);
+      roomMirrors.update(room.size, renderSettings.roomColor);
+      clampCameraToRoom(camera.position);
+      const { min, max } = cameraDistanceBounds();
+      cameraControl.distance = clamp(cameraControl.distance, min, max);
+      refreshCameraDistanceController();
+    },
+  });
+
+  register('mirror.inset', 'Mirrors', 'Wall inset', {
+    min: 0,
+    max: 20,
+    range: 20,
+    get: () => mirrorInset,
+    set: (v: number) => {
+      mirrorInset = Math.max(0, v);
+      roomMirrors.setInset(mirrorInset);
+      roomMirrors.update(room.size, renderSettings.roomColor);
+    },
+  });
+  register('mirror.blur', 'Mirrors', 'Blur', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => mirrorBlurAmount,
+    set: (v: number) => {
+      mirrorBlurAmount = clamp(v, 0, 1);
+      mirrorGuiSettings.blur = mirrorBlurAmount;
+      updateMirrorBlur();
+    },
+  });
+  register('mirror.chromaticShift', 'Mirrors', 'Chromatic shift', {
+    min: 0,
+    max: 0.1,
+    range: 0.1,
+    get: () => mirrorChromaticShift,
+    set: (v: number) => {
+      mirrorChromaticShift = clamp(v, 0, 0.1);
+      mirrorGuiSettings.chromaticShift = mirrorChromaticShift;
+    },
+  });
+  register('mirror.warpStrength', 'Mirrors', 'Warp strength', {
+    min: 0,
+    max: 0.05,
+    range: 0.05,
+    get: () => mirrorWarpStrength,
+    set: (v: number) => {
+      mirrorWarpStrength = clamp(v, 0, 0.05);
+      mirrorGuiSettings.warpStrength = mirrorWarpStrength;
+    },
+  });
+  register('mirror.warpSpeed', 'Mirrors', 'Warp speed', {
+    min: 0,
+    max: 5,
+    range: 5,
+    get: () => mirrorWarpSpeed,
+    set: (v: number) => {
+      mirrorWarpSpeed = clamp(v, 0, 5);
+      mirrorGuiSettings.warpSpeed = mirrorWarpSpeed;
+    },
+  });
+  register('mirror.refractionOffset', 'Mirrors', 'Refraction offset', {
+    min: -0.05,
+    max: 0.05,
+    range: 0.1,
+    get: () => mirrorRefractionOffset,
+    set: (v: number) => {
+      mirrorRefractionOffset = clamp(v, -0.05, 0.05);
+      mirrorGuiSettings.refractionOffset = mirrorRefractionOffset;
+    },
+  });
+  register('mirror.noiseStrength', 'Mirrors', 'Shimmer', {
+    min: 0,
+    max: 0.01,
+    range: 0.01,
+    get: () => mirrorNoiseStrength,
+    set: (v: number) => {
+      mirrorNoiseStrength = clamp(v, 0, 0.01);
+      mirrorGuiSettings.noiseStrength = mirrorNoiseStrength;
+    },
+  });
+  register('mirror.maxResolution', 'Mirrors', 'Max resolution', {
+    min: 256,
+    max: 4096 * 4,
+    range: 4096 * 4 - 256,
+    get: () => reflectorMaxRes,
+    set: (v: number) => {
+      reflectorMaxRes = clamp(v, 256, 4096 * 4);
+      updateMirrorResolution();
+    },
+  });
+  register('mirror.facesPerFrame', 'Mirrors', 'Faces per frame', {
+    min: 1,
+    max: 6,
+    range: 5,
+    get: () => mirrorFacesPerFrame,
+    set: (v: number) => {
+      mirrorFacesPerFrame = Math.max(1, Math.floor(v));
+    },
+  });
+
+  register('edge.neonStrength', 'Edge neon', 'Intensity', {
+    min: 0,
+    max: 200,
+    range: 200,
+    get: () => renderSettings.edgeNeonStrength,
+    set: (v: number) => {
+      renderSettings.edgeNeonStrength = clamp(v, 0, 200);
+    },
+  });
+  register('edge.huePeriod', 'Edge neon', 'Hue period', {
+    min: 0.01,
+    max: 60,
+    range: 30,
+    get: () => renderSettings.edgeHueTravelPeriod,
+    set: (v: number) => {
+      renderSettings.edgeHueTravelPeriod = clamp(v, 0.01, 60);
+    },
+  });
+  register('edge.hue', 'Edge neon', 'Hue', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => hueFromHex(renderSettings.edgeNeonColor),
+    set: (v: number) => {
+      const next = applyHueToHex(renderSettings.edgeNeonColor, v);
+      renderSettings.edgeNeonColor = next;
+    },
+  });
+  register('edge.width', 'Edge neon', 'Width', {
+    min: 0.02,
+    max: 0.5,
+    range: 0.48,
+    get: () => renderSettings.edgeNeonWidth,
+    set: (v: number) => {
+      renderSettings.edgeNeonWidth = clamp(v, 0.02, 0.5);
+    },
+  });
+
+  register('pipes.radius', 'Pipes', 'Radius', {
+    min: 0.05,
+    max: 0.6,
+    range: 0.55,
+    get: () => renderSettings.pipeRadius,
+    set: (v: number) => {
+      renderSettings.pipeRadius = clamp(v, 0.05, 0.6);
+    },
+  });
+  register('pipes.tubularSegments', 'Pipes', 'Smoothness', {
+    min: 3,
+    max: 20,
+    range: 17,
+    get: () => renderSettings.tubularSegments,
+    set: (v: number) => {
+      renderSettings.tubularSegments = clamp(Math.round(v), 3, 20);
+    },
+  });
+  register('pipes.radialSegments', 'Pipes', 'Radial slices', {
+    min: 4,
+    max: 32,
+    range: 28,
+    get: () => renderSettings.radialSegments,
+    set: (v: number) => {
+      renderSettings.radialSegments = clamp(Math.round(v), 4, 32);
+    },
+  });
+  register('pipes.colorShift', 'Pipes', 'Color shift', {
+    min: 0,
+    max: 0.4,
+    range: 0.4,
+    get: () => renderSettings.colorShift,
+    set: (v: number) => {
+      renderSettings.colorShift = clamp(v, 0, 0.4);
+    },
+  });
+  register('pipes.cornerTension', 'Pipes', 'Corner smoothness', {
+    min: 0,
+    max: 3,
+    range: 3,
+    get: () => renderSettings.cornerTension,
+    set: (v: number) => {
+      renderSettings.cornerTension = clamp(v, 0, 3);
+    },
+  });
+  register('pipes.metalness', 'Pipes', 'Metalness', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.pipeMetalness,
+    set: (v: number) => {
+      renderSettings.pipeMetalness = clamp(v, 0, 1);
+      if (!renderSettings.glassEnabled) pipeMaterial.metalness = renderSettings.pipeMetalness;
+    },
+  });
+  register('pipes.roughness', 'Pipes', 'Roughness', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.pipeRoughness,
+    set: (v: number) => {
+      renderSettings.pipeRoughness = clamp(v, 0, 1);
+      if (!renderSettings.glassEnabled) pipeMaterial.roughness = renderSettings.pipeRoughness;
+    },
+  });
+  register('pipes.glassTransmission', 'Pipes', 'Glass transmission', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.glassTransmission,
+    set: (v: number) => {
+      renderSettings.glassTransmission = clamp(v, 0, 1);
+      updatePipeMaterial(renderSettings);
+    },
+  });
+  register('pipes.glassOpacity', 'Pipes', 'Glass opacity', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.glassOpacity,
+    set: (v: number) => {
+      renderSettings.glassOpacity = clamp(v, 0, 1);
+      updatePipeMaterial(renderSettings);
+    },
+  });
+  register('pipes.glassIor', 'Pipes', 'Glass IOR', {
+    min: 1,
+    max: 2.5,
+    range: 1.5,
+    get: () => renderSettings.glassIor,
+    set: (v: number) => {
+      renderSettings.glassIor = clamp(v, 1, 2.5);
+      updatePipeMaterial(renderSettings);
+    },
+  });
+  register('pipes.neonStrength', 'Pipes', 'Neon strength', {
+    min: 0,
+    max: 4,
+    range: 4,
+    get: () => renderSettings.neonStrength,
+    set: (v: number) => {
+      renderSettings.neonStrength = clamp(v, 0, 4);
+    },
+  });
+  register('pipes.neonSize', 'Pipes', 'Neon size', {
+    min: 0.98,
+    max: 1.2,
+    range: 0.22,
+    get: () => renderSettings.neonSize,
+    set: (v: number) => {
+      renderSettings.neonSize = clamp(v, 0.98, 1.2);
+    },
+  });
+
+  register('light.backHue', 'Lighting', 'Camera light hue', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => hueFromHex(renderSettings.backLightColor),
+    set: (v: number) => {
+      const next = applyHueToHex(renderSettings.backLightColor, v);
+      renderSettings.backLightColor = next;
+      cameraLight.color.set(next);
+    },
+  });
+  register('light.backIntensity', 'Lighting', 'Camera light intensity', {
+    min: 0,
+    max: 1200,
+    range: 1200,
+    get: () => renderSettings.backLightIntensity,
+    set: (v: number) => {
+      renderSettings.backLightIntensity = clamp(v, 0, 1200);
+      cameraLight.intensity = renderSettings.backLightIntensity;
+    },
+  });
+  register('light.backRange', 'Lighting', 'Camera light range', {
+    min: 0,
+    max: 420,
+    range: 420,
+    get: () => renderSettings.backLightRange,
+    set: (v: number) => {
+      renderSettings.backLightRange = clamp(v, 0, 420);
+      cameraLight.distance = renderSettings.backLightRange;
+    },
+  });
+
+  register('post.bloomStrength', 'Post FX', 'Bloom strength', {
+    min: 0,
+    max: 2,
+    range: 2,
+    get: () => renderSettings.bloomStrength,
+    set: (v: number) => {
+      renderSettings.bloomStrength = clamp(v, 0, 2);
+      bloomPass.strength = renderSettings.bloomStrength;
+    },
+  });
+  register('post.bloomRadius', 'Post FX', 'Bloom radius', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.bloomRadius,
+    set: (v: number) => {
+      renderSettings.bloomRadius = clamp(v, 0, 1);
+      bloomPass.radius = renderSettings.bloomRadius;
+    },
+  });
+  register('post.bloomThreshold', 'Post FX', 'Bloom threshold', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.bloomThreshold,
+    set: (v: number) => {
+      renderSettings.bloomThreshold = clamp(v, 0, 1);
+      bloomPass.threshold = renderSettings.bloomThreshold;
+    },
+  });
+
+  register('camera.orbitSpeed', 'Camera', 'Orbit speed', {
+    min: 0.02,
+    max: 0.6,
+    range: 0.6,
+    get: () => orbitSettings.orbitSpeed,
+    set: (v: number) => {
+      orbitSettings.orbitSpeed = clamp(v, 0.02, 0.6);
+    },
+  });
+  register('camera.bobStrength', 'Camera', 'Orbit bob', {
+    min: 0,
+    max: 0.8,
+    range: 0.8,
+    get: () => orbitSettings.bobStrength,
+    set: (v: number) => {
+      orbitSettings.bobStrength = clamp(v, 0, 0.8);
+    },
+  });
+  register('camera.wallMovement', 'Camera', 'Wall movement', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => wallDriftSettings.movement,
+    set: (v: number) => {
+      wallDriftSettings.movement = clamp(v, 0, 1);
+      wallMovementController?.setValue(wallDriftSettings.movement);
+    },
+  });
+  register('camera.wallBob', 'Camera', 'Wall bob', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => wallDriftSettings.bobStrength,
+    set: (v: number) => {
+      wallDriftSettings.bobStrength = clamp(v, 0, 1);
+      wallBobController?.setValue(wallDriftSettings.bobStrength);
+    },
+  });
+  register('camera.turnSpeed', 'Camera', 'Turn speed', {
+    min: 0.2,
+    max: 4,
+    range: 3.8,
+    get: () => cameraControl.turnSpeed,
+    set: (v: number) => {
+      cameraControl.turnSpeed = clamp(v, 0.2, 4);
+    },
+  });
+  register('camera.pitchSpeed', 'Camera', 'Pitch speed', {
+    min: 0.2,
+    max: 4,
+    range: 3.8,
+    get: () => cameraControl.pitchSpeed,
+    set: (v: number) => {
+      cameraControl.pitchSpeed = clamp(v, 0.2, 4);
+    },
+  });
+  register('camera.mouseSensitivity', 'Camera', 'Mouse sensitivity', {
+    min: 0.001,
+    max: 0.02,
+    range: 0.019,
+    get: () => cameraControl.mouseSensitivity,
+    set: (v: number) => {
+      cameraControl.mouseSensitivity = clamp(v, 0.001, 0.02);
+    },
+  });
+  register('camera.distance', 'Camera', 'Manual zoom distance', {
+    min: cameraDistanceBounds().min,
+    max: cameraDistanceBounds().max,
+    range: cameraDistanceBounds().max - cameraDistanceBounds().min,
+    get: () => cameraControl.distance,
+    set: (v: number) => {
+      const bounds = cameraDistanceBounds();
+      cameraControl.distance = clamp(v, bounds.min, bounds.max);
+      refreshCameraDistanceController();
+    },
+  });
+  register('camera.zoom', 'Camera', 'Zoom factor', {
+    min: 0.01,
+    max: 2,
+    range: 2,
+    get: () => cameraControl.zoomFactor,
+    set: (v: number) => {
+      applyCameraZoom(v);
+    },
+  });
+
+  register('rail.speed', 'Rail', 'Path speed', {
+    min: 0.02,
+    max: 1.2,
+    range: 1.2,
+    get: () => railSettings.speed,
+    set: (v: number) => {
+      railSettings.speed = clamp(v, 0.02, 1.2);
+    },
+  });
+  register('rail.radialFactor', 'Rail', 'Radius factor', {
+    min: 0.2,
+    max: 1.2,
+    range: 1,
+    get: () => railSettings.radialFactor,
+    set: (v: number) => {
+      railSettings.radialFactor = clamp(v, 0.2, 1.2);
+    },
+  });
+  register('rail.verticalWave', 'Rail', 'Vertical wave', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => railSettings.verticalWave,
+    set: (v: number) => {
+      railSettings.verticalWave = clamp(v, 0, 1);
+    },
+  });
+  register('rail.noise', 'Rail', 'Noise', {
+    min: 0,
+    max: 0.8,
+    range: 0.8,
+    get: () => railSettings.noise,
+    set: (v: number) => {
+      railSettings.noise = clamp(v, 0, 0.8);
+    },
+  });
+  register('rail.posSmoothing', 'Rail', 'Pos smooth (s)', {
+    min: 0.01,
+    max: 1.5,
+    range: 1.49,
+    get: () => railSettings.posSmoothing,
+    set: (v: number) => {
+      railSettings.posSmoothing = clamp(v, 0.01, 1.5);
+    },
+  });
+  register('rail.velocitySmoothing', 'Rail', 'Vel smooth (s)', {
+    min: 0.01,
+    max: 1.5,
+    range: 1.49,
+    get: () => railSettings.velocitySmoothing,
+    set: (v: number) => {
+      railSettings.velocitySmoothing = clamp(v, 0.01, 1.5);
+    },
+  });
+  register('rail.targetSmoothing', 'Rail', 'Look smooth (s)', {
+    min: 0.01,
+    max: 1.5,
+    range: 1.49,
+    get: () => railSettings.targetSmoothing,
+    set: (v: number) => {
+      railSettings.targetSmoothing = clamp(v, 0.01, 1.5);
+    },
+  });
+  register('rail.lookAhead', 'Rail', 'Look ahead', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => railSettings.lookAhead,
+    set: (v: number) => {
+      railSettings.lookAhead = clamp(v, 0, 1);
+    },
+  });
+  register('rail.manualNudge', 'Rail', 'Arrow nudge', {
+    min: 0,
+    max: 0.8,
+    range: 0.8,
+    get: () => railSettings.manualNudge,
+    set: (v: number) => {
+      railSettings.manualNudge = clamp(v, 0, 0.8);
+    },
+  });
+  register('rail.rollStrength', 'Rail', 'Roll', {
+    min: 0,
+    max: 1.2,
+    range: 1.2,
+    get: () => railSettings.rollStrength,
+    set: (v: number) => {
+      railSettings.rollStrength = clamp(v, 0, 1.2);
+    },
+  });
+
+  modulation.syncBaseFromTargets();
+  return setters;
+}
+
+function setupModulationGui(gui: GUI) {
+  const modFolder = gui.addFolder('Modulation');
+  const lfoFolders = new Map<string, GUI>();
+  const uiState = {
+    bypass: modulation.isBypassed(),
+    bpm: modulationGlobals.bpm,
+  };
+
+  modFolder
+    .add(uiState, 'bypass')
+    .name('Bypass (use base values)')
+    .onChange((v: boolean) => {
+      modulation.setBypass(v);
+    });
+  modFolder
+    .add(
+      {
+        rebase: () => {
+          modulation.syncBaseFromTargets();
+        },
+      },
+      'rebase'
+    )
+    .name('Re-baseline from current');
+  modFolder
+    .add(uiState, 'bpm', 10, 360, 1)
+    .name('Global BPM')
+    .onChange((v: number) => {
+      modulationGlobals.bpm = v;
+      modulation.setGlobalBpm(modulationGlobals.bpm);
+    });
+
+  const targetOptions = (groupFilter: string | null) => {
+    const opts: Record<string, string> = {};
+    const sorted = modulation.getTargets().slice().sort((a, b) => a.label.localeCompare(b.label));
+    for (const target of sorted) {
+      if (groupFilter && groupFilter !== 'All' && target.group !== groupFilter) continue;
+      opts[`${target.group ? `${target.group} • ` : ''}${target.label}`] = target.id;
+    }
+    return opts;
+  };
+  const groupOptions = () => {
+    const groups = new Set<string>(['All']);
+    for (const target of modulation.getTargets()) {
+      if (target.group) groups.add(target.group);
+    }
+    return Array.from(groups.values()).sort((a, b) => a.localeCompare(b));
+  };
+
+  const addLfo = () => {
+    const lfo = modulation.addLfo({});
+    if (lfo) attachLfoFolder(lfo);
+  };
+
+  modFolder.add({ add: addLfo }, 'add').name('Add LFO');
+
+  const attachLfoFolder = (lfo: LfoConfig) => {
+    const folder = modFolder.addFolder(`LFO ${lfoFolders.size + 1}`);
+    lfoFolders.set(lfo.id, folder);
+    const currentTarget = modulation.getTarget(lfo.targetId);
+    const lfoUi = { group: currentTarget?.group ?? 'All' };
+    const groupCtrl = folder.add(lfoUi, 'group', groupOptions()).name('Target group');
+    folder.add(lfo, 'enabled').name('Enabled');
+    const targetCtrl = folder.add(lfo, 'targetId', targetOptions(lfoUi.group)).name('Target');
+    targetCtrl.onChange((id: string) => {
+      const target = modulation.getTarget(id);
+      if (target) modulation.setBaseValue(id, target.getCurrent());
+    });
+    groupCtrl.onChange((group: string) => {
+      const opts = targetOptions(group);
+      targetCtrl.options(opts);
+      if (!Object.values(opts).includes(lfo.targetId)) {
+        const first = Object.values(opts)[0];
+        if (first) {
+          lfo.targetId = first;
+          targetCtrl.setValue(first);
+        }
+      }
+    });
+    folder
+      .add(
+        lfo,
+        'wave',
+        {
+          Sine: 'sine',
+          Triangle: 'triangle',
+          Square: 'square',
+          Saw: 'saw',
+          Noise: 'noise',
+          'Sample & Hold': 'sampleHold',
+        } as Record<string, LfoConfig['wave']>
+      )
+      .name('Wave');
+    folder.add(lfo, 'freqHz', 0, 8, 0.01).name('Frequency (Hz)');
+    folder.add(lfo, 'useGlobalBpm').name('Use global BPM');
+    folder.add(lfo, 'bpmCoefficient', 0.01, 8, 0.01).name('BPM coeff (mul/div)');
+    folder.add(lfo, 'amount', 0, 2, 0.01).name('Amount (x range)');
+    folder.add(lfo, 'offset', -1, 1, 0.01).name('Offset (x range)');
+    folder.add(lfo, 'phase', 0, Math.PI * 2, 0.001).name('Phase (rad)');
+    folder.add(lfo, 'bipolar').name('Bipolar');
+    folder.add(lfo, 'smoothSeconds', 0, 2, 0.01).name('Smooth (s)');
+    folder
+      .add(
+        {
+          remove: () => {
+            modulation.removeLfo(lfo.id);
+            lfoFolders.delete(lfo.id);
+            folder.destroy();
+          },
+        },
+        'remove'
+      )
+      .name('Remove');
+  };
+
+  for (const lfo of modulation.getLfos()) {
+    attachLfoFolder(lfo);
+  }
 }
 
 function updateInfo(currentSim: Simulation, currentState: { fpsSmoothed: number; elapsed: number }) {
@@ -1472,6 +2423,11 @@ function resetOrbitState(anchor: Vector3 = camera.position) {
   orbitState.swayPhase = orbitState.phase * 0.35;
 }
 
+function resetWallDriftState() {
+  wallDriftState.travelPhase = Math.random() * Math.PI * 2;
+  wallDriftState.bobPhase = Math.random() * Math.PI * 2;
+}
+
 function cameraDistanceBounds() {
   return {
     min: Math.max(2, (sim.config.gridSize + roomPadding) * 0.3),
@@ -1505,6 +2461,17 @@ function clampCameraToRoom(v: Vector3, margin = CAMERA_MARGIN) {
   v.x = clamp(v.x, -limit, limit);
   v.y = clamp(v.y, -limit, limit);
   v.z = clamp(v.z, -limit, limit);
+}
+
+function buildWallBasis(normal: Vector3, outA: Vector3, outB: Vector3) {
+  const ref = Math.abs(normal.y) > 0.9 ? WORLD_FORWARD : WORLD_UP;
+  outA.copy(normal).cross(ref);
+  if (outA.lengthSq() < 1e-6) {
+    outA.set(1, 0, 0);
+  } else {
+    outA.normalize();
+  }
+  outB.copy(normal).cross(outA).normalize();
 }
 
 function softLimitAxis(value: number, limit: number, softness = 0.12) {
@@ -1542,11 +2509,13 @@ function keepOrbitInside(v: Vector3, margin = CAMERA_MARGIN) {
 }
 
 function randomizeCameraSettings() {
-  const modes: CameraMode[] = ['wall', 'orbit', 'manual', 'rail'];
+  const modes: CameraMode[] = ['wall', 'wallDrift', 'orbit', 'manual', 'rail'];
   const pickedMode = modes[randInt(0, modes.length - 1)];
 
   orbitSettings.orbitSpeed = rand(0.05, 0.55);
   orbitSettings.bobStrength = rand(0.04, 0.7);
+  wallDriftSettings.movement = rand(0.05, 1);
+  wallDriftSettings.bobStrength = rand(0, 1);
 
   cameraControl.mouseSensitivity = rand(0.0012, 0.015);
   cameraControl.turnSpeed = rand(0.4, 3.2);
@@ -1558,6 +2527,9 @@ function randomizeCameraSettings() {
   const { min, max } = cameraDistanceBounds();
   cameraControl.distance = clamp(rand(min * 0.9, max * 0.85), min, max);
   cameraControl.mode = pickedMode;
+  if (pickedMode === 'wallDrift') {
+    resetWallDriftState();
+  }
 
   railSettings.speed = rand(0.05, 0.9);
   railSettings.radialFactor = rand(0.35, 1.05);
@@ -1573,6 +2545,8 @@ function randomizeCameraSettings() {
   cameraModeController?.setValue(pickedMode);
   orbitSpeedController?.setValue(orbitSettings.orbitSpeed);
   orbitBobController?.setValue(orbitSettings.bobStrength);
+  wallMovementController?.setValue(wallDriftSettings.movement);
+  wallBobController?.setValue(wallDriftSettings.bobStrength);
   mouseSensController?.setValue(cameraControl.mouseSensitivity);
   turnSpeedController?.setValue(cameraControl.turnSpeed);
   pitchSpeedController?.setValue(cameraControl.pitchSpeed);
@@ -1589,6 +2563,7 @@ function randomizeCameraSettings() {
   railLookAheadController?.setValue(railSettings.lookAhead);
   railNudgeController?.setValue(railSettings.manualNudge);
   railRollController?.setValue(railSettings.rollStrength);
+  modulation.syncBaseFromTargets();
 }
 
 function clamp(v: number, min: number, max: number) {
@@ -1668,6 +2643,7 @@ function randomizeAll() {
   turnController?.setValue(turnProxy.turnChance);
   tailShrinkController?.setValue(defaultSimConfig.disableTailShrink);
   refreshCameraDistanceController();
+  modulation.syncBaseFromTargets();
 }
 
 function createRoom(
