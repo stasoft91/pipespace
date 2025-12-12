@@ -1,4 +1,14 @@
-export type Waveform = 'sine' | 'triangle' | 'square' | 'saw' | 'noise' | 'sampleHold';
+export type Waveform =
+  | 'sine'
+  | 'triangle'
+  | 'square'
+  | 'saw'
+  | 'noise'
+  | 'sampleHold'
+  | 'expDecay'
+  | 'invExpDecay'
+  | 'exp2Decay'
+  | 'invExp2Decay';
 
 export type LfoConfig = {
   id: string;
@@ -13,6 +23,8 @@ export type LfoConfig = {
   bipolar: boolean;
   smoothSeconds: number;
   enabled: boolean;
+  startSeconds?: number;
+  endSeconds?: number;
 };
 
 export type ModulationTarget = {
@@ -36,6 +48,9 @@ const TAU = Math.PI * 2;
 
 const clamp = (v: number, min: number, max: number) => Math.min(max, Math.max(min, v));
 
+const expDecayWave = (t: number, k: number) => 2 * Math.exp(-k * t) - 1;
+const exp2DecayWave = (t: number, k: number) => 2 * Math.exp(-k * t * t) - 1;
+
 export class ModulationManager {
   private targets = new Map<string, ModulationTarget>();
   private baseValues = new Map<string, number>();
@@ -43,6 +58,7 @@ export class ModulationManager {
   private lfoRuntime = new Map<string, LfoRuntimeState>();
   private bypass = false;
   private globalBpm = 120;
+  private lastUpdateSeconds: number | null = null;
 
   registerTarget(target: ModulationTarget) {
     this.targets.set(target.id, target);
@@ -94,6 +110,8 @@ export class ModulationManager {
       bipolar: partial.bipolar ?? true,
       smoothSeconds: partial.smoothSeconds ?? 0,
       enabled: partial.enabled ?? true,
+      startSeconds: partial.startSeconds,
+      endSeconds: partial.endSeconds,
     };
     this.lfos.push(lfo);
     return lfo;
@@ -125,6 +143,10 @@ export class ModulationManager {
 
   update(timeSeconds: number, dt: number) {
     if (this.targets.size === 0) return;
+    if (this.lastUpdateSeconds !== null && timeSeconds < this.lastUpdateSeconds - 1e-6) {
+      this.lfoRuntime.clear();
+    }
+    this.lastUpdateSeconds = timeSeconds;
     const values = new Map<string, number>();
 
     for (const [id, target] of this.targets) {
@@ -135,6 +157,9 @@ export class ModulationManager {
     if (!this.bypass) {
       for (const lfo of this.lfos) {
         if (!lfo.enabled) continue;
+        const startSeconds = lfo.startSeconds ?? -Infinity;
+        const endSeconds = lfo.endSeconds ?? Infinity;
+        if (timeSeconds < startSeconds || timeSeconds > endSeconds) continue;
         const target = this.targets.get(lfo.targetId);
         if (!target) continue;
         const base = values.get(target.id) ?? this.baseValues.get(target.id) ?? target.getCurrent();
@@ -197,6 +222,30 @@ export class ModulationManager {
       case 'saw': {
         const t = ((phase / TAU) % 1 + 1) % 1;
         raw = t * 2 - 1;
+        break;
+      }
+      case 'expDecay': {
+        const t = ((phase / TAU) % 1 + 1) % 1;
+        const k = 6;
+        raw = expDecayWave(t, k);
+        break;
+      }
+      case 'invExpDecay': {
+        const t = ((phase / TAU) % 1 + 1) % 1;
+        const k = 6;
+        raw = -expDecayWave(t, k);
+        break;
+      }
+      case 'exp2Decay': {
+        const t = ((phase / TAU) % 1 + 1) % 1;
+        const k = 6;
+        raw = exp2DecayWave(t, k);
+        break;
+      }
+      case 'invExp2Decay': {
+        const t = ((phase / TAU) % 1 + 1) % 1;
+        const k = 6;
+        raw = -exp2DecayWave(t, k);
         break;
       }
       case 'noise':

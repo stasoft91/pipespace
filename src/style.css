@@ -14,10 +14,254 @@ body {
   color: #dce7ff;
 }
 
-#pipes-canvas {
-  display: block;
+#root {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
   width: 100vw;
   height: 100vh;
+}
+
+#sim-pane {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 160px;
+  overflow: hidden;
+}
+
+#splitter {
+  height: 6px;
+  flex: 0 0 auto;
+  background: rgba(255, 255, 255, 0.06);
+  cursor: row-resize;
+}
+
+#splitter:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+#timeline-pane {
+  flex: 0 0 auto;
+  height: 30vh;
+  min-height: 140px;
+  background: rgba(6, 10, 16, 0.9);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  flex-direction: column;
+}
+
+.timeline-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: rgba(10, 16, 26, 0.8);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 12px;
+}
+
+.timeline-body {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+}
+
+.lfo-panel {
+  width: 260px;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: rgba(8, 12, 18, 0.9);
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.lfo-list {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 6px;
+}
+
+.lfo-item {
+  position: relative;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  background: #0d1420;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.lfo-item.selected {
+  border-color: #4fd1ff;
+  background: #122033;
+}
+
+.lfo-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.lfo-times {
+  font-size: 10px;
+  opacity: 0.7;
+  margin-top: 2px;
+}
+
+.lfo-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  padding: 2px 5px;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.lfo-editor {
+  flex: 0 0 auto;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 6px;
+  overflow: auto;
+  max-height: 55%;
+}
+
+.lfo-editor-title {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.lfo-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  margin-bottom: 6px;
+}
+
+.lfo-row span {
+  flex: 0 0 72px;
+  opacity: 0.9;
+}
+
+.lfo-row input,
+.lfo-row select {
+  flex: 1 1 auto;
+  background: #0f1622;
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 11px;
+}
+
+.lfo-range {
+  font-size: 10px;
+  opacity: 0.8;
+  margin-top: 6px;
+}
+
+.lfo-empty {
+  font-size: 11px;
+  opacity: 0.6;
+  padding: 8px;
+}
+
+.timeline-controls button {
+  background: #0f1622;
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.timeline-controls button:hover {
+  background: #162235;
+}
+
+.timeline-bpm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+}
+
+.timeline-bpm input {
+  width: 72px;
+  background: #0f1622;
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+
+.timeline-zoom {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+  font-size: 11px;
+}
+
+.timeline-zoom input[type='range'] {
+  width: 140px;
+}
+
+.lfo-context-menu {
+  position: fixed;
+  z-index: 25;
+  min-width: 180px;
+  background: #0f1622;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.6);
+}
+
+.lfo-context-menu button {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: inherit;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.lfo-context-menu button:hover {
+  background: #162235;
+}
+
+.lfo-context-menu button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.waveform-stack {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.peaks-overview {
+  flex: 0 0 64px;
+  height: 64px;
+}
+
+.peaks-zoomview {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+#pipes-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 #info {

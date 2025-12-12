@@ -32,7 +32,9 @@ import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import GUI from 'lil-gui';
-import { ModulationManager, type LfoConfig } from './modulation';
+import { ModulationManager } from './modulation';
+import { initTimeline, type RenderSchedule } from './timeline';
+import { PROJECT_VERSION, stringifyProjectFile, type ProjectFile, type ProjectSettings } from './project';
 import { Pipe, Simulation } from './simulation';
 import type { SimulationConfig, Vec3 } from './simulation';
 import { PhysicalRayMirrorSystem, RasterMirrorSystem, RayMirrorSystem, RayMirrorSystemAllFaces } from './mirrors';
@@ -88,6 +90,25 @@ type MirrorRenderer = 'raster' | 'ray' | 'rayAllFaces' | 'physicalRay';
 const modulation = new ModulationManager();
 const modulationGlobals = { bpm: 120 };
 let modulationBaseSetters: Record<string, (v: number) => void> = {};
+let timelineHandle: ReturnType<typeof initTimeline> | null = null;
+let ignoreAudioForModulation = false;
+const BACKEND_RENDER_URL = 'http://localhost:3333/render';
+
+async function requestBackendRender(schedule: RenderSchedule) {
+  if (videoCaptureSettings.recording) return;
+  console.log('Requesting backend render…');
+  const res = await fetch(BACKEND_RENDER_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(schedule),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Backend render request failed (${res.status}): ${text || res.statusText}`);
+  }
+  const payload = (await res.json().catch(() => ({}))) as { jobId?: string; outputBase?: string };
+  console.log('Backend render started', payload);
+}
 
 let roomPadding = 15; // gap between grid extents and room walls
 const roomGuiSettings = {
@@ -131,9 +152,31 @@ const applyHueToHex = (hex: string, hue: number) => {
   return `#${next.getHexString()}`;
 };
 const PATH_TYPES: PathType[] = ['polyline', 'catmullrom', 'centripetal', 'chordal'];
+const root = document.createElement('div');
+root.id = 'root';
+document.body.appendChild(root);
+
+const simPane = document.createElement('div');
+simPane.id = 'sim-pane';
+root.appendChild(simPane);
+
+const splitter = document.createElement('div');
+splitter.id = 'splitter';
+root.appendChild(splitter);
+
+const timelinePane = document.createElement('div');
+timelinePane.id = 'timeline-pane';
+root.appendChild(timelinePane);
+
 const canvas = document.createElement('canvas');
 canvas.id = 'pipes-canvas';
-document.body.appendChild(canvas);
+simPane.appendChild(canvas);
+
+const simBounds = () => {
+  const width = simPane.clientWidth || window.innerWidth;
+  const height = simPane.clientHeight || window.innerHeight;
+  return { width, height };
+};
 
 const infoOverlay = document.createElement('div');
 infoOverlay.id = 'info';
@@ -159,15 +202,25 @@ Object.assign(recordingOverlay.style, {
 });
 document.body.appendChild(recordingOverlay);
 
+let lastRecordingLog = { label: '', pct: -1 };
+
 function setRecordingProgress(fraction: number | null, label: string) {
   if (fraction === null) {
     recordingOverlay.style.display = 'none';
+    if (lastRecordingLog.pct >= 0) {
+      console.log(`[render] done`);
+    }
+    lastRecordingLog = { label: '', pct: -1 };
     return;
   }
   const clamped = clamp(fraction, 0, 1);
   const pct = Math.round(clamped * 100);
   recordingOverlay.textContent = `${label} ${pct}%`;
   recordingOverlay.style.display = 'block';
+  if (pct !== lastRecordingLog.pct || label !== lastRecordingLog.label) {
+    console.log(`[render] ${label} ${pct}%`);
+    lastRecordingLog = { label, pct };
+  }
 }
 
 const defaultSimConfig: SimulationConfig = {
@@ -294,7 +347,8 @@ const renderer = new WebGLRenderer({
   canvas,
 });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setSize(window.innerWidth, window.innerHeight);
+const { width: initialWidth, height: initialHeight } = simBounds();
+renderer.setSize(initialWidth, initialHeight);
 renderer.outputColorSpace = SRGBColorSpace;
 renderer.toneMapping = ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.1;
@@ -302,7 +356,7 @@ renderer.toneMappingExposure = 1.1;
 const scene = new Scene();
 scene.background = new Color('#000000');
 
-const camera = new PerspectiveCamera(100, window.innerWidth / window.innerHeight, 0.1, 5000);
+const camera = new PerspectiveCamera(100, initialWidth / initialHeight, 0.1, 5000);
 applyCameraZoom(cameraControl.zoomFactor);
 scene.add(camera);
 syncPipeVisibilityToMainCamera();
@@ -430,6 +484,7 @@ updatePipeMaterial(renderSettings);
 let edgeNeons!: EdgeNeonSystem;
 let pipeManager!: PipeVisualManager;
 let bloomPass!: UnrealBloomPass;
+let guiInstance: GUI | null = null;
 let gridSizeController: any;
 let targetCountController: any;
 let maxLengthController: any;
@@ -517,11 +572,11 @@ const orbitState = {
 let lastCameraMode: CameraMode = cameraControl.mode;
 
 function mirrorTargetSize() {
-  const { innerWidth, innerHeight } = window;
+  const { width, height } = simBounds();
   const pixelRatio = renderer.getPixelRatio();
   return {
-    width: Math.min(reflectorMaxRes, innerWidth * pixelRatio * reflectorResScale),
-    height: Math.min(reflectorMaxRes, innerHeight * pixelRatio * reflectorResScale),
+    width: Math.min(reflectorMaxRes, width * pixelRatio * reflectorResScale),
+    height: Math.min(reflectorMaxRes, height * pixelRatio * reflectorResScale),
   };
 }
 
@@ -599,17 +654,61 @@ function syncPipeVisibilityToMainCamera() {
 }
 
 function resize() {
-  const { innerWidth, innerHeight } = window;
-  renderer.setSize(innerWidth, innerHeight);
-  camera.aspect = innerWidth / innerHeight;
+  const { width, height } = simBounds();
+  renderer.setSize(width, height);
+  camera.aspect = width / height;
   camera.updateProjectionMatrix();
-  composer.setSize(innerWidth, innerHeight);
-  bloomPass.setSize(innerWidth, innerHeight);
+  composer.setSize(width, height);
+  bloomPass.setSize(width, height);
   updateMirrorResolution();
 }
 
 window.addEventListener('resize', resize);
 resize();
+
+const splitterDrag = { active: false, pointerId: -1 };
+const MIN_SIM_HEIGHT = 160;
+const MIN_TIMELINE_HEIGHT = 140;
+
+const stopSplitterEvent = (e: PointerEvent) => {
+  e.preventDefault();
+  e.stopPropagation();
+};
+
+splitter.addEventListener('pointerdown', (e) => {
+  stopSplitterEvent(e);
+  splitterDrag.active = true;
+  splitterDrag.pointerId = e.pointerId;
+  splitter.setPointerCapture(e.pointerId);
+});
+
+splitter.addEventListener('pointermove', (e) => {
+  if (!splitterDrag.active || e.pointerId !== splitterDrag.pointerId) return;
+  stopSplitterEvent(e);
+  const rootRect = root.getBoundingClientRect();
+  const splitterRect = splitter.getBoundingClientRect();
+  const y = e.clientY - rootRect.top;
+  const maxSimHeight = rootRect.height - MIN_TIMELINE_HEIGHT - splitterRect.height;
+  const simHeight = clamp(y, MIN_SIM_HEIGHT, maxSimHeight);
+  const timelineHeight = rootRect.height - simHeight - splitterRect.height;
+  timelinePane.style.height = `${timelineHeight}px`;
+  resize();
+});
+
+const endSplitterDrag = (e: PointerEvent) => {
+  if (e.pointerId !== splitterDrag.pointerId) return;
+  stopSplitterEvent(e);
+  splitterDrag.active = false;
+  splitter.releasePointerCapture(e.pointerId);
+  splitterDrag.pointerId = -1;
+};
+
+splitter.addEventListener('pointerup', endSplitterDrag);
+splitter.addEventListener('pointercancel', endSplitterDrag);
+splitter.addEventListener('lostpointercapture', () => {
+  splitterDrag.active = false;
+  splitterDrag.pointerId = -1;
+});
 
 let lastTime = performance.now();
 const heldKeys = new Set<string>();
@@ -677,7 +776,9 @@ function frame(now: number) {
 function stepFrame(dt: number) {
   state.elapsed += dt;
   state.fpsSmoothed = state.fpsSmoothed * 0.9 + (1 / dt) * 0.1;
-  modulation.update(state.elapsed, dt);
+  const playheadSeconds = ignoreAudioForModulation ? null : timelineHandle?.getPlayheadSeconds();
+  const modulationTime = playheadSeconds ?? state.elapsed;
+  modulation.update(modulationTime, dt);
   frameIndex++;
   const enteringOrbit = cameraControl.mode === 'orbit' && lastCameraMode !== 'orbit';
   const enteringWallDrift = cameraControl.mode === 'wallDrift' && lastCameraMode !== 'wallDrift';
@@ -863,7 +964,8 @@ async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | n
   if (!supportsWebCodecs()) return null;
   const width = canvas.width;
   const height = canvas.height;
-  const totalFrames = Math.max(1, Math.round(clamp(durationSeconds, 5, 20) * 60));
+  const safeDuration = Math.max(0.1, durationSeconds);
+  const totalFrames = Math.max(1, Math.round(safeDuration * 60));
 
   const chunks: EncodedVideoChunk[] = [];
   const encoder = new VideoEncoder({
@@ -955,25 +1057,46 @@ async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | n
   return blob;
 }
 
-async function renderVideoCapture(durationSeconds: number) {
+async function renderVideoCapture(
+  durationSeconds: number,
+  opts: { startAtZero?: boolean; filenameBase?: string } = {}
+) {
   if (videoCaptureSettings.recording) return;
 
-  // Prefer offline WebCodecs encoding (decoupled from real-time)
-  if (supportsWebCodecs()) {
-    const blob = await encodeIvfWithWebCodecs(durationSeconds);
-    if (blob) {
-      const url = URL.createObjectURL(blob);
-      const download = document.createElement('a');
-      download.href = url;
-      download.download = `pipes-${clamp(durationSeconds, 5, 20)}s-${Date.now()}.ivf`;
-      download.click();
-      setTimeout(() => URL.revokeObjectURL(url), 10_000);
-      setRecordingProgress(null, '');
-      return;
-    }
+  const safeDuration = Math.max(0.1, durationSeconds);
+  const prevIgnoreAudio = ignoreAudioForModulation;
+  ignoreAudioForModulation = true;
+  if (opts.startAtZero) {
+    state.elapsed = 0;
+    state.paused = false;
+    sim.reset();
+    pipeManager.resetGridSize(sim.config.gridSize);
+    pipeManager.sync([], renderSettings);
   }
 
-  const targetDuration = clamp(durationSeconds, 5, 20);
+  try {
+    // Prefer offline WebCodecs encoding (decoupled from real-time)
+    if (supportsWebCodecs()) {
+      videoCaptureSettings.recording = true;
+      try {
+        const blob = await encodeIvfWithWebCodecs(safeDuration);
+        if (blob) {
+          const url = URL.createObjectURL(blob);
+          const download = document.createElement('a');
+          download.href = url;
+          const base = opts.filenameBase ?? `pipes-${safeDuration.toFixed(2)}s-${Date.now()}`;
+          download.download = `${base}.ivf`;
+          download.click();
+          setTimeout(() => URL.revokeObjectURL(url), 10_000);
+          setRecordingProgress(null, '');
+          return;
+        }
+      } finally {
+        videoCaptureSettings.recording = false;
+      }
+    }
+
+    const targetDuration = safeDuration;
   const mimeType = pickRecordingMimeType();
   if (!mimeType) {
     console.warn('MediaRecorder with WebM is not supported in this browser.');
@@ -1045,7 +1168,8 @@ async function renderVideoCapture(durationSeconds: number) {
     const url = URL.createObjectURL(blob);
     const download = document.createElement('a');
     download.href = url;
-    download.download = `pipes-${targetDuration}s-${Date.now()}.webm`;
+    const base = opts.filenameBase ?? `pipes-${targetDuration.toFixed(2)}s-${Date.now()}`;
+    download.download = `${base}.webm`;
     download.click();
     setTimeout(() => URL.revokeObjectURL(url), 10_000);
     setRecordingProgress(null, '');
@@ -1058,10 +1182,14 @@ async function renderVideoCapture(durationSeconds: number) {
       rafHandle = requestAnimationFrame(frame);
     }
   }
+  } finally {
+    ignoreAudioForModulation = prevIgnoreAudio;
+  }
 }
 
 function setupGui() {
   const gui = new GUI();
+  guiInstance = gui;
   gui.title('Pipes 98-ish');
 
   const simFolder = gui.addFolder('Simulation');
@@ -1638,7 +1766,6 @@ function setupGui() {
     modulationBaseSetters['post.bloomThreshold']?.(v);
   });
 
-  setupModulationGui(gui);
 }
 
 function setupModulationTargets() {
@@ -2254,126 +2381,6 @@ function setupModulationTargets() {
 
   modulation.syncBaseFromTargets();
   return setters;
-}
-
-function setupModulationGui(gui: GUI) {
-  const modFolder = gui.addFolder('Modulation');
-  const lfoFolders = new Map<string, GUI>();
-  const uiState = {
-    bypass: modulation.isBypassed(),
-    bpm: modulationGlobals.bpm,
-  };
-
-  modFolder
-    .add(uiState, 'bypass')
-    .name('Bypass (use base values)')
-    .onChange((v: boolean) => {
-      modulation.setBypass(v);
-    });
-  modFolder
-    .add(
-      {
-        rebase: () => {
-          modulation.syncBaseFromTargets();
-        },
-      },
-      'rebase'
-    )
-    .name('Re-baseline from current');
-  modFolder
-    .add(uiState, 'bpm', 10, 360, 1)
-    .name('Global BPM')
-    .onChange((v: number) => {
-      modulationGlobals.bpm = v;
-      modulation.setGlobalBpm(modulationGlobals.bpm);
-    });
-
-  const targetOptions = (groupFilter: string | null) => {
-    const opts: Record<string, string> = {};
-    const sorted = modulation.getTargets().slice().sort((a, b) => a.label.localeCompare(b.label));
-    for (const target of sorted) {
-      if (groupFilter && groupFilter !== 'All' && target.group !== groupFilter) continue;
-      opts[`${target.group ? `${target.group} • ` : ''}${target.label}`] = target.id;
-    }
-    return opts;
-  };
-  const groupOptions = () => {
-    const groups = new Set<string>(['All']);
-    for (const target of modulation.getTargets()) {
-      if (target.group) groups.add(target.group);
-    }
-    return Array.from(groups.values()).sort((a, b) => a.localeCompare(b));
-  };
-
-  const addLfo = () => {
-    const lfo = modulation.addLfo({});
-    if (lfo) attachLfoFolder(lfo);
-  };
-
-  modFolder.add({ add: addLfo }, 'add').name('Add LFO');
-
-  const attachLfoFolder = (lfo: LfoConfig) => {
-    const folder = modFolder.addFolder(`LFO ${lfoFolders.size + 1}`);
-    lfoFolders.set(lfo.id, folder);
-    const currentTarget = modulation.getTarget(lfo.targetId);
-    const lfoUi = { group: currentTarget?.group ?? 'All' };
-    const groupCtrl = folder.add(lfoUi, 'group', groupOptions()).name('Target group');
-    folder.add(lfo, 'enabled').name('Enabled');
-    const targetCtrl = folder.add(lfo, 'targetId', targetOptions(lfoUi.group)).name('Target');
-    targetCtrl.onChange((id: string) => {
-      const target = modulation.getTarget(id);
-      if (target) modulation.setBaseValue(id, target.getCurrent());
-    });
-    groupCtrl.onChange((group: string) => {
-      const opts = targetOptions(group);
-      targetCtrl.options(opts);
-      if (!Object.values(opts).includes(lfo.targetId)) {
-        const first = Object.values(opts)[0];
-        if (first) {
-          lfo.targetId = first;
-          targetCtrl.setValue(first);
-        }
-      }
-    });
-    folder
-      .add(
-        lfo,
-        'wave',
-        {
-          Sine: 'sine',
-          Triangle: 'triangle',
-          Square: 'square',
-          Saw: 'saw',
-          Noise: 'noise',
-          'Sample & Hold': 'sampleHold',
-        } as Record<string, LfoConfig['wave']>
-      )
-      .name('Wave');
-    folder.add(lfo, 'freqHz', 0, 8, 0.01).name('Frequency (Hz)');
-    folder.add(lfo, 'useGlobalBpm').name('Use global BPM');
-    folder.add(lfo, 'bpmCoefficient', 0.01, 8, 0.01).name('BPM coeff (mul/div)');
-    folder.add(lfo, 'amount', 0, 2, 0.01).name('Amount (x range)');
-    folder.add(lfo, 'offset', -1, 1, 0.01).name('Offset (x range)');
-    folder.add(lfo, 'phase', 0, Math.PI * 2, 0.001).name('Phase (rad)');
-    folder.add(lfo, 'bipolar').name('Bipolar');
-    folder.add(lfo, 'smoothSeconds', 0, 2, 0.01).name('Smooth (s)');
-    folder
-      .add(
-        {
-          remove: () => {
-            modulation.removeLfo(lfo.id);
-            lfoFolders.delete(lfo.id);
-            folder.destroy();
-          },
-        },
-        'remove'
-      )
-      .name('Remove');
-  };
-
-  for (const lfo of modulation.getLfos()) {
-    attachLfoFolder(lfo);
-  }
 }
 
 function updateInfo(currentSim: Simulation, currentState: { fpsSmoothed: number; elapsed: number }) {
@@ -3046,6 +3053,220 @@ edgeNeons = new EdgeNeonSystem(scene);
 pipeManager = new PipeVisualManager(scene, pipeMaterial, defaultSimConfig.gridSize);
 requestAnimationFrame(frame);
 setupGui();
+
+function downloadTextFile(filename: string, text: string, mimeType = 'application/json') {
+  const blob = new Blob([text], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+function buildProjectSettings(): ProjectSettings {
+  return {
+    simConfig: { ...defaultSimConfig },
+    renderSettings: { ...renderSettings },
+    roomPadding,
+    mirror: {
+      inset: mirrorInset,
+      resolutionScale: reflectorResScale,
+      maxResolution: reflectorMaxRes,
+      facesPerFrame: mirrorFacesPerFrame,
+      enabled: mirrorEnabled,
+      renderer: mirrorRenderer,
+      rayBounces: rayMaxBounces,
+      reflectionMode: mirrorReflectionMode,
+      blur: mirrorBlurAmount,
+      chromaticShift: mirrorChromaticShift,
+      warpStrength: mirrorWarpStrength,
+      warpSpeed: mirrorWarpSpeed,
+      refractionOffset: mirrorRefractionOffset,
+      noiseStrength: mirrorNoiseStrength,
+      bounceAttenuation: mirrorBounceAttenuation,
+      bounceAttenuationMode: mirrorBounceAttenuationMode,
+    },
+    camera: { ...cameraControl },
+    orbit: { ...orbitSettings },
+    wallDrift: { ...wallDriftSettings },
+    rail: { ...railSettings },
+  };
+}
+
+function snapshotProjectSettings(): ProjectSettings {
+  const wasBypassed = modulation.isBypassed();
+  const playheadSeconds = ignoreAudioForModulation ? null : timelineHandle?.getPlayheadSeconds();
+  const modulationTime = playheadSeconds ?? state.elapsed;
+
+  modulation.setBypass(true);
+  const settings = buildProjectSettings();
+  modulation.setBypass(wasBypassed);
+  if (!wasBypassed) {
+    modulation.update(modulationTime, 1 / 60);
+  }
+  return settings;
+}
+
+function applyProjectSettings(settings: ProjectSettings) {
+  const cfg = settings.simConfig;
+  defaultSimConfig.gridSize = Math.max(8, Math.floor(cfg.gridSize));
+  defaultSimConfig.targetPipeCount = Math.max(1, Math.floor(cfg.targetPipeCount));
+  defaultSimConfig.maxPipeLength = Math.max(0, Math.floor(cfg.maxPipeLength));
+  defaultSimConfig.growthInterval = Math.max(0.001, cfg.growthInterval);
+  defaultSimConfig.turnProbability = clamp(cfg.turnProbability, 0, 1);
+  defaultSimConfig.disableTailShrink = Boolean(cfg.disableTailShrink);
+  turnProxy.turnChance = defaultSimConfig.turnProbability * 100;
+
+  roomPadding = clamp(settings.roomPadding, 0, 70);
+  roomGuiSettings.wallGap = roomPadding;
+
+  Object.assign(renderSettings, settings.renderSettings);
+
+  const prevMirrorRenderer = mirrorRenderer;
+  mirrorInset = Math.max(0, settings.mirror.inset);
+  reflectorResScale = clamp(settings.mirror.resolutionScale, 0.05, 8);
+  reflectorMaxRes = clamp(settings.mirror.maxResolution, 256, 4096 * 4);
+  mirrorFacesPerFrame = clamp(Math.floor(settings.mirror.facesPerFrame), 1, 6);
+  mirrorEnabled = Boolean(settings.mirror.enabled);
+  mirrorRenderer = settings.mirror.renderer;
+  rayMaxBounces = clamp(Math.floor(settings.mirror.rayBounces), 1, 16);
+  mirrorReflectionMode = settings.mirror.reflectionMode;
+  mirrorBlurAmount = clamp(settings.mirror.blur, 0, 1);
+  mirrorChromaticShift = clamp(settings.mirror.chromaticShift, 0, 0.1);
+  mirrorWarpStrength = clamp(settings.mirror.warpStrength, 0, 0.2);
+  mirrorWarpSpeed = clamp(settings.mirror.warpSpeed, 0, 20);
+  mirrorRefractionOffset = clamp(settings.mirror.refractionOffset, -1, 1);
+  mirrorNoiseStrength = clamp(settings.mirror.noiseStrength, 0, 1);
+  mirrorBounceAttenuation = clamp(settings.mirror.bounceAttenuation, 0, 10);
+  mirrorBounceAttenuationMode = settings.mirror.bounceAttenuationMode;
+
+  Object.assign(mirrorGuiSettings, {
+    inset: mirrorInset,
+    resolutionScale: reflectorResScale,
+    maxResolution: reflectorMaxRes,
+    facesPerFrame: mirrorFacesPerFrame,
+    enabled: mirrorEnabled,
+    renderer: mirrorRenderer,
+    rayBounces: rayMaxBounces,
+    reflectionMode: mirrorReflectionMode,
+    blur: mirrorBlurAmount,
+    chromaticShift: mirrorChromaticShift,
+    warpStrength: mirrorWarpStrength,
+    warpSpeed: mirrorWarpSpeed,
+    refractionOffset: mirrorRefractionOffset,
+    noiseStrength: mirrorNoiseStrength,
+    bounceAttenuation: mirrorBounceAttenuation,
+    bounceAttenuationMode: mirrorBounceAttenuationMode,
+  });
+
+  Object.assign(cameraControl, settings.camera);
+  Object.assign(orbitSettings, settings.orbit);
+  Object.assign(wallDriftSettings, settings.wallDrift);
+  Object.assign(railSettings, settings.rail);
+
+  applyCameraZoom(cameraControl.zoomFactor);
+
+  state.elapsed = 0;
+  state.paused = false;
+  sim.reset(defaultSimConfig);
+  pipeManager.resetGridSize(sim.config.gridSize);
+  pipeManager.sync([], renderSettings);
+
+  room.updateSize(sim.config.gridSize, renderSettings);
+  roomMirrors.update(room.size, renderSettings.roomColor);
+  rebuildGrid(sim.config.gridSize);
+
+  syncPipeVisibilityToMainCamera();
+  updatePipeMaterial(renderSettings);
+  bloomPass.strength = renderSettings.bloomStrength;
+  bloomPass.radius = renderSettings.bloomRadius;
+  bloomPass.threshold = renderSettings.bloomThreshold;
+
+  if (prevMirrorRenderer !== mirrorRenderer) {
+    roomMirrors.dispose();
+    roomMirrors = createMirrorSystem(mirrorRenderer);
+  }
+  roomMirrors.setEnabled(mirrorEnabled);
+  roomMirrors.setInset(mirrorInset);
+  updateMirrorResolution();
+  updateMirrorBlur();
+  updateMirrorDistortionUniforms(state.elapsed);
+  updateMirrorMask();
+  roomMirrors.update(room.size, renderSettings.roomColor);
+
+  refreshCameraDistanceController();
+
+  modulation.syncBaseFromTargets();
+  if (guiInstance) {
+    for (const controller of guiInstance.controllersRecursive()) {
+      controller.updateDisplay();
+    }
+  }
+}
+
+function saveProject() {
+  const timeline = timelineHandle?.getProjectTimeline();
+  if (!timeline) return;
+  const project: ProjectFile = {
+    version: PROJECT_VERSION,
+    savedAt: new Date().toISOString(),
+    name: timeline.audioFileName ?? undefined,
+    timeline,
+    settings: snapshotProjectSettings(),
+  };
+  const json = stringifyProjectFile(project);
+  downloadTextFile(`pipes-project-${Date.now()}.json`, json);
+}
+
+function loadProject(project: ProjectFile) {
+  applyProjectSettings(project.settings);
+  timelineHandle?.loadProjectTimeline(project.timeline);
+}
+
+timelineHandle = initTimeline({
+  container: timelinePane,
+  bpm: modulationGlobals.bpm,
+  modulation,
+  onBpmChange: (bpm) => {
+    modulationGlobals.bpm = bpm;
+    modulation.setGlobalBpm(bpm);
+  },
+  onSaveProject: () => saveProject(),
+  onLoadProject: (project) => loadProject(project),
+  onRenderVideo: (durationSeconds) => {
+    const schedule = timelineHandle?.getRenderSchedule();
+    if (schedule) {
+      requestBackendRender(schedule).catch((err) => {
+        console.warn('Backend render failed; falling back to in-browser render', err);
+        renderVideoCapture(durationSeconds, { startAtZero: true });
+      });
+      return;
+    }
+    renderVideoCapture(durationSeconds, { startAtZero: true });
+  },
+});
+
+function applyRenderSchedule(schedule: RenderSchedule) {
+  modulationGlobals.bpm = schedule.bpm;
+  modulation.setGlobalBpm(schedule.bpm);
+  for (const lfo of modulation.getLfos().slice()) {
+    modulation.removeLfo(lfo.id);
+  }
+  for (const lfo of schedule.lfos) {
+    modulation.addLfo(lfo);
+  }
+  modulation.syncBaseFromTargets();
+}
+
+(window as any).__pipesBackend = {
+  ready: true,
+  applySchedule: applyRenderSchedule,
+  renderFromSchedule: async (schedule: RenderSchedule, filenameBase?: string) => {
+    applyRenderSchedule(schedule);
+    await renderVideoCapture(schedule.durationSeconds, { startAtZero: true, filenameBase });
+  },
+};
 
 function updatePipeMaterial(settings: RenderSettings) {
   pipeMaterial.vertexColors = true;

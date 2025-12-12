@@ -6,15 +6,20 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "render:server": "node render-server.mjs"
   },
   "devDependencies": {
     "@types/three": "^0.181.0",
+    "puppeteer": "^24.23.0",
     "typescript": "~5.9.3",
     "vite": "^7.2.4"
   },
   "dependencies": {
+    "konva": "9.3.22",
     "lil-gui": "^0.21.0",
-    "three": "^0.181.2"
+    "peaks.js": "^4.0.0",
+    "three": "^0.181.2",
+    "waveform-data": "^4.5.2"
   }
 }
