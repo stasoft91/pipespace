@@ -145,6 +145,7 @@ export class ModulationManager {
     if (this.targets.size === 0) return;
     if (this.lastUpdateSeconds !== null && timeSeconds < this.lastUpdateSeconds - 1e-6) {
       this.lfoRuntime.clear();
+      this.lastUpdateSeconds = null;
     }
     this.lastUpdateSeconds = timeSeconds;
     const values = new Map<string, number>();
