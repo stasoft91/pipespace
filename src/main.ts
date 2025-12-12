@@ -116,9 +116,9 @@ const roomGuiSettings = {
 };
 let mirrorInset = 0.01;
 let reflectorResScale = 1;
-let reflectorMaxRes = 4096 * 4;
+let reflectorMaxRes = 4096;
 let mirrorFacesPerFrame = 6; // how many faces update each frame (reduces flicker/load)
-let rayMaxBounces = 3;
+let rayMaxBounces = 2;
 let mirrorEnabled = true;
 let mirrorReflectionMode: MirrorReflectionMode = 'all'; // how mirrors see each other
 let mirrorRenderer: MirrorRenderer = 'physicalRay';
