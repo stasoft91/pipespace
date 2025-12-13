@@ -967,10 +967,17 @@ async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | n
   const safeDuration = Math.max(0.1, durationSeconds);
   const totalFrames = Math.max(1, Math.round(safeDuration * 60));
 
-  const chunks: EncodedVideoChunk[] = [];
+  const chunks: BlobPart[] = [];
   const encoder = new VideoEncoder({
     output: (chunk) => {
-      chunks.push(chunk);
+      const frameHeader = new ArrayBuffer(12);
+      const headerView = new DataView(frameHeader);
+      headerView.setUint32(0, chunk.byteLength, true);
+      headerView.setBigUint64(4, BigInt(chunk.timestamp), true);
+
+      const data = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(data);
+      chunks.push(frameHeader, data);
     },
     error: (e) => {
       console.error('WebCodecs encoder error', e);
@@ -981,7 +988,7 @@ async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | n
     codec: 'vp09.00.10.08',
     width,
     height,
-    bitrate: 125_000_000,
+    bitrate: 30_000_000,
     framerate: 60,
   });
 
@@ -992,11 +999,13 @@ async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | n
   for (let i = 0; i < totalFrames; i++) {
     setRecordingProgress(i / totalFrames, 'Encoding (WebCodecs)');
     stepFrame(1 / 60);
-    const bitmap = await createImageBitmap(canvas);
-    const frame = new VideoFrame(bitmap, { timestamp: i });
+    const frame = new VideoFrame(canvas, { timestamp: i });
     encoder.encode(frame);
     frame.close();
-    bitmap.close();
+    if (i > 0 && i % 120 === 0) {
+      await encoder.flush();
+      await new Promise((r) => setTimeout(r, 0));
+    }
   }
 
   await encoder.flush();
@@ -1009,7 +1018,7 @@ async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | n
   }
 
   // Build IVF container (simple and widely supported)
-  const frameCount = chunks.length;
+  const frameCount = totalFrames;
   const header = new ArrayBuffer(32);
   const view = new DataView(header);
   // Signature 'DKIF'
@@ -1030,28 +1039,7 @@ async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | n
   view.setUint32(24, frameCount, true); // frame count
   view.setUint32(28, 0, true); // unused
 
-  // Calculate total buffer size
-  let totalSize = header.byteLength;
-  for (const chunk of chunks) {
-    totalSize += 12 + chunk.byteLength; // frame header + data
-  }
-
-  const out = new Uint8Array(totalSize);
-  out.set(new Uint8Array(header), 0);
-  let offset = header.byteLength;
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
-    const frameHeader = new DataView(out.buffer, offset, 12);
-    frameHeader.setUint32(0, chunk.byteLength, true);
-    frameHeader.setBigUint64(4, BigInt(i), true);
-    offset += 12;
-    const data = new Uint8Array(chunk.byteLength);
-    chunk.copyTo(data);
-    out.set(data, offset);
-    offset += chunk.byteLength;
-  }
-
-  const blob = new Blob([out], { type: 'video/x-ivf' });
+  const blob = new Blob([header, ...chunks], { type: 'video/x-ivf' });
   if (wasRunning) rafHandle = requestAnimationFrame(frame);
   setRecordingProgress(null, '');
   return blob;
