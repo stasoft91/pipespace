@@ -8,6 +8,7 @@ import puppeteer from 'puppeteer';
 const PORT = Number(process.env.RENDER_PORT ?? 3333);
 const APP_URL = process.env.APP_URL ?? 'http://localhost:5173/';
 const RENDER_DIR = path.join(process.cwd(), 'Rendered');
+const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS ?? 5 * 60 * 1000);
 
 mkdirSync(RENDER_DIR, { recursive: true });
 
@@ -68,13 +69,14 @@ const waitForStableFile = async (filePath, timeoutMs) => {
 
 let busy = false;
 
-async function runRenderJob({ schedule, outputBase }) {
+async function runRenderJob({ schedule, outputBase, appUrl }) {
   const base = sanitizeBase(outputBase);
   const expectedIvf = path.join(RENDER_DIR, `${base}.ivf`);
   const expectedWebm = path.join(RENDER_DIR, `${base}.webm`);
+  const targetUrl = typeof appUrl === 'string' && appUrl.length ? appUrl : APP_URL;
 
   console.log(`[render:${base}] Starting…`);
-  console.log(`[render:${base}] App URL: ${APP_URL}`);
+  console.log(`[render:${base}] App URL: ${targetUrl}`);
   console.log(`[render:${base}] Output dir: ${RENDER_DIR}`);
 
   const browser = await puppeteer.launch({
@@ -87,6 +89,8 @@ async function runRenderJob({ schedule, outputBase }) {
 
   try {
     const page = await browser.newPage();
+    page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
+    page.setDefaultTimeout(NAV_TIMEOUT_MS);
     page.on('console', (msg) => {
       console.log(`[page:${base}] ${msg.type()}: ${msg.text()}`);
     });
@@ -97,8 +101,11 @@ async function runRenderJob({ schedule, outputBase }) {
     const client = await page.target().createCDPSession();
     await client.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: RENDER_DIR });
 
-    await page.goto(APP_URL, { waitUntil: 'networkidle0' });
-    await page.waitForFunction(() => window.__pipesBackend?.ready === true, { timeout: 60_000 });
+    const nav = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
+    if (nav && !nav.ok()) {
+      throw new Error(`Navigation failed: ${nav.status()} ${nav.statusText()}`);
+    }
+    await page.waitForFunction(() => window.__pipesBackend?.ready === true, { timeout: NAV_TIMEOUT_MS });
 
     await page.evaluate(() => {
       const timeline = document.getElementById('timeline-pane');
@@ -149,14 +156,15 @@ const server = http.createServer(async (req, res) => {
       if (busy) return json(res, 409, { ok: false, error: 'Renderer busy' });
       const body = await readJsonBody(req);
       if (!body || typeof body !== 'object') return json(res, 400, { ok: false, error: 'Invalid JSON body' });
-      const schedule = body;
+      const schedule = body.schedule && typeof body.schedule === 'object' ? body.schedule : body;
       const outputBase = typeof body.outputBase === 'string' ? body.outputBase : `render-${Date.now()}`;
+      const appUrl = typeof body.appUrl === 'string' ? body.appUrl : APP_URL;
 
       busy = true;
       const jobId = sanitizeBase(outputBase);
       json(res, 202, { ok: true, jobId, outputBase: jobId });
 
-      runRenderJob({ schedule, outputBase: jobId })
+      runRenderJob({ schedule, outputBase: jobId, appUrl })
         .catch((err) => {
           console.error(`[render:${jobId}] Failed`, err);
         })

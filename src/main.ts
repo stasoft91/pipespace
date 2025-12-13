@@ -100,7 +100,7 @@ async function requestBackendRender(schedule: RenderSchedule) {
   const res = await fetch(BACKEND_RENDER_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(schedule),
+    body: JSON.stringify({ schedule, appUrl: window.location.origin + '/', outputBase: `render-${Date.now()}` }),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
