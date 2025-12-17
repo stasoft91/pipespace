@@ -56,6 +56,7 @@ export class ModulationManager {
   private baseValues = new Map<string, number>();
   private lfos: LfoConfig[] = [];
   private lfoRuntime = new Map<string, LfoRuntimeState>();
+  private scratchValues = new Map<string, number>();
   private bypass = false;
   private globalBpm = 120;
   private lastUpdateSeconds: number | null = null;
@@ -148,7 +149,8 @@ export class ModulationManager {
       this.lastUpdateSeconds = null;
     }
     this.lastUpdateSeconds = timeSeconds;
-    const values = new Map<string, number>();
+    const values = this.scratchValues;
+    values.clear();
 
     for (const [id, target] of this.targets) {
       const base = this.baseValues.get(id);

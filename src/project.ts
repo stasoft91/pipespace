@@ -52,6 +52,7 @@ export type ProjectRenderSettings = {
   bloomStrength: number;
   bloomRadius: number;
   bloomThreshold: number;
+  bloomResolutionScale: number;
 };
 
 export type ProjectMirrorSettings = {
@@ -142,4 +143,3 @@ export function parseProjectFile(jsonText: string): ProjectFile {
 export function stringifyProjectFile(project: ProjectFile): string {
   return JSON.stringify(project, null, 2);
 }
-

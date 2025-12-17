@@ -4,6 +4,7 @@ import {
   BoxGeometry,
   CylinderGeometry,
   BufferAttribute,
+  DynamicDrawUsage,
   CatmullRomCurve3,
   Color,
   CurvePath,
@@ -78,6 +79,7 @@ type RenderSettings = {
   bloomStrength: number;
   bloomRadius: number;
   bloomThreshold: number;
+  bloomResolutionScale: number;
 };
 
 type OrbitSettings = {
@@ -269,6 +271,7 @@ const renderSettings: RenderSettings = {
   bloomStrength: 1,
   bloomRadius: 1,
   bloomThreshold: 0,
+  bloomResolutionScale: 0.5,
 };
 
 const mirrorGuiSettings = {
@@ -514,13 +517,17 @@ let railRollController: any;
 
 const composer = new EffectComposer(renderer);
 const renderPass = new RenderPass(scene, camera);
-const makeBloom = () =>
-  new UnrealBloomPass(
-    new Vector2(window.innerWidth, window.innerHeight),
+const makeBloom = () => {
+  const scale = clamp(renderSettings.bloomResolutionScale, 0.1, 1);
+  const width = Math.max(1, Math.floor(window.innerWidth * scale));
+  const height = Math.max(1, Math.floor(window.innerHeight * scale));
+  return new UnrealBloomPass(
+    new Vector2(width, height),
     renderSettings.bloomStrength,
     renderSettings.bloomRadius,
     renderSettings.bloomThreshold
   );
+};
 bloomPass = makeBloom();
 composer.addPass(renderPass);
 composer.addPass(bloomPass);
@@ -547,6 +554,7 @@ const CAMERA_MARGIN = 1.5;
 const CAMERA_WALL_EPS = 0.6;
 const camDir = new Vector3();
 const behind = new Vector3();
+const tmpToCenter = new Vector3();
 const wallNormals = [
   new Vector3(1, 0, 0),
   new Vector3(-1, 0, 0),
@@ -580,6 +588,15 @@ function mirrorTargetSize() {
   };
 }
 
+function updateBloomResolution(width?: number, height?: number) {
+  const bounds = width !== undefined && height !== undefined ? { width, height } : simBounds();
+  const rawScale = renderSettings.bloomResolutionScale;
+  const scale = clamp(Number.isFinite(rawScale) ? rawScale : 1, 0.1, 1);
+  const w = Math.max(1, Math.floor(bounds.width * scale));
+  const h = Math.max(1, Math.floor(bounds.height * scale));
+  bloomPass.setSize(w, h);
+}
+
 function updateMirrorResolution() {
   const { width, height } = mirrorTargetSize();
   roomMirrors.setResolution(width, height);
@@ -604,7 +621,7 @@ function updateMirrorDistortionUniforms(time: number) {
 function updateMirrorMask() {
   const faces = roomMirrors.faces.length;
   if (faces === 0) return;
-  mirrorUpdateMask = new Set<number>();
+  mirrorUpdateMask.clear();
 
   if (mirrorReflectionMode === 'none') {
     // No mirrors get updated
@@ -612,36 +629,33 @@ function updateMirrorMask() {
     return;
   }
 
-  let candidateFaces: number[] = [];
   if (mirrorReflectionMode === 'cameraFacing') {
     // Only update the camera-facing mirror
-    const cameraDir = new Vector3();
-    camera.getWorldDirection(cameraDir);
     let bestIdx = -1;
     let bestDot = -Infinity;
     for (let i = 0; i < faces; i++) {
       const center = roomMirrors.faces[i].position;
-      const toCenter = center.clone().sub(camera.position).normalize();
-      const dot = cameraDir.dot(toCenter);
+      tmpToCenter.copy(center).sub(camera.position).normalize();
+      const dot = camDir.dot(tmpToCenter);
       if (dot > bestDot) {
         bestDot = dot;
         bestIdx = i;
       }
     }
     if (bestIdx >= 0) {
-      candidateFaces = [bestIdx];
+      mirrorUpdateMask.add(bestIdx);
     }
-  } else {
-    // 'all' mode: rotate through all faces
-    candidateFaces = Array.from({length: faces}, (_, i) => i);
+    mirrorUpdateOffset = 0;
+    roomMirrors.setUpdateMask(mirrorUpdateMask);
+    return;
   }
 
-  const count = Math.max(1, Math.min(candidateFaces.length, mirrorFacesPerFrame));
+  // 'all' mode: rotate through all faces
+  const count = Math.max(1, Math.min(faces, mirrorFacesPerFrame));
   for (let i = 0; i < count; i++) {
-    const idx = (mirrorUpdateOffset + i) % candidateFaces.length;
-    mirrorUpdateMask.add(candidateFaces[idx]);
+    mirrorUpdateMask.add((mirrorUpdateOffset + i) % faces);
   }
-  mirrorUpdateOffset = (mirrorUpdateOffset + count) % candidateFaces.length;
+  mirrorUpdateOffset = (mirrorUpdateOffset + count) % faces;
   roomMirrors.setUpdateMask(mirrorUpdateMask);
 }
 
@@ -659,7 +673,7 @@ function resize() {
   camera.aspect = width / height;
   camera.updateProjectionMatrix();
   composer.setSize(width, height);
-  bloomPass.setSize(width, height);
+  updateBloomResolution(width, height);
   updateMirrorResolution();
 }
 
@@ -1308,10 +1322,7 @@ function setupGui() {
       'Catmull-Rom (centripetal)': 'centripetal',
       'Catmull-Rom (chordal)': 'chordal',
     })
-    .name('Path type')
-    .onChange(() => {
-      pipeManager.forceGeometryRefresh();
-    });
+    .name('Path type');
   pipeFolder
     .add(renderSettings, 'hidePipesInMainCamera')
     .name('Hide in main camera')
@@ -1330,18 +1341,13 @@ function setupGui() {
     .add(renderSettings, 'cornerTension', 0, 3, 0.01)
     .name('Corner smoothness')
     .onChange(() => {
-      pipeManager.forceGeometryRefresh();
       modulationBaseSetters['pipes.cornerTension']?.(renderSettings.cornerTension);
     });
-  pipeFolder.add(renderSettings, 'neonEnabled').name('Neon glow').onChange(() => {
-    pipeManager.forceGeometryRefresh();
-  });
+  pipeFolder.add(renderSettings, 'neonEnabled').name('Neon glow');
   pipeFolder.add(renderSettings, 'neonStrength', 0, 4, 0.05).name('Neon intensity').onChange(() => {
-    pipeManager.forceGeometryRefresh();
     modulationBaseSetters['pipes.neonStrength']?.(renderSettings.neonStrength);
   });
   pipeFolder.add(renderSettings, 'neonSize', 0.98, 1.2, 0.005).name('Neon size').onChange(() => {
-    pipeManager.forceGeometryRefresh();
     modulationBaseSetters['pipes.neonSize']?.(renderSettings.neonSize);
   });
   pipeFolder.add(renderSettings, 'glassEnabled').name('Glass mode').onChange((enabled: boolean) => {
@@ -1752,6 +1758,10 @@ function setupGui() {
   postFolder.add(renderSettings, 'bloomThreshold', 0, 1, 0.01).name('Bloom threshold').onChange((v: number) => {
     bloomPass.threshold = v;
     modulationBaseSetters['post.bloomThreshold']?.(v);
+  });
+  postFolder.add(renderSettings, 'bloomResolutionScale', 0.25, 1, 0.05).name('Bloom resolution').onChange((v: number) => {
+    renderSettings.bloomResolutionScale = clamp(v, 0.1, 1);
+    updateBloomResolution();
   });
 
 }
@@ -2604,6 +2614,7 @@ function randomizeAll() {
   renderSettings.bloomStrength = rand(0.4, 1.2);
   renderSettings.bloomRadius = rand(0.2, 0.6);
   renderSettings.bloomThreshold = rand(0.08, 0.3);
+  renderSettings.bloomResolutionScale = rand(0.35, 0.85);
 
   sim.reset({
     gridSize: defaultSimConfig.gridSize,
@@ -2627,6 +2638,7 @@ function randomizeAll() {
   bloomPass.strength = renderSettings.bloomStrength;
   bloomPass.radius = renderSettings.bloomRadius;
   bloomPass.threshold = renderSettings.bloomThreshold;
+  updateBloomResolution();
 
   gridLines.visible = renderSettings.showGrid;
   state.paused = false;
@@ -2779,12 +2791,14 @@ class EdgeNeonSystem {
 
     // Populate a few point lights along the edge to cast light into the room.
     const span = start.distanceTo(end);
-    const segments = Math.min(12, Math.max(3, Math.round(span / 12)));
+    // Lots of lights get very expensive fast; keep it small and rely on bloom/glow for most of the look.
+    const segments = Math.min(2, Math.max(1, Math.round(span / 60)));
     for (let i = 0; i < segments; i++) {
       const t = (i + 0.5) / segments;
-      const pos = new Vector3().lerpVectors(start, end, t);
-      const light = new PointLight(this.baseColor.clone(), 0, Math.max(roomSize * 0.75, span * 0.6), 1.35);
-      light.position.copy(pos);
+      const light = new PointLight(0xffffff, 0, Math.max(roomSize * 0.75, span * 0.6), 1.35);
+      light.position.lerpVectors(start, end, t);
+      light.matrixAutoUpdate = false;
+      light.updateMatrix();
       this.scene.add(light);
       this.lights.push(light);
     }
@@ -2852,6 +2866,41 @@ const toWorld = (gridSize: number, cell: Vec3): Vector3 => {
   return new Vector3(cell.x - half + 0.5, cell.y - half + 0.5, cell.z - half + 0.5).multiplyScalar(cellSize);
 };
 
+const tmpPipeColor = new Color();
+
+function updatePipeVertexColors(geometry: any, pipe: Pipe, settings: RenderSettings) {
+  const uv = geometry?.getAttribute?.('uv') as BufferAttribute | undefined;
+  const position = geometry?.getAttribute?.('position') as BufferAttribute | undefined;
+  if (!uv || !position) return;
+
+  const uvArray = uv.array as ArrayLike<number>;
+  const vertexCount = position.count;
+  let colorAttr = geometry.getAttribute('color') as BufferAttribute | undefined;
+  if (!colorAttr || colorAttr.count !== vertexCount) {
+    colorAttr = new BufferAttribute(new Float32Array(vertexCount * 3), 3);
+    geometry.setAttribute('color', colorAttr);
+  }
+  if (colorAttr.usage !== DynamicDrawUsage) {
+    colorAttr.setUsage(DynamicDrawUsage);
+  }
+
+  const colors = colorAttr.array as Float32Array;
+  const colorSeed = pipe.colorSeed;
+  const colorShift = settings.colorShift;
+
+  for (let i = 0; i < vertexCount; i++) {
+    const v = uvArray[i * 2 + 1]; // 0..1 along tube length
+    const hue = colorSeed + colorShift * (v - 0.5);
+    const light = clamp(0.35, 0.9, 0.58 + 0.12 * (v - 0.5));
+    tmpPipeColor.setHSL(hue - Math.floor(hue), 0.65, light);
+    colors[i * 3] = tmpPipeColor.r;
+    colors[i * 3 + 1] = tmpPipeColor.g;
+    colors[i * 3 + 2] = tmpPipeColor.b;
+  }
+
+  colorAttr.needsUpdate = true;
+}
+
 class PipeVisual {
   mesh: Mesh;
   glow?: Mesh;
@@ -2881,26 +2930,29 @@ class PipeVisual {
       pipe.version !== this.lastVersion ||
       settings.pipeRadius !== this.lastRadius ||
       settings.tubularSegments !== this.lastSegments ||
-      settings.colorShift !== this.lastColorShift ||
       settings.radialSegments !== this.lastRadialSegments ||
       settings.cornerTension !== this.lastCornerTension ||
       settings.pathType !== this.lastPathType;
+    const needsColor = settings.colorShift !== this.lastColorShift;
 
     if (needsGeometry) {
-      this.mesh.geometry?.dispose();
-      this.mesh.geometry = createPipeGeometry(pipe, this.gridSize, settings);
+      const prevGeometry = this.mesh.geometry;
+      const nextGeometry = createPipeGeometry(pipe, this.gridSize, settings);
+      this.mesh.geometry = nextGeometry;
       if (this.glow) {
-        this.glow.geometry.dispose();
-        this.glow.geometry = this.mesh.geometry;
+        this.glow.geometry = nextGeometry;
       }
+      prevGeometry?.dispose();
       this.lastVersion = pipe.version;
       this.lastRadius = settings.pipeRadius;
       this.lastSegments = settings.tubularSegments;
-      this.lastColorShift = settings.colorShift;
       this.lastRadialSegments = settings.radialSegments;
       this.lastCornerTension = settings.cornerTension;
       this.lastPathType = settings.pathType;
+    } else if (needsColor) {
+      updatePipeVertexColors(this.mesh.geometry, pipe, settings);
     }
+    this.lastColorShift = settings.colorShift;
 
     if (settings.neonEnabled) {
       if (!this.glow || !this.glowMaterial) {
@@ -2924,10 +2976,14 @@ class PipeVisual {
   }
 
   dispose() {
-    this.mesh.geometry?.dispose();
+    const geom = this.mesh.geometry;
     if (this.glow) {
-      this.glow.geometry?.dispose();
+      const glowGeom = this.glow.geometry;
+      if (glowGeom && glowGeom !== geom) {
+        glowGeom.dispose();
+      }
     }
+    geom?.dispose();
     this.glowMaterial?.dispose();
   }
 
@@ -2938,6 +2994,7 @@ class PipeVisual {
 
 class PipeVisualManager {
   private visuals = new Map<number, PipeVisual>();
+  private activeIds = new Set<number>();
   private scene: Scene;
   private material: MeshPhysicalMaterial;
   private gridSize: number;
@@ -2959,9 +3016,12 @@ class PipeVisualManager {
   }
 
   sync(pipes: Pipe[], settings: RenderSettings) {
-    const activeIds = new Set(pipes.map((p) => p.id));
+    this.activeIds.clear();
+    for (const pipe of pipes) {
+      this.activeIds.add(pipe.id);
+    }
     for (const [id, visual] of this.visuals.entries()) {
-      if (!activeIds.has(id)) {
+      if (!this.activeIds.has(id)) {
         this.scene.remove(visual.mesh);
         if (visual.glow) this.scene.remove(visual.glow);
         visual.dispose();
@@ -2981,8 +3041,7 @@ class PipeVisualManager {
       visual.update(pipe, settings);
       const glowMesh = visual.glow as Mesh | undefined;
       if (glowMesh) {
-        const present = this.scene.children.some((child) => child === glowMesh);
-        if (!present) {
+        if (glowMesh.parent !== this.scene) {
           this.scene.add(glowMesh);
         }
       }
@@ -3019,21 +3078,7 @@ function createPipeGeometry(pipe: Pipe, gridSize: number, settings: RenderSettin
     settings.pathType === 'polyline' ? Math.max(1, path.length - 1) : Math.max(1, path.length);
   const tubularSegments = Math.max(6, Math.floor(settings.tubularSegments * baseSegments));
   const geometry = new TubeGeometry(curve, tubularSegments, settings.pipeRadius, settings.radialSegments, false);
-
-  const uv = geometry.getAttribute('uv');
-  const colors = new Float32Array(geometry.attributes.position.count * 3);
-
-  for (let i = 0; i < geometry.attributes.position.count; i++) {
-    const v = uv.getY(i); // 0..1 along tube length
-    const hue = pipe.colorSeed + settings.colorShift * (v - 0.5);
-    const light = clamp(0.35, 0.9, 0.58 + 0.12 * (v - 0.5));
-    const c = new Color().setHSL(hue - Math.floor(hue), 0.65, light);
-    colors[i * 3] = c.r;
-    colors[i * 3 + 1] = c.g;
-    colors[i * 3 + 2] = c.b;
-  }
-
-  geometry.setAttribute('color', new BufferAttribute(colors, 3));
+  updatePipeVertexColors(geometry, pipe, settings);
   return geometry;
 }
 
@@ -3170,6 +3215,7 @@ function applyProjectSettings(settings: ProjectSettings) {
   bloomPass.strength = renderSettings.bloomStrength;
   bloomPass.radius = renderSettings.bloomRadius;
   bloomPass.threshold = renderSettings.bloomThreshold;
+  updateBloomResolution();
 
   if (prevMirrorRenderer !== mirrorRenderer) {
     roomMirrors.dispose();

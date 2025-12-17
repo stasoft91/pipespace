@@ -12,14 +12,17 @@ const DIRECTIONS: readonly Vec3[] = [
 ];
 
 const add = (a: Vec3, b: Vec3): Vec3 => ({ x: a.x + b.x, y: a.y + b.y, z: a.z + b.z });
-const key = (v: Vec3): string => `${v.x},${v.y},${v.z}`;
 
 class OccupancyGrid {
-  private occupied = new Set<string>();
+  private occupied: Uint8Array;
+  private occupiedCount = 0;
   readonly size: number;
+  private readonly size2: number;
 
   constructor(size: number) {
     this.size = size;
+    this.size2 = size * size;
+    this.occupied = new Uint8Array(size * size * size);
   }
 
   isInside(cell: Vec3): boolean {
@@ -33,39 +36,49 @@ class OccupancyGrid {
     );
   }
 
+  private index(cell: Vec3): number {
+    return cell.x + cell.y * this.size + cell.z * this.size2;
+  }
+
   isFree(cell: Vec3): boolean {
-    return this.isInside(cell) && !this.occupied.has(key(cell));
+    if (!this.isInside(cell)) return false;
+    return this.occupied[this.index(cell)] === 0;
   }
 
   occupy(cell: Vec3): void {
-    this.occupied.add(key(cell));
+    const idx = this.index(cell);
+    if (this.occupied[idx] !== 0) return;
+    this.occupied[idx] = 1;
+    this.occupiedCount++;
   }
 
   release(cell: Vec3): void {
-    this.occupied.delete(key(cell));
+    const idx = this.index(cell);
+    if (this.occupied[idx] === 0) return;
+    this.occupied[idx] = 0;
+    this.occupiedCount--;
   }
 
   randomFreeCell(rng: () => number): Vec3 | undefined {
-    const total = this.size * this.size * this.size;
-    if (this.occupied.size >= total) return undefined;
+    const total = this.occupied.length;
+    if (this.occupiedCount >= total) return undefined;
 
     // A few random probes; fall back to a linear search to guarantee a result.
     for (let i = 0; i < 32; i++) {
-      const cell: Vec3 = {
-        x: Math.floor(rng() * this.size),
-        y: Math.floor(rng() * this.size),
-        z: Math.floor(rng() * this.size),
-      };
-      if (this.isFree(cell)) return cell;
+      const x = Math.floor(rng() * this.size);
+      const y = Math.floor(rng() * this.size);
+      const z = Math.floor(rng() * this.size);
+      const idx = x + y * this.size + z * this.size2;
+      if (this.occupied[idx] === 0) return { x, y, z };
     }
 
-    for (let x = 0; x < this.size; x++) {
-      for (let y = 0; y < this.size; y++) {
-        for (let z = 0; z < this.size; z++) {
-          const cell = { x, y, z };
-          if (this.isFree(cell)) return cell;
-        }
-      }
+    for (let idx = 0; idx < total; idx++) {
+      if (this.occupied[idx] !== 0) continue;
+      const z = Math.floor(idx / this.size2);
+      const rem = idx - z * this.size2;
+      const y = Math.floor(rem / this.size);
+      const x = rem - y * this.size;
+      return { x, y, z };
     }
     return undefined;
   }
@@ -229,10 +242,12 @@ export class Simulation {
       const shouldGoStraight = this.rng() > turnProb;
       if (shouldGoStraight) return straight;
 
-      const turnOptions = options.filter((o) => !isSame(o, straight as Vec3));
-      if (turnOptions.length > 0) {
-        const idx = Math.floor(this.rng() * turnOptions.length);
-        return turnOptions[idx];
+      const pick = Math.floor(this.rng() * (options.length - 1));
+      let k = 0;
+      for (const option of options) {
+        if (isSame(option, straight)) continue;
+        if (k === pick) return option;
+        k++;
       }
     }
 
@@ -252,9 +267,8 @@ export class Simulation {
     const { targetPipeCount } = this.config;
     if (this.pipes.length <= targetPipeCount) return;
 
-    const surplus = [...this.pipes].slice(targetPipeCount);
-    for (const pipe of surplus) {
-      pipe.state = 'dying';
+    for (let i = targetPipeCount; i < this.pipes.length; i++) {
+      this.pipes[i].state = 'dying';
     }
   }
 
@@ -272,4 +286,3 @@ function isSame(a: Vec3, b: Vec3): boolean {
 function clamp01(v: number): number {
   return Math.min(1, Math.max(0, v));
 }
-
