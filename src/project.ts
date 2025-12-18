@@ -61,7 +61,7 @@ export type ProjectMirrorSettings = {
   maxResolution: number;
   facesPerFrame: number;
   enabled: boolean;
-  renderer: 'raster' | 'ray' | 'rayAllFaces' | 'physicalRay' | 'omniRecursive';
+  renderer: 'raster' | 'ray' | 'rayAllFaces' | 'physicalRay';
   rayBounces: number;
   reflectionMode: MirrorReflectionMode;
   blur: number;
