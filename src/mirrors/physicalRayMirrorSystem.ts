@@ -58,6 +58,7 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
   private baseRenders: Array<
     (renderer: WebGLRenderer, scene: Scene, camera: PerspectiveCamera, geometry?: any, material?: any, group?: any) => void
   > = [];
+  private hasMainViewCapture: boolean[] = [];
   private tmpMirrorPos = new Vector3();
   private tmpCameraPos = new Vector3();
   private tmpNormal = new Vector3();
@@ -68,6 +69,8 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
   private tmpRayOrigin = new Vector3();
   private tmpRayDir = new Vector3();
   private tmpRayDelta = new Vector3();
+  private tmpCamDir = new Vector3();
+  private tmpToCenter = new Vector3();
 
   private faceNormals: Vector3[] = [];
   private faceCenters: Vector3[] = [];
@@ -91,6 +94,7 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
 
     this.facesList = this.buildMirrors(this.size, this.color);
     this.addFaces(this.facesList);
+    this.hasMainViewCapture = new Array(this.facesList.length).fill(false);
     this.applyDistortionUniforms();
     this.applyEnabledState();
   }
@@ -110,6 +114,7 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
     this.disposeFaces(this.facesList);
     this.facesList = this.buildMirrors(this.size, this.color);
     this.addFaces(this.facesList);
+    this.hasMainViewCapture = new Array(this.facesList.length).fill(false);
     this.applyDistortionUniforms();
     this.applyEnabledState();
   }
@@ -143,9 +148,37 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
 
   updateFrame(renderer: WebGLRenderer, scene: Scene, camera: PerspectiveCamera) {
     if (!this.enabled || this.facesList.length === 0) return;
+    // Empty mask is an explicit "none" mode from the UI: render a single non-recursive pass
+    // for every face so reflections still exist but mirrors don't recurse into each other.
+    if (this.updateMask.size === 0) {
+      const baseExposure = renderer.toneMappingExposure ?? 1;
+      const baseExposureScaled = baseExposure * 0.4;
+      const roomVisible = this.roomMesh.visible;
 
-    const indices = this.updateMask.size > 0 ? Array.from(this.updateMask.values()) : this.facesList.map((_, i) => i);
+      this.roomMesh.visible = false;
+      camera.updateMatrixWorld();
+      renderer.toneMappingExposure = baseExposureScaled;
+      for (let idx = 0; idx < this.facesList.length; idx++) {
+        const mirror = this.facesList[idx];
+        const render = this.baseRenders[idx];
+        if (!mirror || !render) continue;
+        mirror.forceUpdate = true;
+        render(renderer, scene, camera);
+        mirror.forceUpdate = false;
+        this.hasMainViewCapture[idx] = true;
+      }
+
+      renderer.toneMappingExposure = baseExposure;
+      this.roomMesh.visible = roomVisible;
+      return;
+    }
+
+    const indices = Array.from(this.updateMask.values()).filter(
+      (i) => Number.isInteger(i) && i >= 0 && i < this.facesList.length
+    );
     if (indices.length === 0) return;
+    const renderOrder = this.sortFacesByFacing(indices, camera);
+    const frontIdx = renderOrder[renderOrder.length - 1] ?? -1;
 
     const baseExposure = renderer.toneMappingExposure ?? 1;
     const roomVisible = this.roomMesh.visible;
@@ -153,7 +186,45 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
     this.roomMesh.visible = false; // mirrored cameras leave the box; hide the shell
     camera.updateMatrixWorld();
 
-    this.renderRecursive(renderer, scene, camera, indices, this.maxBounces, 0, baseExposure);
+    this.renderRecursive(renderer, scene, camera, renderOrder, this.maxBounces, 0, baseExposure);
+    for (const idx of renderOrder) {
+      if (idx >= 0 && idx < this.hasMainViewCapture.length) this.hasMainViewCapture[idx] = true;
+    }
+
+    // Final facing-mirror resolve: refresh all other faces from the camera-facing
+    // mirror's virtual camera, then re-render it. This fixes the classic “one wall
+    // missing” artifact while moving the camera in the recursive tunnel mode.
+    this.refreshFromFacingMirror(frontIdx, renderer, scene, camera, baseExposure);
+
+    // Restore all other faces for the main view so they don't end the frame with a
+    // textureMatrix/projection computed from a virtual camera (looks like a missing wall).
+    renderer.toneMappingExposure = this.exposureForDepth(baseExposure, 0);
+    for (let idx = 0; idx < this.facesList.length; idx++) {
+      if (idx === frontIdx) continue;
+      const mirror = this.facesList[idx];
+      const render = this.baseRenders[idx];
+      if (!mirror || !render) continue;
+      mirror.forceUpdate = true;
+      render(renderer, scene, camera);
+      mirror.forceUpdate = false;
+      this.hasMainViewCapture[idx] = true;
+    }
+
+    // Baseline update for faces outside the update mask so visible side mirrors
+    // aren't left in an uninitialized/wrong-camera state.
+    const requestedSet = new Set(indices);
+    renderer.toneMappingExposure = baseExposure * 0.4;
+    for (let idx = 0; idx < this.facesList.length; idx++) {
+      if (requestedSet.has(idx)) continue;
+      if (this.hasMainViewCapture[idx]) continue;
+      const mirror = this.facesList[idx];
+      const render = this.baseRenders[idx];
+      if (!mirror || !render) continue;
+      mirror.forceUpdate = true;
+      render(renderer, scene, camera);
+      mirror.forceUpdate = false;
+      this.hasMainViewCapture[idx] = true;
+    }
 
     renderer.toneMappingExposure = baseExposure;
     this.roomMesh.visible = roomVisible;
@@ -189,7 +260,7 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
         continue;
       }
 
-      const nextFace = this.pickNextFace(virtualCamera, indices, idx);
+      const nextFace = this.pickNextFace(virtualCamera, idx);
       if (nextFace >= 0) {
         // Resolve what this mirror sees through the next face in the bounce chain.
         this.renderRecursive(renderer, scene, virtualCamera, [nextFace], remainingBounces - 1, depth + 1, baseExposure);
@@ -203,6 +274,49 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
       renderer.toneMappingExposure = prevExposure;
       mirror.forceUpdate = false;
     }
+  }
+
+  private refreshFromFacingMirror(
+    frontIdx: number,
+    renderer: WebGLRenderer,
+    scene: Scene,
+    camera: PerspectiveCamera,
+    baseExposure: number
+  ) {
+    if (frontIdx < 0) return;
+    const frontMirror = this.facesList[frontIdx];
+    const frontRender = this.baseRenders[frontIdx];
+    const captureCam = frontMirror?.camera as PerspectiveCamera | undefined;
+    if (!frontMirror || !frontRender || !captureCam) return;
+
+    const prevExposure = renderer.toneMappingExposure ?? baseExposure;
+
+    const nextFace = this.pickNextFace(captureCam, frontIdx);
+    if (nextFace >= 0 && this.maxBounces > 1) {
+      this.renderRecursive(renderer, scene, captureCam, [nextFace], this.maxBounces - 1, 1, baseExposure);
+    }
+
+    // Refresh all other faces once from the facing mirror's virtual camera so the
+    // captured tunnel has all 4 side walls (prevents a missing quadrant at 90°).
+    renderer.toneMappingExposure = this.exposureForDepth(baseExposure, 1);
+    for (let idx = 0; idx < this.facesList.length; idx++) {
+      if (idx === frontIdx) continue;
+      if (idx === nextFace) continue; // keep the deeper recursion result intact
+      const mirror = this.facesList[idx];
+      const render = this.baseRenders[idx];
+      if (!mirror || !render) continue;
+      mirror.forceUpdate = true;
+      render(renderer, scene, captureCam);
+      mirror.forceUpdate = false;
+    }
+
+    // Resolve the facing mirror again from the real camera with the freshly updated neighbors.
+    renderer.toneMappingExposure = this.exposureForDepth(baseExposure, 0);
+    frontMirror.forceUpdate = true;
+    frontRender(renderer, scene, camera);
+    frontMirror.forceUpdate = false;
+
+    renderer.toneMappingExposure = prevExposure;
   }
 
   private prepareMirrorCamera(mirror: Reflector, sourceCamera: PerspectiveCamera): PerspectiveCamera | null {
@@ -254,8 +368,8 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
     return virtualCamera;
   }
 
-  private pickNextFace(camera: PerspectiveCamera, indices: number[], avoidIdx: number): number {
-    if (indices.length === 0) return -1;
+  private pickNextFace(camera: PerspectiveCamera, avoidIdx: number): number {
+    if (this.facesList.length <= 1) return -1;
 
     camera.updateMatrixWorld();
     const origin = this.tmpRayOrigin;
@@ -267,7 +381,7 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
     let bestDist = Infinity;
     const eps = 1e-4;
 
-    for (const idx of indices) {
+    for (let idx = 0; idx < this.facesList.length; idx++) {
       if (idx === avoidIdx) continue;
       const normal = this.faceNormals[idx];
       const center = this.faceCenters[idx];
@@ -284,6 +398,30 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
     }
 
     return best;
+  }
+
+  private sortFacesByFacing(indices: number[], camera: PerspectiveCamera) {
+    if (indices.length <= 1) return indices;
+    camera.getWorldDirection(this.tmpCamDir);
+    return [...indices].sort((a, b) => {
+      const dotA = this.faceDot(a, camera);
+      const dotB = this.faceDot(b, camera);
+      if (dotA === dotB) return a - b;
+      return dotA - dotB;
+    });
+  }
+
+  private faceDot(idx: number, camera: PerspectiveCamera) {
+    const center = this.faceCenters[idx];
+    if (!center) return -Infinity;
+    this.tmpToCenter.copy(center).sub(camera.position).normalize();
+    return this.tmpCamDir.dot(this.tmpToCenter);
+  }
+
+  private exposureForDepth(baseExposure: number, depth: number) {
+    const exp = this.bounceAttenuationMode === 'allBounces' ? depth + 1 : Math.max(1, depth);
+    const atten = Math.pow(this.bounceAttenuation, exp);
+    return baseExposure * atten;
   }
 
   private applyEnabledState() {

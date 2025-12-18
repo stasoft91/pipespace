@@ -40,7 +40,13 @@ import { initTimeline, type RenderSchedule } from './timeline';
 import { PROJECT_VERSION, stringifyProjectFile, type ProjectFile, type ProjectSettings } from './project';
 import { Pipe, Simulation } from './simulation';
 import type { SimulationConfig, Vec3 } from './simulation';
-import { PhysicalRayMirrorSystem, RasterMirrorSystem, RayMirrorSystem, RayMirrorSystemAllFaces } from './mirrors';
+import {
+  OmniRecursiveMirrorSystem,
+  PhysicalRayMirrorSystem,
+  RasterMirrorSystem,
+  RayMirrorSystem,
+  RayMirrorSystemAllFaces,
+} from './mirrors';
 import type { MirrorReflectionMode, MirrorSystem } from './mirrors';
 
 type PathType = 'polyline' | 'catmullrom' | 'centripetal' | 'chordal';
@@ -90,7 +96,7 @@ type OrbitSettings = {
 };
 
 type CameraMode = 'wall' | 'wallDrift' | 'orbit' | 'manual' | 'rail';
-type MirrorRenderer = 'raster' | 'ray' | 'rayAllFaces' | 'physicalRay';
+type MirrorRenderer = 'raster' | 'ray' | 'rayAllFaces' | 'physicalRay' | 'omniRecursive';
 const modulation = new ModulationManager();
 const modulationGlobals = { bpm: 120 };
 let modulationBaseSetters: Record<string, (v: number) => void> = {};
@@ -125,7 +131,7 @@ let mirrorFacesPerFrame = 6; // how many faces update each frame (reduces flicke
 let rayMaxBounces = 2;
 let mirrorEnabled = true;
 let mirrorReflectionMode: MirrorReflectionMode = 'all'; // how mirrors see each other
-let mirrorRenderer: MirrorRenderer = 'physicalRay';
+let mirrorRenderer: MirrorRenderer = 'omniRecursive';
 let mirrorBounceAttenuation = 0.65;
 let mirrorBounceAttenuationMode: 'skipFirst' | 'allBounces' = 'skipFirst';
 let mirrorBlurAmount = 0;
@@ -377,6 +383,32 @@ function createMirrorSystem(kind: MirrorRenderer): MirrorSystem {
   const showRoomMesh = kind === 'raster';
   if (kind === 'physicalRay') {
     return new PhysicalRayMirrorSystem({
+      scene,
+      roomMesh: room.mesh,
+      pipeLayer: PIPE_LAYER,
+      baseShader: BASE_REFLECTOR_SHADER,
+      size: room.size,
+      color: renderSettings.roomColor,
+      inset: mirrorInset,
+      resolution: mirrorTargetSize(),
+      distortion: {
+        blur: mirrorBlurAmount,
+        chromaticShift: mirrorChromaticShift,
+        warpStrength: mirrorWarpStrength,
+        warpSpeed: mirrorWarpSpeed,
+        refractionOffset: mirrorRefractionOffset,
+        noiseStrength: mirrorNoiseStrength,
+        time: 0,
+      },
+      enabled: mirrorEnabled,
+      maxBounces: rayMaxBounces,
+      bounceAttenuation: mirrorBounceAttenuation,
+      bounceAttenuationMode: mirrorBounceAttenuationMode,
+      showRoomMesh,
+    });
+  }
+  if (kind === 'omniRecursive') {
+    return new OmniRecursiveMirrorSystem({
       scene,
       roomMesh: room.mesh,
       pipeLayer: PIPE_LAYER,
@@ -1430,6 +1462,7 @@ function setupGui() {
       'Ray (experimental)': 'ray',
       'Ray (all faces)': 'rayAllFaces',
       'Ray tunnel (recursive)': 'physicalRay',
+      'Omni recursive (magnum)': 'omniRecursive',
     })
     .name('Renderer')
     .onChange((v: MirrorRenderer) => {
@@ -1444,30 +1477,30 @@ function setupGui() {
   mirrorFolder
     .add(mirrorGuiSettings, 'rayBounces', 1, 16, 1)
     .name('Ray bounces')
-      .onChange((v: number) => {
-        rayMaxBounces = Math.max(1, Math.floor(v));
-        mirrorGuiSettings.rayBounces = rayMaxBounces;
-        if (mirrorRenderer === 'ray' || mirrorRenderer === 'rayAllFaces' || mirrorRenderer === 'physicalRay') {
-          roomMirrors.dispose();
-          roomMirrors = createMirrorSystem(mirrorRenderer);
-          updateMirrorResolution();
-          updateMirrorBlur();
-          updateMirrorDistortionUniforms(state.elapsed);
+    .onChange((v: number) => {
+      rayMaxBounces = Math.max(1, Math.floor(v));
+      mirrorGuiSettings.rayBounces = rayMaxBounces;
+      if (mirrorRenderer === 'ray' || mirrorRenderer === 'rayAllFaces' || mirrorRenderer === 'physicalRay' || mirrorRenderer === 'omniRecursive') {
+        roomMirrors.dispose();
+        roomMirrors = createMirrorSystem(mirrorRenderer);
+        updateMirrorResolution();
+        updateMirrorBlur();
+        updateMirrorDistortionUniforms(state.elapsed);
         updateMirrorMask();
       }
     });
   mirrorFolder
     .add(mirrorGuiSettings, 'bounceAttenuation', 0, 10, 0.05)
     .name('Bounce attenuation')
-      .onChange((v: number) => {
-        mirrorBounceAttenuation = clamp(v, 0, 10);
-        mirrorGuiSettings.bounceAttenuation = mirrorBounceAttenuation;
-        if (mirrorRenderer === 'ray' || mirrorRenderer === 'rayAllFaces' || mirrorRenderer === 'physicalRay') {
-          roomMirrors.dispose();
-          roomMirrors = createMirrorSystem(mirrorRenderer);
-          updateMirrorResolution();
-          updateMirrorBlur();
-          updateMirrorDistortionUniforms(state.elapsed);
+    .onChange((v: number) => {
+      mirrorBounceAttenuation = clamp(v, 0, 10);
+      mirrorGuiSettings.bounceAttenuation = mirrorBounceAttenuation;
+      if (mirrorRenderer === 'ray' || mirrorRenderer === 'rayAllFaces' || mirrorRenderer === 'physicalRay' || mirrorRenderer === 'omniRecursive') {
+        roomMirrors.dispose();
+        roomMirrors = createMirrorSystem(mirrorRenderer);
+        updateMirrorResolution();
+        updateMirrorBlur();
+        updateMirrorDistortionUniforms(state.elapsed);
         updateMirrorMask();
       }
     });
@@ -1476,15 +1509,15 @@ function setupGui() {
       'Skip first bounce': 'skipFirst',
       'Scale all bounces': 'allBounces',
     })
-      .name('Attenuation math')
-      .onChange((v: 'skipFirst' | 'allBounces') => {
-        mirrorBounceAttenuationMode = v;
-        if (mirrorRenderer === 'ray' || mirrorRenderer === 'rayAllFaces' || mirrorRenderer === 'physicalRay') {
-          roomMirrors.dispose();
-          roomMirrors = createMirrorSystem(mirrorRenderer);
-          updateMirrorResolution();
-          updateMirrorBlur();
-          updateMirrorDistortionUniforms(state.elapsed);
+    .name('Attenuation math')
+    .onChange((v: 'skipFirst' | 'allBounces') => {
+      mirrorBounceAttenuationMode = v;
+      if (mirrorRenderer === 'ray' || mirrorRenderer === 'rayAllFaces' || mirrorRenderer === 'physicalRay' || mirrorRenderer === 'omniRecursive') {
+        roomMirrors.dispose();
+        roomMirrors = createMirrorSystem(mirrorRenderer);
+        updateMirrorResolution();
+        updateMirrorBlur();
+        updateMirrorDistortionUniforms(state.elapsed);
         updateMirrorMask();
       }
     });

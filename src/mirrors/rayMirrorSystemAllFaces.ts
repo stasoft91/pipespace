@@ -45,6 +45,7 @@ export class RayMirrorSystemAllFaces implements MirrorSystem {
 
   private facesList: Reflector[] = [];
   private mirrorUniforms = new Map<number, MirrorUniformBag>();
+  private updateMask = new Set<number>();
 
   private size: number;
   private color: string;
@@ -125,12 +126,36 @@ export class RayMirrorSystemAllFaces implements MirrorSystem {
   }
 
   setUpdateMask(_mask: Set<number>) {
-    // Intentionally ignored so all faces always capture.
+    // Used only for "none" mode; otherwise all faces capture every pass.
+    this.updateMask = _mask;
   }
 
   updateFrame(renderer: WebGLRenderer, scene: Scene, camera: PerspectiveCamera) {
     if (!this.enabled) return;
     if (this.facesList.length === 0) return;
+    // Empty mask is an explicit "none" mode from the UI: render a single non-recursive pass
+    // for every face so reflections still exist but mirrors don't recurse into each other.
+    if (this.updateMask.size === 0) {
+      const indices = this.facesList.map((_, i) => i);
+      const baseExposure = renderer.toneMappingExposure ?? 1;
+      const baseExposureScaled = baseExposure * 0.4;
+      const roomVisible = this.roomMesh.visible;
+
+      this.roomMesh.visible = false;
+      renderer.toneMappingExposure = baseExposureScaled;
+      for (const idx of indices) {
+        const baseRender = this.baseRenders[idx];
+        const mirror = this.facesList[idx];
+        if (!baseRender || !mirror) continue;
+        mirror.forceUpdate = true;
+        baseRender(renderer, scene, camera);
+        mirror.forceUpdate = false;
+      }
+
+      this.roomMesh.visible = roomVisible;
+      renderer.toneMappingExposure = baseExposure;
+      return;
+    }
 
     // Always render every face each pass to keep inter-reflections alive from any view.
     const indices = this.facesList.map((_, i) => i);

@@ -62,6 +62,7 @@ export class RayMirrorSystem implements MirrorSystem {
   private baseRenders: Array<
     (renderer: WebGLRenderer, scene: Scene, camera: PerspectiveCamera, geometry?: any, material?: any, group?: any) => void
   > = [];
+  private hasMainViewCapture: boolean[] = [];
 
   constructor(opts: RayMirrorSystemOptions) {
     this.scene = opts.scene;
@@ -82,6 +83,7 @@ export class RayMirrorSystem implements MirrorSystem {
 
     this.facesList = this.buildMirrors(this.size, this.color);
     this.addFaces(this.facesList);
+    this.hasMainViewCapture = new Array(this.facesList.length).fill(false);
     this.applyDistortionUniforms();
     this.applyEnabledState();
   }
@@ -102,6 +104,7 @@ export class RayMirrorSystem implements MirrorSystem {
     this.disposeFaces(this.facesList);
     this.facesList = this.buildMirrors(this.size, this.color);
     this.addFaces(this.facesList);
+    this.hasMainViewCapture = new Array(this.facesList.length).fill(false);
     this.applyDistortionUniforms();
     this.applyEnabledState();
   }
@@ -136,8 +139,29 @@ export class RayMirrorSystem implements MirrorSystem {
   updateFrame(renderer: WebGLRenderer, scene: Scene, camera: PerspectiveCamera) {
     if (!this.enabled) return;
     if (this.facesList.length === 0) return;
+    // Empty mask is an explicit "none" mode from the UI: render a single non-recursive pass
+    // for every face so reflections still exist but mirrors don't recurse into each other.
+    if (this.updateMask.size === 0) {
+      const baseExposure = renderer.toneMappingExposure ?? 1;
+      const baseExposureScaled = baseExposure * 0.4;
+      const roomVisible = this.roomMesh.visible;
+      this.roomMesh.visible = false;
+      renderer.toneMappingExposure = baseExposureScaled;
+      for (let idx = 0; idx < this.facesList.length; idx++) {
+        const mirror = this.facesList[idx];
+        const render = this.baseRenders[idx];
+        if (!mirror || !render) continue;
+        mirror.forceUpdate = true;
+        render(renderer, scene, camera);
+        mirror.forceUpdate = false;
+        if (idx >= 0 && idx < this.hasMainViewCapture.length) this.hasMainViewCapture[idx] = true;
+      }
+      this.roomMesh.visible = roomVisible;
+      renderer.toneMappingExposure = baseExposure;
+      return;
+    }
 
-    const indices = this.updateMask.size > 0 ? Array.from(this.updateMask.values()) : this.facesList.map((_, i) => i);
+    const indices = Array.from(this.updateMask.values());
     const renderOrder = this.sortFacesByFacing(indices, camera);
     const frontIdx = renderOrder[renderOrder.length - 1] ?? -1;
     const baseExposure = renderer.toneMappingExposure ?? 1;
@@ -160,12 +184,41 @@ export class RayMirrorSystem implements MirrorSystem {
         mirror.forceUpdate = true; // always update even if the mirror is technically back-facing
         baseRender(renderer, scene, camera);
         mirror.forceUpdate = false;
+        if (idx >= 0 && idx < this.hasMainViewCapture.length) this.hasMainViewCapture[idx] = true;
       }
     }
 
     // Resolve neighbor mirrors once from the camera-facing mirror's virtual camera so
     // the axis-aligned tunnel looks correct (prevents missing quadrants at 90°).
     this.refreshFromFacingMirror(frontIdx, renderOrder, renderer, scene, camera, baseExposure, baseExposureScaled, resolveAtten);
+
+    // Restore other mirrors for the main view so they don't end the frame with a
+    // projection matrix computed from the facing mirror's virtual camera.
+    renderer.toneMappingExposure = baseExposureScaled;
+    for (const idx of renderOrder) {
+      if (idx === frontIdx) continue;
+      const mirror = this.facesList[idx];
+      const render = this.baseRenders[idx];
+      if (!mirror || !render) continue;
+      mirror.forceUpdate = true;
+      render(renderer, scene, camera);
+      mirror.forceUpdate = false;
+      if (idx >= 0 && idx < this.hasMainViewCapture.length) this.hasMainViewCapture[idx] = true;
+    }
+
+    // Baseline update for faces outside the update mask so side mirrors aren't left blank.
+    const requestedSet = new Set(indices);
+    for (let idx = 0; idx < this.facesList.length; idx++) {
+      if (requestedSet.has(idx)) continue;
+      if (this.hasMainViewCapture[idx]) continue;
+      const mirror = this.facesList[idx];
+      const render = this.baseRenders[idx];
+      if (!mirror || !render) continue;
+      mirror.forceUpdate = true;
+      render(renderer, scene, camera);
+      mirror.forceUpdate = false;
+      this.hasMainViewCapture[idx] = true;
+    }
 
     this.roomMesh.visible = roomVisible;
     renderer.toneMappingExposure = baseExposure;
