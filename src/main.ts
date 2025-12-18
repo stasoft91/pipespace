@@ -2,17 +2,19 @@ import './style.css';
 import {
   ACESFilmicToneMapping,
   BoxGeometry,
+  BufferGeometry,
   CylinderGeometry,
   BufferAttribute,
   DynamicDrawUsage,
   CatmullRomCurve3,
   Color,
-  CurvePath,
   EdgesGeometry,
   AdditiveBlending,
-  LineCurve3,
   LineBasicMaterial,
   LineSegments,
+  InstancedBufferAttribute,
+  InstancedMesh,
+  Matrix4,
   Mesh,
   MeshBasicMaterial,
   MeshPhysicalMaterial,
@@ -20,8 +22,8 @@ import {
   PointLight,
   Scene,
   SRGBColorSpace,
+  SphereGeometry,
   Group,
-  TubeGeometry,
   Vector3,
   Vector2,
   WebGLRenderer,
@@ -1557,7 +1559,7 @@ function setupGui() {
       modulationBaseSetters['mirror.maxResolution']?.(reflectorMaxRes);
     });
   mirrorFolder
-    .add(mirrorGuiSettings, 'facesPerFrame', 1, 6, 1)
+    .add(mirrorGuiSettings, 'facesPerFrame', 1, 16, 1)
     .name('Faces per frame')
     .onChange((v: number) => {
       mirrorFacesPerFrame = Math.max(1, Math.floor(v));
@@ -1977,8 +1979,8 @@ function setupModulationTargets() {
   });
   register('mirror.facesPerFrame', 'Mirrors', 'Faces per frame', {
     min: 1,
-    max: 6,
-    range: 5,
+    max: 16,
+    range: 15,
     get: () => mirrorFacesPerFrame,
     set: (v: number) => {
       mirrorFacesPerFrame = Math.max(1, Math.floor(v));
@@ -2861,130 +2863,312 @@ class EdgeNeonSystem {
   }
 }
 const cellSize = 1;
-const toWorld = (gridSize: number, cell: Vec3): Vector3 => {
+const toWorldInto = (gridSize: number, cell: Vec3, target: Vector3): Vector3 => {
   const half = gridSize / 2;
-  return new Vector3(cell.x - half + 0.5, cell.y - half + 0.5, cell.z - half + 0.5).multiplyScalar(cellSize);
+  return target
+    .set(cell.x - half + 0.5, cell.y - half + 0.5, cell.z - half + 0.5)
+    .multiplyScalar(cellSize);
 };
 
 const tmpPipeColor = new Color();
+const tmpPipePrev = new Vector3();
+const tmpPipeA = new Vector3();
+const tmpPipeB = new Vector3();
+const tmpPipeMid = new Vector3();
+const tmpPipeDir = new Vector3();
+const tmpPipeScale = new Vector3();
+const tmpPipeMat = new Matrix4();
+const tmpPipeQuat = new Quaternion();
+const PIPE_SEG_UP = new Vector3(0, 1, 0);
 
-function updatePipeVertexColors(geometry: any, pipe: Pipe, settings: RenderSettings) {
-  const uv = geometry?.getAttribute?.('uv') as BufferAttribute | undefined;
-  const position = geometry?.getAttribute?.('position') as BufferAttribute | undefined;
-  if (!uv || !position) return;
-
-  const uvArray = uv.array as ArrayLike<number>;
+function ensureWhiteVertexColors(geometry: BufferGeometry) {
+  const position = geometry.getAttribute('position') as BufferAttribute | undefined;
+  if (!position) return;
   const vertexCount = position.count;
-  let colorAttr = geometry.getAttribute('color') as BufferAttribute | undefined;
-  if (!colorAttr || colorAttr.count !== vertexCount) {
-    colorAttr = new BufferAttribute(new Float32Array(vertexCount * 3), 3);
-    geometry.setAttribute('color', colorAttr);
-  }
-  if (colorAttr.usage !== DynamicDrawUsage) {
-    colorAttr.setUsage(DynamicDrawUsage);
-  }
-
-  const colors = colorAttr.array as Float32Array;
-  const colorSeed = pipe.colorSeed;
-  const colorShift = settings.colorShift;
-
-  for (let i = 0; i < vertexCount; i++) {
-    const v = uvArray[i * 2 + 1]; // 0..1 along tube length
-    const hue = colorSeed + colorShift * (v - 0.5);
-    const light = clamp(0.35, 0.9, 0.58 + 0.12 * (v - 0.5));
-    tmpPipeColor.setHSL(hue - Math.floor(hue), 0.65, light);
-    colors[i * 3] = tmpPipeColor.r;
-    colors[i * 3 + 1] = tmpPipeColor.g;
-    colors[i * 3 + 2] = tmpPipeColor.b;
-  }
-
-  colorAttr.needsUpdate = true;
+  const existing = geometry.getAttribute('color') as BufferAttribute | undefined;
+  if (existing?.count === vertexCount) return;
+  const colors = new Float32Array(vertexCount * 3);
+  colors.fill(1);
+  geometry.setAttribute('color', new BufferAttribute(colors, 3));
 }
 
+function ensureInstanceColors(mesh: InstancedMesh): InstancedBufferAttribute {
+  const instanceCount = mesh.instanceMatrix.count;
+  let attr = mesh.instanceColor;
+  if (!attr || attr.count !== instanceCount) {
+    const colors = new Float32Array(instanceCount * 3);
+    colors.fill(1);
+    attr = new InstancedBufferAttribute(colors, 3);
+    attr.setUsage(DynamicDrawUsage);
+    mesh.instanceColor = attr;
+  }
+  return attr;
+}
+
+function setPipeBaseColor(out: Color, pipe: Pipe) {
+  const hue = pipe.colorSeed - Math.floor(pipe.colorSeed);
+  out.setHSL(hue, 0.65, 0.6);
+}
+
+function setSegmentInstance(mesh: InstancedMesh, index: number, start: Vector3, end: Vector3, radius: number) {
+  tmpPipeDir.subVectors(end, start);
+  const length = tmpPipeDir.length();
+  if (length <= 1e-8) {
+    tmpPipeMid.copy(start);
+    tmpPipeQuat.identity();
+    tmpPipeScale.set(radius, 1e-6, radius);
+  } else {
+    tmpPipeMid.addVectors(start, end).multiplyScalar(0.5);
+    tmpPipeDir.divideScalar(length);
+    tmpPipeQuat.setFromUnitVectors(PIPE_SEG_UP, tmpPipeDir);
+    tmpPipeScale.set(radius, length, radius);
+  }
+  tmpPipeMat.compose(tmpPipeMid, tmpPipeQuat, tmpPipeScale);
+  mesh.setMatrixAt(index, tmpPipeMat);
+}
+
+function attachNeonSizeUniform(material: MeshBasicMaterial) {
+  (material as any).userData ??= {};
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.neonSize = { value: renderSettings.neonSize };
+    if (!shader.vertexShader.includes('uniform float neonSize;')) {
+      shader.vertexShader = `uniform float neonSize;\n${shader.vertexShader}`;
+    }
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <begin_vertex>',
+      '#include <begin_vertex>\ntransformed *= neonSize;'
+    );
+    (material as any).userData.shader = shader;
+  };
+  material.customProgramCacheKey = () => 'pipes-glow-neonSize-v1';
+}
+
+type PipeSharedResources = {
+  segmentGeometry: CylinderGeometry;
+  jointGeometry: SphereGeometry;
+  glowMaterial: MeshBasicMaterial;
+};
+
 class PipeVisual {
-  mesh: Mesh;
-  glow?: Mesh;
-  glowMaterial?: MeshBasicMaterial;
+  readonly group = new Group();
   private lastVersion = -1;
   private lastRadius = renderSettings.pipeRadius;
   private lastSegments = renderSettings.tubularSegments;
-  private lastColorShift = renderSettings.colorShift;
-  private lastRadialSegments = renderSettings.radialSegments;
   private lastCornerTension = renderSettings.cornerTension;
   private lastPathType: PathType = renderSettings.pathType;
   private material: MeshPhysicalMaterial;
   private gridSize: number;
+  private segmentMesh: InstancedMesh;
+  private glowSegmentMesh: InstancedMesh;
+  private jointMesh: InstancedMesh;
+  private glowJointMesh: InstancedMesh;
+  private pathPoints: Vector3[] = [];
+  private pathPointPool: Vector3[] = [];
+  private curve: CatmullRomCurve3 | null = null;
 
-  constructor(material: MeshPhysicalMaterial, gridSize: number, pipe: Pipe, settings: RenderSettings) {
+  constructor(material: MeshPhysicalMaterial, gridSize: number, pipe: Pipe, settings: RenderSettings, resources: PipeSharedResources) {
     this.material = material;
     this.gridSize = gridSize;
-    this.mesh = new Mesh(undefined, this.material);
-    this.mesh.layers.set(PIPE_LAYER);
-    this.glow = undefined;
-    this.glowMaterial = undefined;
-    this.update(pipe, settings);
+    this.segmentMesh = this.createSegmentMesh(resources.segmentGeometry, this.material, 1);
+    this.glowSegmentMesh = this.createSegmentMesh(resources.segmentGeometry, resources.glowMaterial, 1);
+    this.glowSegmentMesh.instanceMatrix = this.segmentMesh.instanceMatrix;
+
+    this.jointMesh = this.createJointMesh(resources.jointGeometry, this.material, 1);
+    this.glowJointMesh = this.createJointMesh(resources.jointGeometry, resources.glowMaterial, 1);
+    this.glowJointMesh.instanceMatrix = this.jointMesh.instanceMatrix;
+
+    this.group.add(this.segmentMesh, this.jointMesh, this.glowSegmentMesh, this.glowJointMesh);
+    this.update(pipe, settings, resources);
   }
 
-  update(pipe: Pipe, settings: RenderSettings): void {
+  setGeometries(resources: PipeSharedResources) {
+    this.segmentMesh.geometry = resources.segmentGeometry;
+    this.glowSegmentMesh.geometry = resources.segmentGeometry;
+    this.jointMesh.geometry = resources.jointGeometry;
+    this.glowJointMesh.geometry = resources.jointGeometry;
+  }
+
+  private createSegmentMesh(geometry: CylinderGeometry, material: MeshPhysicalMaterial | MeshBasicMaterial, capacity: number) {
+    const mesh = new InstancedMesh(geometry, material, capacity);
+    mesh.layers.set(PIPE_LAYER);
+    mesh.frustumCulled = false;
+    mesh.instanceMatrix.setUsage(DynamicDrawUsage);
+    return mesh;
+  }
+
+  private createJointMesh(geometry: SphereGeometry, material: MeshPhysicalMaterial | MeshBasicMaterial, capacity: number) {
+    const mesh = new InstancedMesh(geometry, material, capacity);
+    mesh.layers.set(PIPE_LAYER);
+    mesh.frustumCulled = false;
+    mesh.instanceMatrix.setUsage(DynamicDrawUsage);
+    return mesh;
+  }
+
+  private ensurePathPoints(count: number) {
+    while (this.pathPoints.length < count) {
+      this.pathPoints.push(this.pathPointPool.pop() ?? new Vector3());
+    }
+    while (this.pathPoints.length > count) {
+      const next = this.pathPoints.pop();
+      if (next) this.pathPointPool.push(next);
+    }
+  }
+
+  private ensureCapacity(segmentCount: number, jointCount: number, resources: PipeSharedResources) {
+    if (segmentCount > this.segmentMesh.instanceMatrix.count) {
+      const nextCapacity = Math.max(segmentCount, Math.ceil(this.segmentMesh.instanceMatrix.count * 1.5));
+      const prevSegment = this.segmentMesh;
+      const prevGlow = this.glowSegmentMesh;
+      this.segmentMesh = this.createSegmentMesh(resources.segmentGeometry, this.material, nextCapacity);
+      this.glowSegmentMesh = this.createSegmentMesh(resources.segmentGeometry, resources.glowMaterial, nextCapacity);
+      this.glowSegmentMesh.instanceMatrix = this.segmentMesh.instanceMatrix;
+      this.group.remove(prevSegment, prevGlow);
+      this.group.add(this.segmentMesh, this.glowSegmentMesh);
+    }
+
+    if (jointCount > this.jointMesh.instanceMatrix.count) {
+      const nextCapacity = Math.max(jointCount, Math.ceil(this.jointMesh.instanceMatrix.count * 1.5));
+      const prevJoint = this.jointMesh;
+      const prevGlow = this.glowJointMesh;
+      this.jointMesh = this.createJointMesh(resources.jointGeometry, this.material, nextCapacity);
+      this.glowJointMesh = this.createJointMesh(resources.jointGeometry, resources.glowMaterial, nextCapacity);
+      this.glowJointMesh.instanceMatrix = this.jointMesh.instanceMatrix;
+      this.group.remove(prevJoint, prevGlow);
+      this.group.add(this.jointMesh, this.glowJointMesh);
+    }
+  }
+
+  update(pipe: Pipe, settings: RenderSettings, resources: PipeSharedResources): void {
     const needsGeometry =
       pipe.version !== this.lastVersion ||
       settings.pipeRadius !== this.lastRadius ||
       settings.tubularSegments !== this.lastSegments ||
-      settings.radialSegments !== this.lastRadialSegments ||
       settings.cornerTension !== this.lastCornerTension ||
       settings.pathType !== this.lastPathType;
-    const needsColor = settings.colorShift !== this.lastColorShift;
+
+    const baseSegments = Math.max(0, pipe.cells.length - 1);
+    let samplesPerSegment = Math.max(1, Math.floor(settings.tubularSegments));
+    if (baseSegments > 0) {
+      const minSamples = Math.ceil(6 / baseSegments);
+      samplesPerSegment = Math.max(samplesPerSegment, minSamples);
+    }
+    const segmentCount = baseSegments > 0 ? baseSegments * samplesPerSegment : 0;
+    const jointCount = pipe.cells.length;
 
     if (needsGeometry) {
-      const prevGeometry = this.mesh.geometry;
-      const nextGeometry = createPipeGeometry(pipe, this.gridSize, settings);
-      this.mesh.geometry = nextGeometry;
-      if (this.glow) {
-        this.glow.geometry = nextGeometry;
-      }
-      prevGeometry?.dispose();
+      this.ensureCapacity(segmentCount, jointCount, resources);
+      this.setGeometries(resources);
       this.lastVersion = pipe.version;
       this.lastRadius = settings.pipeRadius;
       this.lastSegments = settings.tubularSegments;
-      this.lastRadialSegments = settings.radialSegments;
       this.lastCornerTension = settings.cornerTension;
       this.lastPathType = settings.pathType;
-    } else if (needsColor) {
-      updatePipeVertexColors(this.mesh.geometry, pipe, settings);
     }
-    this.lastColorShift = settings.colorShift;
 
-    if (settings.neonEnabled) {
-      if (!this.glow || !this.glowMaterial) {
-        this.glowMaterial = new MeshBasicMaterial({
-          vertexColors: true,
-          transparent: true,
-          blending: AdditiveBlending,
-          depthWrite: false,
-          toneMapped: false,
-          opacity: settings.neonStrength,
-        });
-        this.glow = new Mesh(this.mesh.geometry, this.glowMaterial);
-        this.glow.layers.set(PIPE_LAYER);
+    if (needsGeometry) {
+      // Populate control points
+      this.ensurePathPoints(pipe.cells.length);
+      for (let i = 0; i < pipe.cells.length; i++) {
+        toWorldInto(this.gridSize, pipe.cells[i], this.pathPoints[i]);
       }
-      this.glowMaterial.opacity = settings.neonStrength;
-      this.glow.scale.setScalar(settings.neonSize);
-      this.glow.visible = true;
-    } else if (this.glow) {
-      this.glow.visible = false;
+      if (pipe.headLerp < 1 && pipe.cells.length > 1) {
+        toWorldInto(this.gridSize, pipe.prevHead, tmpPipePrev);
+        this.pathPoints[this.pathPoints.length - 1].lerpVectors(
+          tmpPipePrev,
+          this.pathPoints[this.pathPoints.length - 1],
+          pipe.headLerp
+        );
+      }
+
+      // Segments
+      this.segmentMesh.count = segmentCount;
+      this.glowSegmentMesh.count = segmentCount;
+      if (segmentCount > 0) {
+        setPipeBaseColor(tmpPipeColor, pipe);
+        const baseR = tmpPipeColor.r;
+        const baseG = tmpPipeColor.g;
+        const baseB = tmpPipeColor.b;
+        const segColorAttr = ensureInstanceColors(this.segmentMesh);
+        const segColors = segColorAttr.array as Float32Array;
+        this.glowSegmentMesh.instanceColor = segColorAttr;
+
+        if (settings.pathType === 'polyline') {
+          let idx = 0;
+          for (let seg = 0; seg < baseSegments; seg++) {
+            const p0 = this.pathPoints[seg];
+            const p1 = this.pathPoints[seg + 1];
+            for (let s = 0; s < samplesPerSegment; s++) {
+              const a0 = s / samplesPerSegment;
+              const a1 = (s + 1) / samplesPerSegment;
+              tmpPipeA.lerpVectors(p0, p1, a0);
+              tmpPipeB.lerpVectors(p0, p1, a1);
+              setSegmentInstance(this.segmentMesh, idx, tmpPipeA, tmpPipeB, settings.pipeRadius);
+              segColors[idx * 3] = baseR;
+              segColors[idx * 3 + 1] = baseG;
+              segColors[idx * 3 + 2] = baseB;
+              idx++;
+            }
+          }
+        } else {
+          if (!this.curve) {
+            this.curve = new CatmullRomCurve3(this.pathPoints, false, 'centripetal', settings.cornerTension);
+          }
+          this.curve.points = this.pathPoints;
+          this.curve.curveType = settings.pathType === 'catmullrom' ? 'catmullrom' : settings.pathType;
+          this.curve.tension = settings.cornerTension;
+
+          let idx = 0;
+          for (let seg = 0; seg < baseSegments; seg++) {
+            for (let s = 0; s < samplesPerSegment; s++) {
+              const u0 = (seg + s / samplesPerSegment) / baseSegments;
+              const u1 = (seg + (s + 1) / samplesPerSegment) / baseSegments;
+              this.curve.getPoint(u0, tmpPipeA);
+              this.curve.getPoint(u1, tmpPipeB);
+              setSegmentInstance(this.segmentMesh, idx, tmpPipeA, tmpPipeB, settings.pipeRadius);
+              segColors[idx * 3] = baseR;
+              segColors[idx * 3 + 1] = baseG;
+              segColors[idx * 3 + 2] = baseB;
+              idx++;
+            }
+          }
+        }
+        this.segmentMesh.instanceMatrix.needsUpdate = true;
+        segColorAttr.needsUpdate = true;
+      }
+
+      // Joints (polyline only; helps hide hard corners)
+      const showJoints = settings.pathType === 'polyline' && jointCount > 0;
+      const drawJoints = showJoints ? jointCount : 0;
+      this.jointMesh.visible = showJoints;
+      this.jointMesh.count = drawJoints;
+      this.glowJointMesh.visible = showJoints && settings.neonEnabled;
+      this.glowJointMesh.count = drawJoints;
+      if (showJoints) {
+        setPipeBaseColor(tmpPipeColor, pipe);
+        const baseR = tmpPipeColor.r;
+        const baseG = tmpPipeColor.g;
+        const baseB = tmpPipeColor.b;
+        const jointColorAttr = ensureInstanceColors(this.jointMesh);
+        const jointColors = jointColorAttr.array as Float32Array;
+        this.glowJointMesh.instanceColor = jointColorAttr;
+        for (let i = 0; i < jointCount; i++) {
+          tmpPipeMat.compose(this.pathPoints[i], tmpPipeQuat.identity(), tmpPipeScale.setScalar(settings.pipeRadius));
+          this.jointMesh.setMatrixAt(i, tmpPipeMat);
+          jointColors[i * 3] = baseR;
+          jointColors[i * 3 + 1] = baseG;
+          jointColors[i * 3 + 2] = baseB;
+        }
+        this.jointMesh.instanceMatrix.needsUpdate = true;
+        jointColorAttr.needsUpdate = true;
+      }
     }
+
+    this.glowSegmentMesh.visible = settings.neonEnabled;
+    this.glowJointMesh.visible = settings.neonEnabled && this.jointMesh.visible;
   }
 
   dispose() {
-    const geom = this.mesh.geometry;
-    if (this.glow) {
-      const glowGeom = this.glow.geometry;
-      if (glowGeom && glowGeom !== geom) {
-        glowGeom.dispose();
-      }
-    }
-    geom?.dispose();
-    this.glowMaterial?.dispose();
+    this.group.clear();
   }
 
   forceGeometryRefresh() {
@@ -2997,11 +3181,16 @@ class PipeVisualManager {
   private activeIds = new Set<number>();
   private scene: Scene;
   private material: MeshPhysicalMaterial;
+  private glowMaterial: MeshBasicMaterial;
   private gridSize: number;
+  private lastRadialSegments = -1;
+  private segmentGeometry: CylinderGeometry | null = null;
+  private jointGeometry: SphereGeometry | null = null;
 
-  constructor(scene: Scene, material: MeshPhysicalMaterial, gridSize: number) {
+  constructor(scene: Scene, material: MeshPhysicalMaterial, glowMaterial: MeshBasicMaterial, gridSize: number) {
     this.scene = scene;
     this.material = material;
+    this.glowMaterial = glowMaterial;
     this.gridSize = gridSize;
   }
 
@@ -3016,14 +3205,16 @@ class PipeVisualManager {
   }
 
   sync(pipes: Pipe[], settings: RenderSettings) {
+    this.syncGlowMaterial(settings);
+    const resources = this.ensureSharedResources(settings);
+
     this.activeIds.clear();
     for (const pipe of pipes) {
       this.activeIds.add(pipe.id);
     }
     for (const [id, visual] of this.visuals.entries()) {
       if (!this.activeIds.has(id)) {
-        this.scene.remove(visual.mesh);
-        if (visual.glow) this.scene.remove(visual.glow);
+        this.scene.remove(visual.group);
         visual.dispose();
         this.visuals.delete(id);
       }
@@ -3032,58 +3223,59 @@ class PipeVisualManager {
     for (const pipe of pipes) {
       let visual = this.visuals.get(pipe.id);
       if (!visual) {
-        visual = new PipeVisual(this.material, this.gridSize, pipe, settings);
+        visual = new PipeVisual(this.material, this.gridSize, pipe, settings, resources);
         this.visuals.set(pipe.id, visual);
-        this.scene.add(visual.mesh);
-        const glow = visual.glow;
-        if (glow) this.scene.add(glow);
+        this.scene.add(visual.group);
       }
-      visual.update(pipe, settings);
-      const glowMesh = visual.glow as Mesh | undefined;
-      if (glowMesh) {
-        if (glowMesh.parent !== this.scene) {
-          this.scene.add(glowMesh);
-        }
-      }
+      visual.update(pipe, settings, resources);
     }
   }
-}
 
-function createPipeGeometry(pipe: Pipe, gridSize: number, settings: RenderSettings) {
-  const path = pipe.cells.map((cell) => toWorld(gridSize, cell));
-  if (pipe.headLerp < 1 && pipe.cells.length > 1) {
-    const last = path.length - 1;
-    const prev = toWorld(gridSize, pipe.prevHead);
-    path[last] = prev.clone().lerp(path[last], pipe.headLerp);
+  private syncGlowMaterial(settings: RenderSettings) {
+    this.glowMaterial.opacity = settings.neonStrength;
+    const shader = (this.glowMaterial as any).userData?.shader;
+    if (shader?.uniforms?.neonSize) {
+      shader.uniforms.neonSize.value = settings.neonSize;
+    }
   }
-  if (path.length === 1) path.push(path[0].clone().add(new Vector3(0.001, 0.001, 0.001)));
 
-  const curve =
-    settings.pathType === 'polyline'
-      ? (() => {
-          const curvePath = new CurvePath<Vector3>();
-          for (let i = 0; i < path.length - 1; i++) {
-            curvePath.add(new LineCurve3(path[i], path[i + 1]));
-          }
-          return curvePath;
-        })()
-      : new CatmullRomCurve3(
-          path,
-          false,
-          settings.pathType === 'catmullrom' ? 'catmullrom' : settings.pathType,
-          settings.cornerTension
-        );
+  private ensureSharedResources(settings: RenderSettings): PipeSharedResources {
+    const radial = Math.max(4, Math.floor(settings.radialSegments));
+    if (!this.segmentGeometry || !this.jointGeometry || radial !== this.lastRadialSegments) {
+      const prevSegment = this.segmentGeometry;
+      const prevJoint = this.jointGeometry;
 
-  const baseSegments =
-    settings.pathType === 'polyline' ? Math.max(1, path.length - 1) : Math.max(1, path.length);
-  const tubularSegments = Math.max(6, Math.floor(settings.tubularSegments * baseSegments));
-  const geometry = new TubeGeometry(curve, tubularSegments, settings.pipeRadius, settings.radialSegments, false);
-  updatePipeVertexColors(geometry, pipe, settings);
-  return geometry;
+      const nextSegment = new CylinderGeometry(1, 1, 1, radial, 1, true);
+      const nextJoint = new SphereGeometry(1, radial, Math.max(2, Math.floor(radial / 2)));
+      ensureWhiteVertexColors(nextSegment);
+      ensureWhiteVertexColors(nextJoint);
+
+      this.segmentGeometry = nextSegment;
+      this.jointGeometry = nextJoint;
+      this.lastRadialSegments = radial;
+
+      for (const visual of this.visuals.values()) {
+        visual.setGeometries({ segmentGeometry: nextSegment, jointGeometry: nextJoint, glowMaterial: this.glowMaterial });
+      }
+
+      prevSegment?.dispose();
+      prevJoint?.dispose();
+    }
+    return { segmentGeometry: this.segmentGeometry, jointGeometry: this.jointGeometry, glowMaterial: this.glowMaterial };
+  }
 }
 
 edgeNeons = new EdgeNeonSystem(scene);
-pipeManager = new PipeVisualManager(scene, pipeMaterial, defaultSimConfig.gridSize);
+const pipeGlowMaterial = new MeshBasicMaterial({
+  vertexColors: true,
+  transparent: true,
+  blending: AdditiveBlending,
+  depthWrite: false,
+  toneMapped: false,
+  opacity: renderSettings.neonStrength,
+});
+attachNeonSizeUniform(pipeGlowMaterial);
+pipeManager = new PipeVisualManager(scene, pipeMaterial, pipeGlowMaterial, defaultSimConfig.gridSize);
 requestAnimationFrame(frame);
 setupGui();
 
