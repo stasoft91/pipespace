@@ -156,6 +156,32 @@ body {
   font-size: 11px;
 }
 
+.lfo-presets {
+  flex: 1 1 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.lfo-preset {
+  background: #0f1622;
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 10px;
+  line-height: 1.1;
+  cursor: pointer;
+}
+
+.lfo-preset:hover {
+  background: #162235;
+}
+
+.lfo-preset.selected {
+  border-color: #4fd1ff;
+}
+
 .lfo-range {
   font-size: 10px;
   opacity: 0.8;
@@ -190,6 +216,23 @@ body {
 
 .timeline-bpm input {
   width: 72px;
+  background: #0f1622;
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+
+.timeline-insert {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+  font-size: 11px;
+}
+
+.timeline-insert select {
+  width: 110px;
   background: #0f1622;
   color: inherit;
   border: 1px solid rgba(255, 255, 255, 0.14);

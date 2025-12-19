@@ -1570,12 +1570,6 @@ function setupGui() {
       modulationBaseSetters['pipes.radialSegments']?.(v);
     });
   pipeFolder
-    .add(renderSettings, 'colorShift', 0, 0.4, 0.005)
-    .name('Color shift')
-    .onChange((v: number) => {
-      modulationBaseSetters['pipes.colorShift']?.(v);
-    });
-  pipeFolder
     .add(renderSettings, 'pathType', {
       'Polyline (no smoothing)': 'polyline',
       'Catmull-Rom (uniform)': 'catmullrom',
@@ -1742,13 +1736,6 @@ function setupGui() {
       roomMirrors.setInset(mirrorInset);
       roomMirrors.update(room.size, renderSettings.roomColor);
       modulationBaseSetters['mirror.inset']?.(mirrorInset);
-    });
-  mirrorFolder
-    .add(mirrorGuiSettings, 'warpStrength', 0, 0.05, 0.0005)
-    .name('Warp strength')
-    .onChange((v: number) => {
-      mirrorWarpStrength = Math.max(0, v);
-      modulationBaseSetters['mirror.warpStrength']?.(mirrorWarpStrength);
     });
   mirrorFolder
     .add(mirrorGuiSettings, 'maxResolution', 256, 4096 * 4, 64)
@@ -2487,16 +2474,6 @@ function setupModulationTargets() {
       roomMirrors.update(room.size, renderSettings.roomColor);
     },
   });
-  register('mirror.warpStrength', 'Mirrors', 'Warp strength', {
-    min: 0,
-    max: 0.05,
-    range: 0.05,
-    get: () => mirrorWarpStrength,
-    set: (v: number) => {
-      mirrorWarpStrength = clamp(v, 0, 0.05);
-      mirrorGuiSettings.warpStrength = mirrorWarpStrength;
-    },
-  });
   register('mirror.maxResolution', 'Mirrors', 'Max resolution', {
     min: 256,
     max: 4096 * 4,
@@ -2580,15 +2557,6 @@ function setupModulationTargets() {
     get: () => renderSettings.radialSegments,
     set: (v: number) => {
       renderSettings.radialSegments = clamp(Math.round(v), 4, 32);
-    },
-  });
-  register('pipes.colorShift', 'Pipes', 'Color shift', {
-    min: 0,
-    max: 0.4,
-    range: 0.4,
-    get: () => renderSettings.colorShift,
-    set: (v: number) => {
-      renderSettings.colorShift = clamp(v, 0, 0.4);
     },
   });
   register('pipes.cornerTension', 'Pipes', 'Corner smoothness', {
@@ -4457,8 +4425,14 @@ function applyRenderSchedule(schedule: RenderSchedule) {
   for (const lfo of modulation.getLfos().slice()) {
     modulation.removeLfo(lfo.id);
   }
+  for (const env of modulation.getEnvelopes().slice()) {
+    modulation.removeEnvelope(env.id);
+  }
   for (const lfo of schedule.lfos) {
     modulation.addLfo(lfo);
+  }
+  for (const env of schedule.envelopes ?? []) {
+    modulation.addEnvelope(env);
   }
   modulation.syncBaseFromTargets();
 }

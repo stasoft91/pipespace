@@ -27,6 +27,17 @@ export type LfoConfig = {
   endSeconds?: number;
 };
 
+export type EnvelopeConfig = {
+  id: string;
+  targetId: string;
+  wave: Waveform;
+  min: number;
+  max: number;
+  enabled: boolean;
+  startSeconds?: number;
+  endSeconds?: number;
+};
+
 export type ModulationTarget = {
   id: string;
   label: string;
@@ -56,6 +67,8 @@ export class ModulationManager {
   private baseValues = new Map<string, number>();
   private lfos: LfoConfig[] = [];
   private lfoRuntime = new Map<string, LfoRuntimeState>();
+  private envelopes: EnvelopeConfig[] = [];
+  private envelopeRuntime = new Map<string, LfoRuntimeState>();
   private scratchValues = new Map<string, number>();
   private bypass = false;
   private globalBpm = 120;
@@ -127,6 +140,37 @@ export class ModulationManager {
     return this.lfos;
   }
 
+  addEnvelope(partial: Partial<EnvelopeConfig>): EnvelopeConfig | null {
+    const defaultTargetId = partial.targetId ?? this.getTargets()[0]?.id;
+    if (!defaultTargetId) return null;
+    const target = this.targets.get(defaultTargetId);
+    const current = target ? target.getCurrent() : 0;
+    const numOr = (v: unknown, fallback: number) => (typeof v === 'number' && isFinite(v) ? v : fallback);
+    const minDefault = numOr(partial.min, target?.min ?? current);
+    const maxDefault = numOr(partial.max, target?.max ?? minDefault + 1);
+    const env: EnvelopeConfig = {
+      id: partial.id ?? `env-${Math.random().toString(16).slice(2)}`,
+      targetId: defaultTargetId,
+      wave: partial.wave ?? 'sine',
+      min: minDefault,
+      max: maxDefault,
+      enabled: partial.enabled ?? true,
+      startSeconds: partial.startSeconds,
+      endSeconds: partial.endSeconds,
+    };
+    this.envelopes.push(env);
+    return env;
+  }
+
+  removeEnvelope(id: string) {
+    this.envelopes = this.envelopes.filter((e) => e.id !== id);
+    this.envelopeRuntime.delete(id);
+  }
+
+  getEnvelopes() {
+    return this.envelopes;
+  }
+
   setBaseValue(targetId: string, value: number) {
     if (!this.targets.has(targetId)) return;
     this.baseValues.set(targetId, value);
@@ -146,6 +190,7 @@ export class ModulationManager {
     if (this.targets.size === 0) return;
     if (this.lastUpdateSeconds !== null && timeSeconds < this.lastUpdateSeconds - 1e-6) {
       this.lfoRuntime.clear();
+      this.envelopeRuntime.clear();
       this.lastUpdateSeconds = null;
     }
     this.lastUpdateSeconds = timeSeconds;
@@ -158,6 +203,21 @@ export class ModulationManager {
     }
 
     if (!this.bypass) {
+      for (const env of this.envelopes) {
+        if (!env.enabled) continue;
+        const startSeconds = env.startSeconds;
+        const endSeconds = env.endSeconds;
+        if (startSeconds === undefined || endSeconds === undefined) continue;
+        if (endSeconds <= startSeconds) continue;
+        if (timeSeconds < startSeconds || timeSeconds > endSeconds) continue;
+        const target = this.targets.get(env.targetId);
+        if (!target) continue;
+        const raw = this.sampleEnvelopeWave(env, timeSeconds);
+        const normalized = raw * 0.5 + 0.5;
+        const next = env.min + normalized * (env.max - env.min);
+        values.set(target.id, next);
+      }
+
       for (const lfo of this.lfos) {
         if (!lfo.enabled) continue;
         const startSeconds = lfo.startSeconds ?? -Infinity;
@@ -277,6 +337,81 @@ export class ModulationManager {
 
     state.lastValue = raw;
     this.lfoRuntime.set(lfo.id, state);
+    return raw;
+  }
+
+  private sampleEnvelopeWave(env: EnvelopeConfig, timeSeconds: number) {
+    const start = env.startSeconds ?? timeSeconds;
+    const end = env.endSeconds ?? start + 1;
+    const duration = Math.max(1e-6, end - start);
+    const t = clamp((timeSeconds - start) / duration, 0, 1);
+    const phase = t * TAU;
+
+    const state: LfoRuntimeState = this.envelopeRuntime.get(env.id) ?? {
+      lastValue: 0,
+      holdValue: Math.random() * 2 - 1,
+      lastHoldTime: timeSeconds,
+    };
+
+    const effectiveFreq = 1 / duration;
+    let raw: number;
+
+    switch (env.wave) {
+      case 'triangle':
+        raw = (2 / Math.PI) * Math.asin(Math.sin(phase));
+        break;
+      case 'square':
+        raw = Math.sign(Math.sin(phase)) || 1;
+        break;
+      case 'saw': {
+        const tt = ((phase / TAU) % 1 + 1) % 1;
+        raw = tt * 2 - 1;
+        break;
+      }
+      case 'expDecay': {
+        const tt = ((phase / TAU) % 1 + 1) % 1;
+        const k = 6;
+        raw = expDecayWave(tt, k);
+        break;
+      }
+      case 'invExpDecay': {
+        const tt = ((phase / TAU) % 1 + 1) % 1;
+        const k = 6;
+        raw = -expDecayWave(tt, k);
+        break;
+      }
+      case 'exp2Decay': {
+        const tt = ((phase / TAU) % 1 + 1) % 1;
+        const k = 6;
+        raw = exp2DecayWave(tt, k);
+        break;
+      }
+      case 'invExp2Decay': {
+        const tt = ((phase / TAU) % 1 + 1) % 1;
+        const k = 6;
+        raw = -exp2DecayWave(tt, k);
+        break;
+      }
+      case 'noise':
+        raw = Math.random() * 2 - 1;
+        break;
+      case 'sampleHold': {
+        const interval = 1 / Math.max(0.0001, effectiveFreq || 0.0001);
+        if (timeSeconds - state.lastHoldTime >= interval) {
+          state.holdValue = Math.random() * 2 - 1;
+          state.lastHoldTime = timeSeconds;
+        }
+        raw = state.holdValue;
+        break;
+      }
+      case 'sine':
+      default:
+        raw = Math.sin(phase);
+        break;
+    }
+
+    state.lastValue = raw;
+    this.envelopeRuntime.set(env.id, state);
     return raw;
   }
 }

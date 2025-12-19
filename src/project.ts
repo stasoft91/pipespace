@@ -1,4 +1,4 @@
-import type { LfoConfig } from './modulation';
+import type { EnvelopeConfig, LfoConfig } from './modulation';
 import type { SimulationConfig } from './simulation';
 import type { MirrorReflectionMode } from './mirrors/types';
 
@@ -9,11 +9,17 @@ export type ProjectLfo = {
   lfo: Partial<LfoConfig>;
 };
 
+export type ProjectEnvelope = {
+  segmentId: string;
+  envelope: Partial<EnvelopeConfig>;
+};
+
 export type ProjectTimeline = {
   bpm: number;
   durationSeconds: number;
   audioFileName: string | null;
   lfos: ProjectLfo[];
+  envelopes?: ProjectEnvelope[];
 };
 
 export type ProjectRenderSettings = {

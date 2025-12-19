@@ -1,11 +1,12 @@
 import Peaks, { type PeaksInstance, type Segment, type SegmentDragEvent, type SegmentsInsertEvent } from 'peaks.js';
-import { ModulationManager, type LfoConfig, type ModulationTarget, type Waveform } from './modulation';
+import { ModulationManager, type EnvelopeConfig, type LfoConfig, type ModulationTarget, type Waveform } from './modulation';
 import { type ProjectFile, type ProjectTimeline, parseProjectFile } from './project';
 
 export type RenderSchedule = {
   bpm: number;
   durationSeconds: number;
   lfos: LfoConfig[];
+  envelopes?: EnvelopeConfig[];
   videoResolution: number;
 };
 
@@ -24,6 +25,7 @@ export type TimelineInitOptions = {
 };
 
 type SnapMode = 'round' | 'floor' | 'ceil';
+type TimelineEventKind = 'lfo' | 'envelope';
 
 export function initTimeline(options: TimelineInitOptions) {
   const { container } = options;
@@ -55,6 +57,28 @@ export function initTimeline(options: TimelineInitOptions) {
   bpmInput.value = String(options.bpm);
   bpmLabel.appendChild(bpmInput);
   controls.appendChild(bpmLabel);
+
+  let insertKind: TimelineEventKind = 'lfo';
+  const insertLabel = document.createElement('label');
+  insertLabel.className = 'timeline-insert';
+  insertLabel.textContent = 'Insert';
+  const insertSelect = document.createElement('select');
+  insertSelect.setAttribute('aria-label', 'Segment insert type');
+  for (const opt of [
+    { label: 'LFO', value: 'lfo' as const },
+    { label: 'Envelope', value: 'envelope' as const },
+  ]) {
+    const option = document.createElement('option');
+    option.value = opt.value;
+    option.textContent = opt.label;
+    insertSelect.appendChild(option);
+  }
+  insertSelect.value = insertKind;
+  insertSelect.addEventListener('change', () => {
+    insertKind = (insertSelect.value as TimelineEventKind) || 'lfo';
+  });
+  insertLabel.appendChild(insertSelect);
+  controls.appendChild(insertLabel);
 
   const zoomOutBtn = document.createElement('button');
   zoomOutBtn.type = 'button';
@@ -180,6 +204,19 @@ export function initTimeline(options: TimelineInitOptions) {
 
   type TimelineLfo = LfoConfig & { startSeconds?: number; endSeconds?: number; segmentId?: string };
   const lfoBySegmentId = new Map<string, TimelineLfo>();
+  type TimelineEnvelope = EnvelopeConfig & { startSeconds?: number; endSeconds?: number; segmentId?: string };
+  const envelopeBySegmentId = new Map<string, TimelineEnvelope>();
+
+  const COLOR_SELECTED = '#ffd166';
+  const COLOR_LFO = '#4fd1ff';
+  const COLOR_ENV = '#a78bfa';
+
+  const getSegmentKind = (segmentId: string | null): TimelineEventKind | null => {
+    if (!segmentId) return null;
+    if (lfoBySegmentId.has(segmentId)) return 'lfo';
+    if (envelopeBySegmentId.has(segmentId)) return 'envelope';
+    return null;
+  };
 
   const beatsPerBar = 4;
   const zoomLevels = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
@@ -279,13 +316,38 @@ export function initTimeline(options: TimelineInitOptions) {
     refreshSegmentColors();
   };
 
+  const applyEnvelopeTimeWindow = (env: TimelineEnvelope, startSeconds: number, endSeconds: number) => {
+    const bar = barSeconds();
+    const snappedStart = snapToBar(clampTime(startSeconds), 'floor');
+    const snappedEndRaw = snapToBar(clampTime(endSeconds), 'ceil');
+    const snappedEnd = snappedEndRaw <= snappedStart ? snappedStart + bar : snappedEndRaw;
+
+    env.startSeconds = snappedStart;
+    env.endSeconds = snappedEnd;
+
+    if (peaks && env.segmentId) {
+      const seg = peaks.segments.getSegment(env.segmentId);
+      if (seg) {
+        isSnapping = true;
+        seg.update({ startTime: snappedStart, endTime: snappedEnd });
+        isSnapping = false;
+      }
+    }
+
+    renderLfoList();
+    if (selectedSegmentId === env.segmentId) renderLfoEditor();
+    refreshSegmentColors();
+  };
+
   const refreshSegmentColors = () => {
     if (!peaks) return;
     const segments = peaks.segments.getSegments();
     for (const seg of segments) {
       const id = seg.id;
       if (!id) continue;
-      seg.update({ color: id === selectedSegmentId ? '#ffd166' : '#4fd1ff' });
+      const kind = getSegmentKind(id);
+      const base = kind === 'envelope' ? COLOR_ENV : COLOR_LFO;
+      seg.update({ color: id === selectedSegmentId ? COLOR_SELECTED : base });
     }
   };
 
@@ -304,7 +366,9 @@ export function initTimeline(options: TimelineInitOptions) {
 
   const showContextMenu = (clientX: number, clientY: number, segmentId: string) => {
     const lfo = lfoBySegmentId.get(segmentId);
-    if (!lfo) return;
+    const env = envelopeBySegmentId.get(segmentId);
+    const kind: TimelineEventKind | null = lfo ? 'lfo' : env ? 'envelope' : null;
+    if (!kind) return;
     lfoContextMenu.textContent = '';
 
     const fullTrackBtn = document.createElement('button');
@@ -313,8 +377,12 @@ export function initTimeline(options: TimelineInitOptions) {
     const duration = audioDurationSeconds;
     fullTrackBtn.disabled = duration === null || !isFinite(duration);
     fullTrackBtn.addEventListener('click', () => {
-      const end = duration ?? lfo.endSeconds ?? 0;
-      applyLfoTimeWindow(lfo, 0, end);
+      const end =
+        duration ??
+        (kind === 'lfo' ? lfo?.endSeconds : env?.endSeconds) ??
+        0;
+      if (kind === 'lfo' && lfo) applyLfoTimeWindow(lfo, 0, end);
+      if (kind === 'envelope' && env) applyEnvelopeTimeWindow(env, 0, end);
       hideContextMenu();
     });
     lfoContextMenu.appendChild(fullTrackBtn);
@@ -332,25 +400,43 @@ export function initTimeline(options: TimelineInitOptions) {
 
   const renderLfoList = () => {
     lfoList.textContent = '';
-    const entries = Array.from(lfoBySegmentId.entries()).sort((a, b) => {
-      const sa = a[1].startSeconds ?? 0;
-      const sb = b[1].startSeconds ?? 0;
+    type Entry =
+      | { kind: 'lfo'; segmentId: string; config: TimelineLfo }
+      | { kind: 'envelope'; segmentId: string; config: TimelineEnvelope };
+
+    const entries: Entry[] = [
+      ...Array.from(lfoBySegmentId.entries()).map(([segmentId, lfo]) => ({
+        kind: 'lfo' as const,
+        segmentId,
+        config: lfo,
+      })),
+      ...Array.from(envelopeBySegmentId.entries()).map(([segmentId, env]) => ({
+        kind: 'envelope' as const,
+        segmentId,
+        config: env,
+      })),
+    ].sort((a, b) => {
+      const sa = a.config.startSeconds ?? 0;
+      const sb = b.config.startSeconds ?? 0;
       return sa - sb;
     });
-    for (const [segmentId, lfo] of entries) {
+
+    for (const entry of entries) {
+      const { segmentId } = entry;
       const item = document.createElement('div');
       item.className = `lfo-item${segmentId === selectedSegmentId ? ' selected' : ''}`;
 
       const title = document.createElement('div');
       title.className = 'lfo-title';
-      const target = modulation.getTarget(lfo.targetId);
-      title.textContent = target ? target.label : lfo.targetId;
+      const target = modulation.getTarget(entry.config.targetId);
+      const kindLabel = entry.kind === 'lfo' ? 'LFO' : 'ENV';
+      title.textContent = `${kindLabel} • ${target ? target.label : entry.config.targetId}`;
       item.appendChild(title);
 
       const times = document.createElement('div');
       times.className = 'lfo-times';
-      const start = lfo.startSeconds ?? 0;
-      const end = lfo.endSeconds ?? start;
+      const start = entry.config.startSeconds ?? 0;
+      const end = entry.config.endSeconds ?? start;
       times.textContent = `${fmtTime(start)} → ${fmtTime(end)}`;
       item.appendChild(times);
 
@@ -363,9 +449,15 @@ export function initTimeline(options: TimelineInitOptions) {
         if (peaks) {
           peaks.segments.removeById(segmentId);
         } else {
-          const existing = lfoBySegmentId.get(segmentId);
-          if (existing) modulation.removeLfo(existing.id);
-          lfoBySegmentId.delete(segmentId);
+          if (entry.kind === 'lfo') {
+            const existing = lfoBySegmentId.get(segmentId);
+            if (existing) modulation.removeLfo(existing.id);
+            lfoBySegmentId.delete(segmentId);
+          } else {
+            const existing = envelopeBySegmentId.get(segmentId);
+            if (existing) modulation.removeEnvelope(existing.id);
+            envelopeBySegmentId.delete(segmentId);
+          }
           if (selectedSegmentId === segmentId) selectedSegmentId = null;
           renderLfoList();
           renderLfoEditor();
@@ -389,17 +481,13 @@ export function initTimeline(options: TimelineInitOptions) {
     if (!selectedSegmentId) {
       const empty = document.createElement('div');
       empty.className = 'lfo-empty';
-      empty.textContent = 'Select an LFO segment';
+      empty.textContent = 'Select a segment';
       lfoEditor.appendChild(empty);
       return;
     }
     const lfo = lfoBySegmentId.get(selectedSegmentId);
-    if (!lfo) return;
-
-    const header = document.createElement('div');
-    header.className = 'lfo-editor-title';
-    header.textContent = `LFO ${lfo.id}`;
-    lfoEditor.appendChild(header);
+    const env = envelopeBySegmentId.get(selectedSegmentId);
+    if (!lfo && !env) return;
 
     const addRow = (labelText: string, input: HTMLElement) => {
       const row = document.createElement('label');
@@ -412,44 +500,6 @@ export function initTimeline(options: TimelineInitOptions) {
       return input;
     };
 
-    const enabledInput = document.createElement('input');
-    enabledInput.type = 'checkbox';
-    enabledInput.checked = lfo.enabled;
-    enabledInput.addEventListener('change', () => {
-      lfo.enabled = enabledInput.checked;
-    });
-    addRow('Enabled', enabledInput);
-
-    const startInput = document.createElement('input');
-    startInput.type = 'number';
-    startInput.step = '0.01';
-    startInput.min = '0';
-    if (audioDurationSeconds !== null && isFinite(audioDurationSeconds)) {
-      startInput.max = String(audioDurationSeconds);
-    }
-    startInput.value = String(lfo.startSeconds ?? 0);
-    startInput.addEventListener('change', () => {
-      const nextStart = Number(startInput.value) || 0;
-      const nextEnd = lfo.endSeconds ?? nextStart;
-      applyLfoTimeWindow(lfo, nextStart, nextEnd);
-    });
-    addRow('Start (s)', startInput);
-
-    const endInput = document.createElement('input');
-    endInput.type = 'number';
-    endInput.step = '0.01';
-    endInput.min = '0';
-    if (audioDurationSeconds !== null && isFinite(audioDurationSeconds)) {
-      endInput.max = String(audioDurationSeconds);
-    }
-    endInput.value = String(lfo.endSeconds ?? lfo.startSeconds ?? 0);
-    endInput.addEventListener('change', () => {
-      const nextEnd = Number(endInput.value) || 0;
-      const nextStart = lfo.startSeconds ?? 0;
-      applyLfoTimeWindow(lfo, nextStart, nextEnd);
-    });
-    addRow('End (s)', endInput);
-
     const targets = modulation
       .getTargets()
       .slice()
@@ -459,27 +509,6 @@ export function initTimeline(options: TimelineInitOptions) {
         if (ga !== gb) return ga.localeCompare(gb);
         return a.label.localeCompare(b.label);
       });
-    const targetSelect = document.createElement('select');
-    for (const t of targets) {
-      const opt = document.createElement('option');
-      opt.value = t.id;
-      opt.textContent = `${t.group ? `${t.group} • ` : ''}${t.label}`;
-      targetSelect.appendChild(opt);
-    }
-    targetSelect.value = lfo.targetId;
-    targetSelect.addEventListener('change', () => {
-      lfo.targetId = targetSelect.value;
-      if (peaks && selectedSegmentId) {
-        const seg = peaks.segments.getSegment(selectedSegmentId);
-        const target = modulation.getTarget(lfo.targetId);
-        if (seg) seg.update({ labelText: target ? target.label : lfo.targetId });
-      }
-      renderLfoList();
-      renderLfoEditor();
-    });
-    addRow('Target', targetSelect);
-
-    const waveSelect = document.createElement('select');
     const waveOpts: Array<{ label: string; value: Waveform }> = [
       { label: 'Sine', value: 'sine' },
       { label: 'Triangle', value: 'triangle' },
@@ -492,113 +521,371 @@ export function initTimeline(options: TimelineInitOptions) {
       { label: 'Exp2 decay', value: 'exp2Decay' },
       { label: 'Inv exp2 decay', value: 'invExp2Decay' },
     ];
-    for (const w of waveOpts) {
-      const opt = document.createElement('option');
-      opt.value = w.value;
-      opt.textContent = w.label;
-      waveSelect.appendChild(opt);
+    if (lfo) {
+      const header = document.createElement('div');
+      header.className = 'lfo-editor-title';
+      header.textContent = `LFO ${lfo.id}`;
+      lfoEditor.appendChild(header);
+
+      const enabledInput = document.createElement('input');
+      enabledInput.type = 'checkbox';
+      enabledInput.checked = lfo.enabled;
+      enabledInput.addEventListener('change', () => {
+        lfo.enabled = enabledInput.checked;
+      });
+      addRow('Enabled', enabledInput);
+
+      const startInput = document.createElement('input');
+      startInput.type = 'number';
+      startInput.step = '0.01';
+      startInput.min = '0';
+      if (audioDurationSeconds !== null && isFinite(audioDurationSeconds)) {
+        startInput.max = String(audioDurationSeconds);
+      }
+      startInput.value = String(lfo.startSeconds ?? 0);
+      startInput.addEventListener('change', () => {
+        const nextStart = Number(startInput.value) || 0;
+        const nextEnd = lfo.endSeconds ?? nextStart;
+        applyLfoTimeWindow(lfo, nextStart, nextEnd);
+      });
+      addRow('Start (s)', startInput);
+
+      const endInput = document.createElement('input');
+      endInput.type = 'number';
+      endInput.step = '0.01';
+      endInput.min = '0';
+      if (audioDurationSeconds !== null && isFinite(audioDurationSeconds)) {
+        endInput.max = String(audioDurationSeconds);
+      }
+      endInput.value = String(lfo.endSeconds ?? lfo.startSeconds ?? 0);
+      endInput.addEventListener('change', () => {
+        const nextEnd = Number(endInput.value) || 0;
+        const nextStart = lfo.startSeconds ?? 0;
+        applyLfoTimeWindow(lfo, nextStart, nextEnd);
+      });
+      addRow('End (s)', endInput);
+
+      const targetSelect = document.createElement('select');
+      for (const t of targets) {
+        const opt = document.createElement('option');
+        opt.value = t.id;
+        opt.textContent = `${t.group ? `${t.group} • ` : ''}${t.label}`;
+        targetSelect.appendChild(opt);
+      }
+      targetSelect.value = lfo.targetId;
+      targetSelect.addEventListener('change', () => {
+        lfo.targetId = targetSelect.value;
+        if (peaks && selectedSegmentId) {
+          const seg = peaks.segments.getSegment(selectedSegmentId);
+          const target = modulation.getTarget(lfo.targetId);
+          if (seg) seg.update({ labelText: target ? target.label : lfo.targetId });
+        }
+        renderLfoList();
+        renderLfoEditor();
+      });
+      addRow('Target', targetSelect);
+
+      const waveSelect = document.createElement('select');
+      for (const w of waveOpts) {
+        const opt = document.createElement('option');
+        opt.value = w.value;
+        opt.textContent = w.label;
+        waveSelect.appendChild(opt);
+      }
+      waveSelect.value = lfo.wave;
+      waveSelect.addEventListener('change', () => {
+        lfo.wave = waveSelect.value as Waveform;
+      });
+      addRow('Wave', waveSelect);
+
+      const freqInput = document.createElement('input');
+      freqInput.type = 'number';
+      freqInput.step = '0.01';
+      freqInput.min = '0';
+      freqInput.max = '20';
+      freqInput.value = String(lfo.freqHz);
+      freqInput.addEventListener('change', () => {
+        lfo.freqHz = Math.max(0, Number(freqInput.value) || 0);
+      });
+      addRow('Freq (Hz)', freqInput);
+
+      const useBpmInput = document.createElement('input');
+      useBpmInput.type = 'checkbox';
+      useBpmInput.checked = lfo.useGlobalBpm;
+      useBpmInput.addEventListener('change', () => {
+        lfo.useGlobalBpm = useBpmInput.checked;
+      });
+      addRow('Use BPM', useBpmInput);
+
+      const coeffInput = document.createElement('input');
+      coeffInput.type = 'number';
+      coeffInput.step = '0.01';
+      coeffInput.min = '0.01';
+      coeffInput.max = '16';
+      coeffInput.value = String(lfo.bpmCoefficient);
+
+      const approxEq = (a: number, b: number) => Math.abs(a - b) <= 1e-6;
+      const presetButtons: Array<{ value: number; btn: HTMLButtonElement }> = [];
+      const updatePresetSelections = () => {
+        for (const { value, btn } of presetButtons) {
+          btn.classList.toggle('selected', approxEq(lfo.bpmCoefficient, value));
+        }
+      };
+      const setBpmCoeff = (value: number) => {
+        lfo.bpmCoefficient = Math.max(0.01, value);
+        coeffInput.value = String(lfo.bpmCoefficient);
+        updatePresetSelections();
+      };
+
+      coeffInput.addEventListener('change', () => {
+        lfo.bpmCoefficient = Math.max(0.01, Number(coeffInput.value) || 1);
+        coeffInput.value = String(lfo.bpmCoefficient);
+        updatePresetSelections();
+      });
+      addRow('BPM coeff', coeffInput);
+
+      const addPresetRow = (labelText: string, presets: Array<{ label: string; value: number }>) => {
+        const group = document.createElement('div');
+        group.className = 'lfo-presets';
+        for (const p of presets) {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'lfo-preset';
+          btn.textContent = p.label;
+          btn.addEventListener('click', () => setBpmCoeff(p.value));
+          group.appendChild(btn);
+          presetButtons.push({ value: p.value, btn });
+        }
+        addRow(labelText, group);
+      };
+
+      const basePresets: Array<{ label: string; value: number }> = [
+        { label: '1/16', value: 1 / 16 },
+        { label: '1/8', value: 1 / 8 },
+        { label: '1/4', value: 1 / 4 },
+        { label: '1/2', value: 1 / 2 },
+        { label: '1/1', value: 1 },
+        { label: '2/1', value: 2 },
+        { label: '4/1', value: 4 },
+      ];
+      const dottedPresets: Array<{ label: string; value: number }> = [
+        { label: '1/16.', value: (1 / 16) * 1.5 },
+        { label: '1/8.', value: (1 / 8) * 1.5 },
+        { label: '1/4.', value: (1 / 4) * 1.5 },
+        { label: '1/2.', value: (1 / 2) * 1.5 },
+      ];
+      addPresetRow('Quick', basePresets);
+      addPresetRow('Dotted', dottedPresets);
+      updatePresetSelections();
+
+      const amountInput = document.createElement('input');
+      amountInput.type = 'number';
+      amountInput.step = '0.01';
+      amountInput.min = '0';
+      amountInput.max = '4';
+      amountInput.value = String(lfo.amount);
+      amountInput.addEventListener('change', () => {
+        lfo.amount = Math.max(0, Number(amountInput.value) || 0);
+        updateRangeDisplay();
+      });
+      addRow('Amount', amountInput);
+
+      const offsetInput = document.createElement('input');
+      offsetInput.type = 'number';
+      offsetInput.step = '0.01';
+      offsetInput.min = '-2';
+      offsetInput.max = '2';
+      offsetInput.value = String(lfo.offset);
+      offsetInput.addEventListener('change', () => {
+        lfo.offset = Number(offsetInput.value) || 0;
+        updateRangeDisplay();
+      });
+      addRow('Offset', offsetInput);
+
+      const phaseInput = document.createElement('input');
+      phaseInput.type = 'number';
+      phaseInput.step = '0.001';
+      phaseInput.min = '0';
+      phaseInput.max = String(Math.PI * 2);
+      phaseInput.value = String(lfo.phase);
+      phaseInput.addEventListener('change', () => {
+        lfo.phase = Number(phaseInput.value) || 0;
+      });
+      addRow('Phase (rad)', phaseInput);
+
+      const bipolarInput = document.createElement('input');
+      bipolarInput.type = 'checkbox';
+      bipolarInput.checked = lfo.bipolar;
+      bipolarInput.addEventListener('change', () => {
+        lfo.bipolar = bipolarInput.checked;
+        updateRangeDisplay();
+      });
+      addRow('Bipolar', bipolarInput);
+
+      const smoothInput = document.createElement('input');
+      smoothInput.type = 'number';
+      smoothInput.step = '0.01';
+      smoothInput.min = '0';
+      smoothInput.max = '4';
+      smoothInput.value = String(lfo.smoothSeconds);
+      smoothInput.addEventListener('change', () => {
+        lfo.smoothSeconds = Math.max(0, Number(smoothInput.value) || 0);
+      });
+      addRow('Smooth (s)', smoothInput);
+
+      const rangeDisplay = document.createElement('div');
+      rangeDisplay.className = 'lfo-range';
+      lfoEditor.appendChild(rangeDisplay);
+
+      const updateRangeDisplay = () => {
+        const { min, max, target } = computeDeltaRange(lfo);
+        const fmt = (v: number) => v.toFixed(3);
+        rangeDisplay.textContent = `Δ range: ${fmt(min)} … ${fmt(max)}${target ? ` (${target.label})` : ''}`;
+      };
+      updateRangeDisplay();
+      return;
     }
-    waveSelect.value = lfo.wave;
-    waveSelect.addEventListener('change', () => {
-      lfo.wave = waveSelect.value as Waveform;
-    });
-    addRow('Wave', waveSelect);
 
-    const freqInput = document.createElement('input');
-    freqInput.type = 'number';
-    freqInput.step = '0.01';
-    freqInput.min = '0';
-    freqInput.max = '20';
-    freqInput.value = String(lfo.freqHz);
-    freqInput.addEventListener('change', () => {
-      lfo.freqHz = Math.max(0, Number(freqInput.value) || 0);
-    });
-    addRow('Freq (Hz)', freqInput);
+    if (env) {
+      const header = document.createElement('div');
+      header.className = 'lfo-editor-title';
+      header.textContent = `Envelope ${env.id}`;
+      lfoEditor.appendChild(header);
 
-    const useBpmInput = document.createElement('input');
-    useBpmInput.type = 'checkbox';
-    useBpmInput.checked = lfo.useGlobalBpm;
-    useBpmInput.addEventListener('change', () => {
-      lfo.useGlobalBpm = useBpmInput.checked;
-    });
-    addRow('Use BPM', useBpmInput);
+      const enabledInput = document.createElement('input');
+      enabledInput.type = 'checkbox';
+      enabledInput.checked = env.enabled;
+      enabledInput.addEventListener('change', () => {
+        env.enabled = enabledInput.checked;
+      });
+      addRow('Enabled', enabledInput);
 
-    const coeffInput = document.createElement('input');
-    coeffInput.type = 'number';
-    coeffInput.step = '0.01';
-    coeffInput.min = '0.01';
-    coeffInput.max = '16';
-    coeffInput.value = String(lfo.bpmCoefficient);
-    coeffInput.addEventListener('change', () => {
-      lfo.bpmCoefficient = Math.max(0.01, Number(coeffInput.value) || 1);
-    });
-    addRow('BPM coeff', coeffInput);
+      const startInput = document.createElement('input');
+      startInput.type = 'number';
+      startInput.step = '0.01';
+      startInput.min = '0';
+      if (audioDurationSeconds !== null && isFinite(audioDurationSeconds)) {
+        startInput.max = String(audioDurationSeconds);
+      }
+      startInput.value = String(env.startSeconds ?? 0);
+      startInput.addEventListener('change', () => {
+        const nextStart = Number(startInput.value) || 0;
+        const nextEnd = env.endSeconds ?? nextStart;
+        applyEnvelopeTimeWindow(env, nextStart, nextEnd);
+      });
+      addRow('Start (s)', startInput);
 
-    const amountInput = document.createElement('input');
-    amountInput.type = 'number';
-    amountInput.step = '0.01';
-    amountInput.min = '0';
-    amountInput.max = '4';
-    amountInput.value = String(lfo.amount);
-    amountInput.addEventListener('change', () => {
-      lfo.amount = Math.max(0, Number(amountInput.value) || 0);
+      const endInput = document.createElement('input');
+      endInput.type = 'number';
+      endInput.step = '0.01';
+      endInput.min = '0';
+      if (audioDurationSeconds !== null && isFinite(audioDurationSeconds)) {
+        endInput.max = String(audioDurationSeconds);
+      }
+      endInput.value = String(env.endSeconds ?? env.startSeconds ?? 0);
+      endInput.addEventListener('change', () => {
+        const nextEnd = Number(endInput.value) || 0;
+        const nextStart = env.startSeconds ?? 0;
+        applyEnvelopeTimeWindow(env, nextStart, nextEnd);
+      });
+      addRow('End (s)', endInput);
+
+      const targetSelect = document.createElement('select');
+      for (const t of targets) {
+        const opt = document.createElement('option');
+        opt.value = t.id;
+        opt.textContent = `${t.group ? `${t.group} • ` : ''}${t.label}`;
+        targetSelect.appendChild(opt);
+      }
+      targetSelect.value = env.targetId;
+      targetSelect.addEventListener('change', () => {
+        env.targetId = targetSelect.value;
+        if (peaks && selectedSegmentId) {
+          const seg = peaks.segments.getSegment(selectedSegmentId);
+          const target = modulation.getTarget(env.targetId);
+          if (seg) seg.update({ labelText: target ? target.label : env.targetId });
+        }
+        renderLfoList();
+        renderLfoEditor();
+      });
+      addRow('Target', targetSelect);
+
+      const waveSelect = document.createElement('select');
+      for (const w of waveOpts) {
+        const opt = document.createElement('option');
+        opt.value = w.value;
+        opt.textContent = w.label;
+        waveSelect.appendChild(opt);
+      }
+      waveSelect.value = env.wave;
+      waveSelect.addEventListener('change', () => {
+        env.wave = waveSelect.value as Waveform;
+      });
+      addRow('Wave', waveSelect);
+
+      const minInput = document.createElement('input');
+      minInput.type = 'number';
+      minInput.step = '0.01';
+      minInput.value = String(env.min);
+
+      const maxInput = document.createElement('input');
+      maxInput.type = 'number';
+      maxInput.step = '0.01';
+      maxInput.value = String(env.max);
+
+      const rangeDisplay = document.createElement('div');
+      rangeDisplay.className = 'lfo-range';
+
+      const updateBounds = () => {
+        const target = modulation.getTarget(env.targetId);
+        const min = target?.min;
+        const max = target?.max;
+        if (min !== undefined) {
+          minInput.min = String(min);
+          maxInput.min = String(min);
+        } else {
+          minInput.removeAttribute('min');
+          maxInput.removeAttribute('min');
+        }
+        if (max !== undefined) {
+          minInput.max = String(max);
+          maxInput.max = String(max);
+        } else {
+          minInput.removeAttribute('max');
+          maxInput.removeAttribute('max');
+        }
+      };
+
+      const updateRangeDisplay = () => {
+        const fmt = (v: number) => v.toFixed(3);
+        const target = modulation.getTarget(env.targetId);
+        rangeDisplay.textContent = `Range: ${fmt(env.min)} … ${fmt(env.max)}${target ? ` (${target.label})` : ''}`;
+      };
+
+      const syncRangeFromInputs = () => {
+        const nextMin = Number(minInput.value);
+        const nextMax = Number(maxInput.value);
+        env.min = isFinite(nextMin) ? nextMin : env.min;
+        env.max = isFinite(nextMax) ? nextMax : env.max;
+        if (env.min > env.max) {
+          const tmp = env.min;
+          env.min = env.max;
+          env.max = tmp;
+          minInput.value = String(env.min);
+          maxInput.value = String(env.max);
+        }
+        updateRangeDisplay();
+      };
+
+      minInput.addEventListener('change', syncRangeFromInputs);
+      maxInput.addEventListener('change', syncRangeFromInputs);
+      updateBounds();
       updateRangeDisplay();
-    });
-    addRow('Amount', amountInput);
 
-    const offsetInput = document.createElement('input');
-    offsetInput.type = 'number';
-    offsetInput.step = '0.01';
-    offsetInput.min = '-2';
-    offsetInput.max = '2';
-    offsetInput.value = String(lfo.offset);
-    offsetInput.addEventListener('change', () => {
-      lfo.offset = Number(offsetInput.value) || 0;
-      updateRangeDisplay();
-    });
-    addRow('Offset', offsetInput);
-
-    const phaseInput = document.createElement('input');
-    phaseInput.type = 'number';
-    phaseInput.step = '0.001';
-    phaseInput.min = '0';
-    phaseInput.max = String(Math.PI * 2);
-    phaseInput.value = String(lfo.phase);
-    phaseInput.addEventListener('change', () => {
-      lfo.phase = Number(phaseInput.value) || 0;
-    });
-    addRow('Phase (rad)', phaseInput);
-
-    const bipolarInput = document.createElement('input');
-    bipolarInput.type = 'checkbox';
-    bipolarInput.checked = lfo.bipolar;
-    bipolarInput.addEventListener('change', () => {
-      lfo.bipolar = bipolarInput.checked;
-      updateRangeDisplay();
-    });
-    addRow('Bipolar', bipolarInput);
-
-    const smoothInput = document.createElement('input');
-    smoothInput.type = 'number';
-    smoothInput.step = '0.01';
-    smoothInput.min = '0';
-    smoothInput.max = '4';
-    smoothInput.value = String(lfo.smoothSeconds);
-    smoothInput.addEventListener('change', () => {
-      lfo.smoothSeconds = Math.max(0, Number(smoothInput.value) || 0);
-    });
-    addRow('Smooth (s)', smoothInput);
-
-    const rangeDisplay = document.createElement('div');
-    rangeDisplay.className = 'lfo-range';
-    lfoEditor.appendChild(rangeDisplay);
-
-    const updateRangeDisplay = () => {
-      const { min, max, target } = computeDeltaRange(lfo);
-      const fmt = (v: number) => v.toFixed(3);
-      rangeDisplay.textContent = `Δ range: ${fmt(min)} … ${fmt(max)}${target ? ` (${target.label})` : ''}`;
-    };
-    updateRangeDisplay();
+      addRow('Min', minInput);
+      addRow('Max', maxInput);
+      lfoEditor.appendChild(rangeDisplay);
+    }
   };
 
   const ensureSegmentId = (segment: Segment) => {
@@ -610,6 +897,7 @@ export function initTimeline(options: TimelineInitOptions) {
 
   const createLfoForSegment = (segment: Segment) => {
     const segmentId = ensureSegmentId(segment);
+    if (envelopeBySegmentId.has(segmentId)) return null;
     if (lfoBySegmentId.has(segmentId)) return lfoBySegmentId.get(segmentId) ?? null;
     const created = modulation.addLfo({});
     if (!created) return null;
@@ -625,24 +913,60 @@ export function initTimeline(options: TimelineInitOptions) {
     return lfo;
   };
 
-  const updateLfoFromSegment = (segment: Segment) => {
+  const createEnvelopeForSegment = (segment: Segment) => {
+    const segmentId = ensureSegmentId(segment);
+    if (lfoBySegmentId.has(segmentId)) return null;
+    if (envelopeBySegmentId.has(segmentId)) return envelopeBySegmentId.get(segmentId) ?? null;
+    const created = modulation.addEnvelope({});
+    if (!created) return null;
+    const env = created as TimelineEnvelope;
+    env.startSeconds = segment.startTime;
+    env.endSeconds = segment.endTime;
+    env.segmentId = segmentId;
+    envelopeBySegmentId.set(segmentId, env);
+    (segment as any).envelopeId = env.id;
+    segment.update({ labelText: `ENV ${envelopeBySegmentId.size}` });
+    renderLfoList();
+    selectSegment(segmentId);
+    return env;
+  };
+
+  const createEventForSegment = (segment: Segment) => {
+    return insertKind === 'envelope' ? createEnvelopeForSegment(segment) : createLfoForSegment(segment);
+  };
+
+  const updateEventFromSegment = (segment: Segment) => {
     const segmentId = segment.id;
     if (!segmentId) return;
     const lfo = lfoBySegmentId.get(segmentId);
-    if (!lfo) return;
-    lfo.startSeconds = segment.startTime;
-    lfo.endSeconds = segment.endTime;
+    if (lfo) {
+      lfo.startSeconds = segment.startTime;
+      lfo.endSeconds = segment.endTime;
+    } else {
+      const env = envelopeBySegmentId.get(segmentId);
+      if (!env) return;
+      env.startSeconds = segment.startTime;
+      env.endSeconds = segment.endTime;
+    }
     renderLfoList();
     if (selectedSegmentId === segmentId) renderLfoEditor();
   };
 
-  const removeLfosForSegments = (segments: Segment[]) => {
+  const removeEventsForSegments = (segments: Segment[]) => {
     for (const seg of segments) {
       const id = seg.id;
       if (!id) continue;
       const lfo = lfoBySegmentId.get(id);
-      if (lfo) modulation.removeLfo(lfo.id);
-      lfoBySegmentId.delete(id);
+      if (lfo) {
+        modulation.removeLfo(lfo.id);
+        lfoBySegmentId.delete(id);
+        continue;
+      }
+      const env = envelopeBySegmentId.get(id);
+      if (env) {
+        modulation.removeEnvelope(env.id);
+        envelopeBySegmentId.delete(id);
+      }
     }
     renderLfoList();
     renderLfoEditor();
@@ -654,6 +978,12 @@ export function initTimeline(options: TimelineInitOptions) {
         modulation.removeLfo(lfo.id);
       }
       lfoBySegmentId.clear();
+    }
+    if (envelopeBySegmentId.size) {
+      for (const env of envelopeBySegmentId.values()) {
+        modulation.removeEnvelope(env.id);
+      }
+      envelopeBySegmentId.clear();
     }
     selectSegment(null);
   };
@@ -755,7 +1085,20 @@ export function initTimeline(options: TimelineInitOptions) {
             endTime: end,
             editable: true,
             labelText: target ? target.label : lfo.targetId,
-            color: segmentId === selectedSegmentId ? '#ffd166' : '#4fd1ff',
+            color: segmentId === selectedSegmentId ? COLOR_SELECTED : COLOR_LFO,
+          });
+        }
+        for (const [segmentId, env] of envelopeBySegmentId.entries()) {
+          const start = env.startSeconds ?? 0;
+          const end = env.endSeconds ?? start + barSeconds();
+          const target = modulation.getTarget(env.targetId);
+          peaks.segments.add({
+            id: segmentId,
+            startTime: start,
+            endTime: end,
+            editable: true,
+            labelText: target ? target.label : env.targetId,
+            color: segmentId === selectedSegmentId ? COLOR_SELECTED : COLOR_ENV,
           });
         }
         refreshSegmentColors();
@@ -763,14 +1106,14 @@ export function initTimeline(options: TimelineInitOptions) {
         peaks.on('segments.insert', (event: SegmentsInsertEvent) => {
           if (isSnapping) return;
           applySnapToSegment(event.segment, 'floor', 'ceil');
-          createLfoForSegment(event.segment);
+          createEventForSegment(event.segment);
           options.onSegmentInserted?.(event.segment);
         });
 
         const onDragged = (event: SegmentDragEvent) => {
           if (isSnapping) return;
           applySnapToSegment(event.segment, 'round', 'round');
-          updateLfoFromSegment(event.segment);
+          updateEventFromSegment(event.segment);
           options.onSegmentUpdated?.(event.segment);
         };
 
@@ -782,7 +1125,7 @@ export function initTimeline(options: TimelineInitOptions) {
         });
 
         peaks.on('segments.remove', (event) => {
-          removeLfosForSegments(event.segments);
+          removeEventsForSegments(event.segments);
           for (const seg of event.segments) {
             options.onSegmentRemoved?.(seg.id ?? '');
           }
@@ -858,7 +1201,7 @@ export function initTimeline(options: TimelineInitOptions) {
     if (peaks) {
       for (const seg of peaks.segments.getSegments()) {
         applySnapToSegment(seg, 'floor', 'ceil');
-        updateLfoFromSegment(seg);
+        updateEventFromSegment(seg);
       }
       refreshSegmentColors();
     }
@@ -948,7 +1291,17 @@ export function initTimeline(options: TimelineInitOptions) {
         startSeconds: lfo.startSeconds,
         endSeconds: lfo.endSeconds,
       }));
-      return { bpm, durationSeconds: audioDurationSeconds, lfos, videoResolution };
+      const envelopes: EnvelopeConfig[] = Array.from(envelopeBySegmentId.values()).map((env) => ({
+        id: env.id,
+        targetId: env.targetId,
+        wave: env.wave,
+        min: env.min,
+        max: env.max,
+        enabled: env.enabled,
+        startSeconds: env.startSeconds,
+        endSeconds: env.endSeconds,
+      }));
+      return { bpm, durationSeconds: audioDurationSeconds, lfos, envelopes, videoResolution };
     },
     getProjectTimeline: (): ProjectTimeline => {
       const lfos = Array.from(lfoBySegmentId.entries()).map(([segmentId, lfo]) => ({
@@ -970,11 +1323,25 @@ export function initTimeline(options: TimelineInitOptions) {
           endSeconds: lfo.endSeconds,
         } satisfies Partial<LfoConfig>,
       }));
+      const envelopes = Array.from(envelopeBySegmentId.entries()).map(([segmentId, env]) => ({
+        segmentId,
+        envelope: {
+          id: env.id,
+          targetId: env.targetId,
+          wave: env.wave,
+          min: env.min,
+          max: env.max,
+          enabled: env.enabled,
+          startSeconds: env.startSeconds,
+          endSeconds: env.endSeconds,
+        } satisfies Partial<EnvelopeConfig>,
+      }));
       return {
         bpm,
         durationSeconds: audioDurationSeconds && isFinite(audioDurationSeconds) ? audioDurationSeconds : 0,
         audioFileName,
         lfos,
+        envelopes: envelopes.length ? envelopes : undefined,
       };
     },
     loadProjectTimeline: (timeline: ProjectTimeline) => {
@@ -1002,8 +1369,16 @@ export function initTimeline(options: TimelineInitOptions) {
         lfo.segmentId = segmentId;
         lfoBySegmentId.set(segmentId, lfo);
       }
+      for (const entry of timeline.envelopes ?? []) {
+        const created = modulation.addEnvelope(entry.envelope);
+        if (!created) continue;
+        const segmentId = entry.segmentId || created.id;
+        const env = created as TimelineEnvelope;
+        env.segmentId = segmentId;
+        envelopeBySegmentId.set(segmentId, env);
+      }
       renderLfoList();
-      selectSegment(timeline.lfos?.[0]?.segmentId ?? null);
+      selectSegment(timeline.lfos?.[0]?.segmentId ?? timeline.envelopes?.[0]?.segmentId ?? null);
     },
     destroy: () => {
       resizeObserver.disconnect();
