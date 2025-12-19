@@ -197,6 +197,23 @@ body {
   padding: 3px 6px;
 }
 
+.timeline-resolution {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+  font-size: 11px;
+}
+
+.timeline-resolution select {
+  width: 74px;
+  background: #0f1622;
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+
 .timeline-zoom {
   display: inline-flex;
   align-items: center;

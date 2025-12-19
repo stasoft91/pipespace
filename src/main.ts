@@ -31,8 +31,14 @@ import {
   Quaternion,
 } from 'three';
 import { Reflector } from 'three/examples/jsm/objects/Reflector.js';
+import { AfterimagePass } from 'three/examples/jsm/postprocessing/AfterimagePass.js';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { BokehPass } from 'three/examples/jsm/postprocessing/BokehPass.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { FilmPass } from 'three/examples/jsm/postprocessing/FilmPass.js';
+import { FXAAPass } from 'three/examples/jsm/postprocessing/FXAAPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import GUI from 'lil-gui';
 import { ModulationManager } from './modulation';
@@ -40,6 +46,7 @@ import { initTimeline, type RenderSchedule } from './timeline';
 import { PROJECT_VERSION, stringifyProjectFile, type ProjectFile, type ProjectSettings } from './project';
 import { Pipe, Simulation } from './simulation';
 import type { SimulationConfig, Vec3 } from './simulation';
+import { PrismWarpShader } from './shaders/prismWarpShader';
 import {
   PhysicalRayMirrorSystem,
   RasterMirrorSystem,
@@ -87,6 +94,25 @@ type RenderSettings = {
   bloomRadius: number;
   bloomThreshold: number;
   bloomResolutionScale: number;
+  bloomEnabled: boolean;
+  afterimageEnabled: boolean;
+  afterimageDamp: number;
+  bokehEnabled: boolean;
+  bokehFocus: number;
+  bokehAperture: number;
+  bokehMaxblur: number;
+  filmEnabled: boolean;
+  filmIntensity: number;
+  filmGrayscale: boolean;
+  fxaaEnabled: boolean;
+  prismEnabled: boolean;
+  prismStrength: number;
+  prismWarp: number;
+  prismChromaticAberration: number;
+  prismGrain: number;
+  prismVignette: number;
+  prismScanlines: number;
+  prismSpeed: number;
 };
 
 type OrbitSettings = {
@@ -181,7 +207,9 @@ const canvas = document.createElement('canvas');
 canvas.id = 'pipes-canvas';
 simPane.appendChild(canvas);
 
+let renderSizeOverride: { width: number; height: number } | null = null;
 const simBounds = () => {
+  if (renderSizeOverride) return renderSizeOverride;
   const width = simPane.clientWidth || window.innerWidth;
   const height = simPane.clientHeight || window.innerHeight;
   return { width, height };
@@ -279,6 +307,25 @@ const renderSettings: RenderSettings = {
   bloomRadius: 1,
   bloomThreshold: 0,
   bloomResolutionScale: 0.5,
+  bloomEnabled: true,
+  afterimageEnabled: false,
+  afterimageDamp: 0.96,
+  bokehEnabled: false,
+  bokehFocus: 32,
+  bokehAperture: 0.0002,
+  bokehMaxblur: 0.02,
+  filmEnabled: false,
+  filmIntensity: 0.35,
+  filmGrayscale: false,
+  fxaaEnabled: false,
+  prismEnabled: false,
+  prismStrength: 0.35,
+  prismWarp: 0.02,
+  prismChromaticAberration: 0.006,
+  prismGrain: 0.08,
+  prismVignette: 0.35,
+  prismScanlines: 0.12,
+  prismSpeed: 1,
 };
 
 const mirrorGuiSettings = {
@@ -494,6 +541,12 @@ updatePipeMaterial(renderSettings);
 let edgeNeons!: EdgeNeonSystem;
 let pipeManager!: PipeVisualManager;
 let bloomPass!: UnrealBloomPass;
+let bokehPass!: BokehPass;
+let afterimagePass!: AfterimagePass;
+let filmPass!: FilmPass;
+let prismPass!: ShaderPass;
+let outputPass!: OutputPass;
+let fxaaPass!: FXAAPass;
 let guiInstance: GUI | null = null;
 let gridSizeController: any;
 let targetCountController: any;
@@ -521,13 +574,15 @@ let railTargetSmoothController: any;
 let railLookAheadController: any;
 let railNudgeController: any;
 let railRollController: any;
+let bokehFocusController: any;
 
 const composer = new EffectComposer(renderer);
 const renderPass = new RenderPass(scene, camera);
 const makeBloom = () => {
   const scale = clamp(renderSettings.bloomResolutionScale, 0.1, 1);
-  const width = Math.max(1, Math.floor(window.innerWidth * scale));
-  const height = Math.max(1, Math.floor(window.innerHeight * scale));
+  const bounds = simBounds();
+  const width = Math.max(1, Math.floor(bounds.width * scale));
+  const height = Math.max(1, Math.floor(bounds.height * scale));
   return new UnrealBloomPass(
     new Vector2(width, height),
     renderSettings.bloomStrength,
@@ -536,8 +591,27 @@ const makeBloom = () => {
   );
 };
 bloomPass = makeBloom();
+bokehPass = new BokehPass(scene, camera, {
+  focus: renderSettings.bokehFocus,
+  aperture: renderSettings.bokehAperture,
+  maxblur: renderSettings.bokehMaxblur,
+});
+filmPass = new FilmPass(renderSettings.filmIntensity, renderSettings.filmGrayscale);
+prismPass = new ShaderPass(PrismWarpShader);
+afterimagePass = new AfterimagePass(renderSettings.afterimageDamp);
+outputPass = new OutputPass();
+fxaaPass = new FXAAPass();
+
 composer.addPass(renderPass);
+composer.addPass(bokehPass);
 composer.addPass(bloomPass);
+composer.addPass(filmPass);
+composer.addPass(prismPass);
+composer.addPass(afterimagePass);
+composer.addPass(outputPass);
+composer.addPass(fxaaPass);
+
+syncPostProcessingPasses();
 modulation.setGlobalBpm(modulationGlobals.bpm);
 modulationBaseSetters = setupModulationTargets();
 
@@ -602,6 +676,57 @@ function updateBloomResolution(width?: number, height?: number) {
   const w = Math.max(1, Math.floor(bounds.width * scale));
   const h = Math.max(1, Math.floor(bounds.height * scale));
   bloomPass.setSize(w, h);
+}
+
+function syncPrismResolution(width?: number, height?: number) {
+  const bounds = width !== undefined && height !== undefined ? { width, height } : simBounds();
+  const pixelRatio = renderer.getPixelRatio();
+  const w = Math.max(1, Math.floor(bounds.width * pixelRatio));
+  const h = Math.max(1, Math.floor(bounds.height * pixelRatio));
+  const uniforms = prismPass?.uniforms as any;
+  if (uniforms?.resolution?.value?.set) {
+    uniforms.resolution.value.set(w, h);
+  }
+}
+
+function syncPrismUniforms() {
+  const uniforms = prismPass?.uniforms as any;
+  if (!uniforms) return;
+  uniforms.strength.value = clamp(renderSettings.prismStrength, 0, 2);
+  uniforms.warp.value = clamp(renderSettings.prismWarp, 0, 0.2);
+  uniforms.chroma.value = clamp(renderSettings.prismChromaticAberration, 0, 0.05);
+  uniforms.grain.value = clamp(renderSettings.prismGrain, 0, 1);
+  uniforms.vignette.value = clamp(renderSettings.prismVignette, 0, 1);
+  uniforms.scanlines.value = clamp(renderSettings.prismScanlines, 0, 1);
+  uniforms.speed.value = clamp(renderSettings.prismSpeed, 0, 10);
+}
+
+function syncPostProcessingPasses() {
+  bokehPass.enabled = Boolean(renderSettings.bokehEnabled);
+  renderSettings.bokehFocus = Math.max(0, renderSettings.bokehFocus);
+  renderSettings.bokehAperture = clamp(renderSettings.bokehAperture, 0, 0.01);
+  renderSettings.bokehMaxblur = clamp(renderSettings.bokehMaxblur, 0, 0.1);
+  (bokehPass.uniforms as any).focus.value = renderSettings.bokehFocus;
+  (bokehPass.uniforms as any).aperture.value = renderSettings.bokehAperture;
+  (bokehPass.uniforms as any).maxblur.value = renderSettings.bokehMaxblur;
+
+  bloomPass.enabled = Boolean(renderSettings.bloomEnabled);
+  bloomPass.strength = renderSettings.bloomStrength;
+  bloomPass.radius = renderSettings.bloomRadius;
+  bloomPass.threshold = renderSettings.bloomThreshold;
+
+  filmPass.enabled = Boolean(renderSettings.filmEnabled);
+  (filmPass.uniforms as any).intensity.value = clamp(renderSettings.filmIntensity, 0, 1);
+  (filmPass.uniforms as any).grayscale.value = Boolean(renderSettings.filmGrayscale);
+
+  prismPass.enabled = Boolean(renderSettings.prismEnabled);
+  syncPrismUniforms();
+
+  afterimagePass.enabled = Boolean(renderSettings.afterimageEnabled);
+  afterimagePass.damp = clamp(renderSettings.afterimageDamp, 0, 1);
+
+  outputPass.enabled = true;
+  fxaaPass.enabled = Boolean(renderSettings.fxaaEnabled);
 }
 
 function updateMirrorResolution() {
@@ -681,6 +806,7 @@ function resize() {
   camera.updateProjectionMatrix();
   composer.setSize(width, height);
   updateBloomResolution(width, height);
+  syncPrismResolution(width, height);
   updateMirrorResolution();
 }
 
@@ -968,7 +1094,9 @@ function stepFrame(dt: number) {
   updateInfo(sim, state);
 
   lastCameraMode = cameraControl.mode;
-  composer.render();
+  const prismUniforms = prismPass?.uniforms as any;
+  if (prismUniforms?.time) prismUniforms.time.value = state.elapsed;
+  composer.render(dt);
 }
 
 function pickRecordingMimeType() {
@@ -979,6 +1107,32 @@ function pickRecordingMimeType() {
 
 function supportsWebCodecs() {
   return typeof VideoEncoder !== 'undefined' && typeof createImageBitmap !== 'undefined';
+}
+
+const VIDEO_RESOLUTIONS = [360, 720, 1080, 1920] as const;
+type VideoResolution = (typeof VIDEO_RESOLUTIONS)[number];
+
+function normalizeVideoResolution(value: unknown): VideoResolution | null {
+  const rounded = Math.round(Number(value));
+  if (!Number.isFinite(rounded)) return null;
+  return (VIDEO_RESOLUTIONS as readonly number[]).includes(rounded) ? (rounded as VideoResolution) : null;
+}
+
+function toEven(value: number) {
+  if (!Number.isFinite(value)) return 0;
+  const v = Math.floor(value);
+  return v % 2 === 0 ? v : v - 1;
+}
+
+function videoResolutionToRenderSize(value: unknown): { width: number; height: number } | null {
+  const videoResolution = normalizeVideoResolution(value);
+  if (videoResolution === null) return null;
+
+  let height = toEven(videoResolution);
+  let width = toEven((height * 16) / 9);
+  height = Math.max(2, height);
+  width = Math.max(2, width);
+  return { width, height };
 }
 
 async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | null> {
@@ -1068,7 +1222,7 @@ async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | n
 
 async function renderVideoCapture(
   durationSeconds: number,
-  opts: { startAtZero?: boolean; filenameBase?: string } = {}
+  opts: { startAtZero?: boolean; filenameBase?: string; videoResolution?: number } = {}
 ) {
   if (videoCaptureSettings.recording) return;
 
@@ -1083,7 +1237,17 @@ async function renderVideoCapture(
     pipeManager.sync([], renderSettings);
   }
 
+  const renderSize = videoResolutionToRenderSize(opts.videoResolution);
+  const prevPixelRatio = renderer.getPixelRatio();
+  const prevRenderSizeOverride = renderSizeOverride;
+
   try {
+    if (renderSize) {
+      renderSizeOverride = renderSize;
+      renderer.setPixelRatio(1);
+      resize();
+    }
+
     // Prefer offline WebCodecs encoding (decoupled from real-time)
     if (supportsWebCodecs()) {
       videoCaptureSettings.recording = true;
@@ -1192,6 +1356,11 @@ async function renderVideoCapture(
     }
   }
   } finally {
+    if (renderSize) {
+      renderSizeOverride = prevRenderSizeOverride;
+      renderer.setPixelRatio(prevPixelRatio);
+      resize();
+    }
     ignoreAudioForModulation = prevIgnoreAudio;
   }
 }
@@ -1220,6 +1389,7 @@ function setupGui() {
       const bounds = cameraDistanceBounds();
       cameraControl.distance = clamp(cameraControl.distance, bounds.min, bounds.max);
       refreshCameraDistanceController();
+      refreshBokehFocusController();
     });
   targetCountController = simFolder.add(defaultSimConfig, 'targetPipeCount', 1, 64, 1).name('Pipe cap').onChange((v: number) => {
     sim.config.targetPipeCount = v;
@@ -1269,6 +1439,7 @@ function setupGui() {
           gridLines.visible = renderSettings.showGrid;
           scene.add(gridLines);
           refreshCameraDistanceController();
+          refreshBokehFocusController();
           modulation.syncBaseFromTargets();
         },
       },
@@ -1423,6 +1594,7 @@ function setupGui() {
       const { min, max } = cameraDistanceBounds();
       cameraControl.distance = clamp(cameraControl.distance, min, max);
       refreshCameraDistanceController();
+      refreshBokehFocusController();
       modulationBaseSetters['room.wallGap']?.(roomPadding);
     });
   mirrorFolder.add(mirrorGuiSettings, 'enabled').name('Enabled').onChange((v: boolean) => {
@@ -1754,21 +1926,126 @@ function setupGui() {
     .name('Randomize camera');
 
   const postFolder = gui.addFolder('Post FX');
-  postFolder.add(renderSettings, 'bloomStrength', 0, 2, 0.01).name('Bloom strength').onChange((v: number) => {
+  postFolder.add(renderSettings, 'fxaaEnabled').name('FXAA').onChange((v: boolean) => {
+    renderSettings.fxaaEnabled = v;
+    fxaaPass.enabled = v;
+    modulationBaseSetters['post.fxaaEnabled']?.(Number(v));
+  });
+
+  const afterimageFolder = postFolder.addFolder('Afterimage');
+  afterimageFolder.add(renderSettings, 'afterimageEnabled').name('Enabled').onChange((v: boolean) => {
+    renderSettings.afterimageEnabled = v;
+    afterimagePass.enabled = v;
+    modulationBaseSetters['post.afterimageEnabled']?.(Number(v));
+  });
+  afterimageFolder.add(renderSettings, 'afterimageDamp', 0, 1, 0.001).name('Damp').onChange((v: number) => {
+    renderSettings.afterimageDamp = clamp(v, 0, 1);
+    afterimagePass.damp = renderSettings.afterimageDamp;
+    modulationBaseSetters['post.afterimageDamp']?.(renderSettings.afterimageDamp);
+  });
+
+  const bloomFolder = postFolder.addFolder('Bloom');
+  bloomFolder.add(renderSettings, 'bloomEnabled').name('Enabled').onChange((v: boolean) => {
+    renderSettings.bloomEnabled = v;
+    bloomPass.enabled = v;
+    modulationBaseSetters['post.bloomEnabled']?.(Number(v));
+  });
+  bloomFolder.add(renderSettings, 'bloomStrength', 0, 2, 0.01).name('Strength').onChange((v: number) => {
     bloomPass.strength = v;
     modulationBaseSetters['post.bloomStrength']?.(v);
   });
-  postFolder.add(renderSettings, 'bloomRadius', 0, 1, 0.01).name('Bloom radius').onChange((v: number) => {
+  bloomFolder.add(renderSettings, 'bloomRadius', 0, 1, 0.01).name('Radius').onChange((v: number) => {
     bloomPass.radius = v;
     modulationBaseSetters['post.bloomRadius']?.(v);
   });
-  postFolder.add(renderSettings, 'bloomThreshold', 0, 1, 0.01).name('Bloom threshold').onChange((v: number) => {
+  bloomFolder.add(renderSettings, 'bloomThreshold', 0, 1, 0.01).name('Threshold').onChange((v: number) => {
     bloomPass.threshold = v;
     modulationBaseSetters['post.bloomThreshold']?.(v);
   });
-  postFolder.add(renderSettings, 'bloomResolutionScale', 0.25, 1, 0.05).name('Bloom resolution').onChange((v: number) => {
+  bloomFolder.add(renderSettings, 'bloomResolutionScale', 0.25, 1, 0.05).name('Resolution').onChange((v: number) => {
     renderSettings.bloomResolutionScale = clamp(v, 0.1, 1);
     updateBloomResolution();
+  });
+
+  const bokehFolder = postFolder.addFolder('Bokeh');
+  bokehFolder.add(renderSettings, 'bokehEnabled').name('Enabled').onChange((v: boolean) => {
+    renderSettings.bokehEnabled = v;
+    bokehPass.enabled = v;
+    modulationBaseSetters['post.bokehEnabled']?.(Number(v));
+  });
+  bokehFocusController = bokehFolder.add(renderSettings, 'bokehFocus', 0, bokehFocusMax(), 0.1).name('Focus').onChange((v: number) => {
+    renderSettings.bokehFocus = Math.max(0, v);
+    (bokehPass.uniforms as any).focus.value = renderSettings.bokehFocus;
+    modulationBaseSetters['post.bokehFocus']?.(renderSettings.bokehFocus);
+  });
+  bokehFolder.add(renderSettings, 'bokehAperture', 0, 0.01, 0.00001).name('Aperture').onChange((v: number) => {
+    renderSettings.bokehAperture = Math.max(0, v);
+    (bokehPass.uniforms as any).aperture.value = renderSettings.bokehAperture;
+    modulationBaseSetters['post.bokehAperture']?.(renderSettings.bokehAperture);
+  });
+  bokehFolder.add(renderSettings, 'bokehMaxblur', 0, 0.1, 0.0005).name('Max blur').onChange((v: number) => {
+    renderSettings.bokehMaxblur = Math.max(0, v);
+    (bokehPass.uniforms as any).maxblur.value = renderSettings.bokehMaxblur;
+    modulationBaseSetters['post.bokehMaxblur']?.(renderSettings.bokehMaxblur);
+  });
+
+  const filmFolder = postFolder.addFolder('Film');
+  filmFolder.add(renderSettings, 'filmEnabled').name('Enabled').onChange((v: boolean) => {
+    renderSettings.filmEnabled = v;
+    filmPass.enabled = v;
+    modulationBaseSetters['post.filmEnabled']?.(Number(v));
+  });
+  filmFolder.add(renderSettings, 'filmIntensity', 0, 1, 0.01).name('Intensity').onChange((v: number) => {
+    renderSettings.filmIntensity = clamp(v, 0, 1);
+    (filmPass.uniforms as any).intensity.value = renderSettings.filmIntensity;
+    modulationBaseSetters['post.filmIntensity']?.(renderSettings.filmIntensity);
+  });
+  filmFolder.add(renderSettings, 'filmGrayscale').name('Grayscale').onChange((v: boolean) => {
+    renderSettings.filmGrayscale = v;
+    (filmPass.uniforms as any).grayscale.value = v;
+    modulationBaseSetters['post.filmGrayscale']?.(Number(v));
+  });
+
+  const prismFolder = postFolder.addFolder('ShaderPass (PrismWarp)');
+  prismFolder.add(renderSettings, 'prismEnabled').name('Enabled').onChange((v: boolean) => {
+    renderSettings.prismEnabled = v;
+    prismPass.enabled = v;
+    modulationBaseSetters['post.prismEnabled']?.(Number(v));
+  });
+  prismFolder.add(renderSettings, 'prismStrength', 0, 2, 0.01).name('Strength').onChange((v: number) => {
+    renderSettings.prismStrength = clamp(v, 0, 2);
+    syncPrismUniforms();
+    modulationBaseSetters['post.prismStrength']?.(renderSettings.prismStrength);
+  });
+  prismFolder.add(renderSettings, 'prismWarp', 0, 0.12, 0.001).name('Warp').onChange((v: number) => {
+    renderSettings.prismWarp = clamp(v, 0, 0.2);
+    syncPrismUniforms();
+    modulationBaseSetters['post.prismWarp']?.(renderSettings.prismWarp);
+  });
+  prismFolder.add(renderSettings, 'prismChromaticAberration', 0, 0.02, 0.0005).name('Chroma').onChange((v: number) => {
+    renderSettings.prismChromaticAberration = clamp(v, 0, 0.05);
+    syncPrismUniforms();
+    modulationBaseSetters['post.prismChroma']?.(renderSettings.prismChromaticAberration);
+  });
+  prismFolder.add(renderSettings, 'prismGrain', 0, 0.5, 0.01).name('Grain').onChange((v: number) => {
+    renderSettings.prismGrain = clamp(v, 0, 1);
+    syncPrismUniforms();
+    modulationBaseSetters['post.prismGrain']?.(renderSettings.prismGrain);
+  });
+  prismFolder.add(renderSettings, 'prismVignette', 0, 1, 0.01).name('Vignette').onChange((v: number) => {
+    renderSettings.prismVignette = clamp(v, 0, 1);
+    syncPrismUniforms();
+    modulationBaseSetters['post.prismVignette']?.(renderSettings.prismVignette);
+  });
+  prismFolder.add(renderSettings, 'prismScanlines', 0, 1, 0.01).name('Scanlines').onChange((v: number) => {
+    renderSettings.prismScanlines = clamp(v, 0, 1);
+    syncPrismUniforms();
+    modulationBaseSetters['post.prismScanlines']?.(renderSettings.prismScanlines);
+  });
+  prismFolder.add(renderSettings, 'prismSpeed', 0, 5, 0.01).name('Speed').onChange((v: number) => {
+    renderSettings.prismSpeed = clamp(v, 0, 10);
+    syncPrismUniforms();
+    modulationBaseSetters['post.prismSpeed']?.(renderSettings.prismSpeed);
   });
 
 }
@@ -1897,6 +2174,7 @@ function setupModulationTargets() {
       const { min, max } = cameraDistanceBounds();
       cameraControl.distance = clamp(cameraControl.distance, min, max);
       refreshCameraDistanceController();
+      refreshBokehFocusController();
     },
   });
 
@@ -2207,6 +2485,200 @@ function setupModulationTargets() {
     },
   });
 
+  register('post.bloomEnabled', 'Post FX', 'Bloom enabled', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => Number(renderSettings.bloomEnabled),
+    set: (v: number) => {
+      renderSettings.bloomEnabled = v >= 0.5;
+      bloomPass.enabled = renderSettings.bloomEnabled;
+    },
+  });
+  register('post.fxaaEnabled', 'Post FX', 'FXAA enabled', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => Number(renderSettings.fxaaEnabled),
+    set: (v: number) => {
+      renderSettings.fxaaEnabled = v >= 0.5;
+      fxaaPass.enabled = renderSettings.fxaaEnabled;
+    },
+  });
+
+  register('post.bokehEnabled', 'Post FX', 'Bokeh enabled', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => Number(renderSettings.bokehEnabled),
+    set: (v: number) => {
+      renderSettings.bokehEnabled = v >= 0.5;
+      bokehPass.enabled = renderSettings.bokehEnabled;
+    },
+  });
+  register('post.bokehFocus', 'Post FX', 'Bokeh focus', {
+    min: 0,
+    max: bokehFocusMax(),
+    range: 200,
+    get: () => renderSettings.bokehFocus,
+    set: (v: number) => {
+      renderSettings.bokehFocus = Math.max(0, v);
+      (bokehPass.uniforms as any).focus.value = renderSettings.bokehFocus;
+    },
+  });
+  register('post.bokehAperture', 'Post FX', 'Bokeh aperture', {
+    min: 0,
+    max: 0.01,
+    range: 0.01,
+    get: () => renderSettings.bokehAperture,
+    set: (v: number) => {
+      renderSettings.bokehAperture = clamp(v, 0, 0.01);
+      (bokehPass.uniforms as any).aperture.value = renderSettings.bokehAperture;
+    },
+  });
+  register('post.bokehMaxblur', 'Post FX', 'Bokeh max blur', {
+    min: 0,
+    max: 0.1,
+    range: 0.1,
+    get: () => renderSettings.bokehMaxblur,
+    set: (v: number) => {
+      renderSettings.bokehMaxblur = clamp(v, 0, 0.1);
+      (bokehPass.uniforms as any).maxblur.value = renderSettings.bokehMaxblur;
+    },
+  });
+
+  register('post.filmEnabled', 'Post FX', 'Film enabled', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => Number(renderSettings.filmEnabled),
+    set: (v: number) => {
+      renderSettings.filmEnabled = v >= 0.5;
+      filmPass.enabled = renderSettings.filmEnabled;
+    },
+  });
+  register('post.filmIntensity', 'Post FX', 'Film intensity', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.filmIntensity,
+    set: (v: number) => {
+      renderSettings.filmIntensity = clamp(v, 0, 1);
+      (filmPass.uniforms as any).intensity.value = renderSettings.filmIntensity;
+    },
+  });
+  register('post.filmGrayscale', 'Post FX', 'Film grayscale', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => Number(renderSettings.filmGrayscale),
+    set: (v: number) => {
+      renderSettings.filmGrayscale = v >= 0.5;
+      (filmPass.uniforms as any).grayscale.value = renderSettings.filmGrayscale;
+    },
+  });
+
+  register('post.prismEnabled', 'Post FX', 'PrismWarp enabled', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => Number(renderSettings.prismEnabled),
+    set: (v: number) => {
+      renderSettings.prismEnabled = v >= 0.5;
+      prismPass.enabled = renderSettings.prismEnabled;
+    },
+  });
+  register('post.prismStrength', 'Post FX', 'PrismWarp strength', {
+    min: 0,
+    max: 2,
+    range: 2,
+    get: () => renderSettings.prismStrength,
+    set: (v: number) => {
+      renderSettings.prismStrength = clamp(v, 0, 2);
+      syncPrismUniforms();
+    },
+  });
+  register('post.prismWarp', 'Post FX', 'PrismWarp warp', {
+    min: 0,
+    max: 0.12,
+    range: 0.12,
+    get: () => renderSettings.prismWarp,
+    set: (v: number) => {
+      renderSettings.prismWarp = clamp(v, 0, 0.2);
+      syncPrismUniforms();
+    },
+  });
+  register('post.prismChroma', 'Post FX', 'PrismWarp chroma', {
+    min: 0,
+    max: 0.02,
+    range: 0.02,
+    get: () => renderSettings.prismChromaticAberration,
+    set: (v: number) => {
+      renderSettings.prismChromaticAberration = clamp(v, 0, 0.05);
+      syncPrismUniforms();
+    },
+  });
+  register('post.prismGrain', 'Post FX', 'PrismWarp grain', {
+    min: 0,
+    max: 0.5,
+    range: 0.5,
+    get: () => renderSettings.prismGrain,
+    set: (v: number) => {
+      renderSettings.prismGrain = clamp(v, 0, 1);
+      syncPrismUniforms();
+    },
+  });
+  register('post.prismVignette', 'Post FX', 'PrismWarp vignette', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.prismVignette,
+    set: (v: number) => {
+      renderSettings.prismVignette = clamp(v, 0, 1);
+      syncPrismUniforms();
+    },
+  });
+  register('post.prismScanlines', 'Post FX', 'PrismWarp scanlines', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.prismScanlines,
+    set: (v: number) => {
+      renderSettings.prismScanlines = clamp(v, 0, 1);
+      syncPrismUniforms();
+    },
+  });
+  register('post.prismSpeed', 'Post FX', 'PrismWarp speed', {
+    min: 0,
+    max: 5,
+    range: 5,
+    get: () => renderSettings.prismSpeed,
+    set: (v: number) => {
+      renderSettings.prismSpeed = clamp(v, 0, 10);
+      syncPrismUniforms();
+    },
+  });
+  register('post.afterimageEnabled', 'Post FX', 'Afterimage enabled', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => Number(renderSettings.afterimageEnabled),
+    set: (v: number) => {
+      renderSettings.afterimageEnabled = v >= 0.5;
+      afterimagePass.enabled = renderSettings.afterimageEnabled;
+    },
+  });
+  register('post.afterimageDamp', 'Post FX', 'Afterimage damp', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.afterimageDamp,
+    set: (v: number) => {
+      renderSettings.afterimageDamp = clamp(v, 0, 1);
+      afterimagePass.damp = renderSettings.afterimageDamp;
+    },
+  });
+
   register('camera.orbitSpeed', 'Camera', 'Orbit speed', {
     min: 0.02,
     max: 0.6,
@@ -2462,6 +2934,24 @@ function refreshCameraDistanceController() {
   cameraDistanceController.setValue(clamp(cameraControl.distance, min, max));
 }
 
+function bokehFocusMax() {
+  // Focus is "distance along the camera look direction" in world units.
+  // Keep this range large enough for big grids/padding, otherwise focus changes can appear to do nothing.
+  return Math.max(200, room.size * 2);
+}
+
+function refreshBokehFocusController() {
+  if (bokehFocusController?.max) {
+    bokehFocusController.max(bokehFocusMax());
+  }
+
+  // Keep modulation scaling stable (range stays 200) but allow higher focus values.
+  const target = modulation.getTarget('post.bokehFocus');
+  if (target) {
+    target.max = bokehFocusMax();
+  }
+}
+
 function cameraBoundsLimit(margin = CAMERA_MARGIN) {
   const inset = mirrorInset + CAMERA_WALL_EPS;
   const halfSize = room.size * 0.5;
@@ -2657,6 +3147,7 @@ function randomizeAll() {
   turnController?.setValue(turnProxy.turnChance);
   tailShrinkController?.setValue(defaultSimConfig.disableTailShrink);
   refreshCameraDistanceController();
+  refreshBokehFocusController();
   modulation.syncBaseFromTargets();
 }
 
@@ -3351,7 +3842,13 @@ function applyProjectSettings(settings: ProjectSettings) {
   roomPadding = clamp(settings.roomPadding, 0, 70);
   roomGuiSettings.wallGap = roomPadding;
 
-  Object.assign(renderSettings, settings.renderSettings);
+  const loadedRenderSettings = settings.renderSettings as Partial<RenderSettings>;
+  for (const key of Object.keys(renderSettings) as Array<keyof RenderSettings>) {
+    const value = loadedRenderSettings[key];
+    if (value !== undefined) {
+      (renderSettings as any)[key] = value;
+    }
+  }
 
   const prevMirrorRenderer = mirrorRenderer;
   mirrorInset = Math.max(0, settings.mirror.inset);
@@ -3416,10 +3913,9 @@ function applyProjectSettings(settings: ProjectSettings) {
 
   syncPipeVisibilityToMainCamera();
   updatePipeMaterial(renderSettings);
-  bloomPass.strength = renderSettings.bloomStrength;
-  bloomPass.radius = renderSettings.bloomRadius;
-  bloomPass.threshold = renderSettings.bloomThreshold;
+  syncPostProcessingPasses();
   updateBloomResolution();
+  syncPrismResolution();
 
   if (prevMirrorRenderer !== mirrorRenderer) {
     roomMirrors.dispose();
@@ -3434,6 +3930,7 @@ function applyProjectSettings(settings: ProjectSettings) {
   roomMirrors.update(room.size, renderSettings.roomColor);
 
   refreshCameraDistanceController();
+  refreshBokehFocusController();
 
   modulation.syncBaseFromTargets();
   if (guiInstance) {
@@ -3477,7 +3974,7 @@ timelineHandle = initTimeline({
     if (schedule) {
       requestBackendRender(schedule).catch((err) => {
         console.warn('Backend render failed; falling back to in-browser render', err);
-        renderVideoCapture(durationSeconds, { startAtZero: true });
+        renderVideoCapture(durationSeconds, { startAtZero: true, videoResolution: schedule.videoResolution });
       });
       return;
     }
@@ -3502,7 +3999,11 @@ function applyRenderSchedule(schedule: RenderSchedule) {
   applySchedule: applyRenderSchedule,
   renderFromSchedule: async (schedule: RenderSchedule, filenameBase?: string) => {
     applyRenderSchedule(schedule);
-    await renderVideoCapture(schedule.durationSeconds, { startAtZero: true, filenameBase });
+    await renderVideoCapture(schedule.durationSeconds, {
+      startAtZero: true,
+      filenameBase,
+      videoResolution: schedule.videoResolution,
+    });
   },
 };
 

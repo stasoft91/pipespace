@@ -6,6 +6,7 @@ export type RenderSchedule = {
   bpm: number;
   durationSeconds: number;
   lfos: LfoConfig[];
+  videoResolution: number;
 };
 
 export type TimelineInitOptions = {
@@ -83,6 +84,26 @@ export function initTimeline(options: TimelineInitOptions) {
   playBtn.type = 'button';
   playBtn.textContent = 'Play';
   controls.appendChild(playBtn);
+
+  let videoResolution = 1080;
+  const resolutionLabel = document.createElement('label');
+  resolutionLabel.className = 'timeline-resolution';
+  resolutionLabel.textContent = 'Res';
+  const resolutionSelect = document.createElement('select');
+  resolutionSelect.setAttribute('aria-label', 'Video resolution');
+  for (const res of [360, 720, 1080, 1920]) {
+    const option = document.createElement('option');
+    option.value = String(res);
+    option.textContent = String(res);
+    resolutionSelect.appendChild(option);
+  }
+  resolutionSelect.value = String(videoResolution);
+  resolutionSelect.addEventListener('change', () => {
+    const next = Math.round(Number(resolutionSelect.value));
+    if (isFinite(next) && next > 0) videoResolution = next;
+  });
+  resolutionLabel.appendChild(resolutionSelect);
+  controls.appendChild(resolutionLabel);
 
   const renderBtn = document.createElement('button');
   renderBtn.type = 'button';
@@ -927,7 +948,7 @@ export function initTimeline(options: TimelineInitOptions) {
         startSeconds: lfo.startSeconds,
         endSeconds: lfo.endSeconds,
       }));
-      return { bpm, durationSeconds: audioDurationSeconds, lfos };
+      return { bpm, durationSeconds: audioDurationSeconds, lfos, videoResolution };
     },
     getProjectTimeline: (): ProjectTimeline => {
       const lfos = Array.from(lfoBySegmentId.entries()).map(([segmentId, lfo]) => ({

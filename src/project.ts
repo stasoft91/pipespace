@@ -53,6 +53,25 @@ export type ProjectRenderSettings = {
   bloomRadius: number;
   bloomThreshold: number;
   bloomResolutionScale: number;
+  bloomEnabled: boolean;
+  afterimageEnabled: boolean;
+  afterimageDamp: number;
+  bokehEnabled: boolean;
+  bokehFocus: number;
+  bokehAperture: number;
+  bokehMaxblur: number;
+  filmEnabled: boolean;
+  filmIntensity: number;
+  filmGrayscale: boolean;
+  fxaaEnabled: boolean;
+  prismEnabled: boolean;
+  prismStrength: number;
+  prismWarp: number;
+  prismChromaticAberration: number;
+  prismGrain: number;
+  prismVignette: number;
+  prismScanlines: number;
+  prismSpeed: number;
 };
 
 export type ProjectMirrorSettings = {
