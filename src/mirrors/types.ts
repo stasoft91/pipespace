@@ -4,12 +4,7 @@ import type { Reflector } from 'three/examples/jsm/objects/Reflector.js';
 export type MirrorReflectionMode = 'none' | 'cameraFacing' | 'all';
 
 export type MirrorDistortionUniforms = {
-  blur: number;
-  chromaticShift: number;
   warpStrength: number;
-  warpSpeed: number;
-  refractionOffset: number;
-  noiseStrength: number;
   time: number;
 };
 
@@ -17,7 +12,6 @@ export type MirrorSystem = {
   readonly faces: Reflector[];
   update: (size: number, color: string) => void;
   setResolution: (width: number, height: number) => void;
-  setBlur: (amount: number) => void;
   setDistortion: (u: MirrorDistortionUniforms) => void;
   setEnabled: (enabled: boolean) => void;
   setUpdateMask: (mask: Set<number>) => void;
@@ -30,4 +24,3 @@ export type MirrorSystemDeps = {
   scene: Scene;
   camera: PerspectiveCamera;
 };
-

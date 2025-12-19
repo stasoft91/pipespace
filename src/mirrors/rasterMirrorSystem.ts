@@ -3,12 +3,7 @@ import { Reflector } from 'three/examples/jsm/objects/Reflector.js';
 import type { MirrorDistortionUniforms, MirrorSystem } from './types';
 
 type MirrorUniformBag = {
-  blurAmount?: { value: number };
-  chromaticShift?: { value: number };
   warpStrength?: { value: number };
-  warpSpeed?: { value: number };
-  refractionOffset?: { value: number };
-  noiseStrength?: { value: number };
   time?: { value: number };
 };
 
@@ -97,11 +92,6 @@ export class RasterMirrorSystem implements MirrorSystem {
     }
   }
 
-  setBlur(amount: number) {
-    this.distortion.blur = amount;
-    this.applyDistortionUniforms();
-  }
-
   setDistortion(u: MirrorDistortionUniforms) {
     this.distortion = { ...u };
     this.applyDistortionUniforms();
@@ -133,12 +123,7 @@ export class RasterMirrorSystem implements MirrorSystem {
 
   private applyDistortionUniforms() {
     for (const uniforms of this.mirrorUniforms.values()) {
-      if (uniforms.blurAmount) uniforms.blurAmount.value = this.distortion.blur;
-      if (uniforms.chromaticShift) uniforms.chromaticShift.value = this.distortion.chromaticShift;
       if (uniforms.warpStrength) uniforms.warpStrength.value = this.distortion.warpStrength;
-      if (uniforms.warpSpeed) uniforms.warpSpeed.value = this.distortion.warpSpeed;
-      if (uniforms.refractionOffset) uniforms.refractionOffset.value = this.distortion.refractionOffset;
-      if (uniforms.noiseStrength) uniforms.noiseStrength.value = this.distortion.noiseStrength;
       if (uniforms.time) uniforms.time.value = this.distortion.time;
     }
   }
@@ -182,23 +167,13 @@ export class RasterMirrorSystem implements MirrorSystem {
       ...this.baseShader,
       uniforms: {
         ...this.baseShader.uniforms,
-        blurAmount: { value: this.distortion.blur },
-        chromaticShift: { value: this.distortion.chromaticShift },
         warpStrength: { value: this.distortion.warpStrength },
-        warpSpeed: { value: this.distortion.warpSpeed },
-        refractionOffset: { value: this.distortion.refractionOffset },
-        noiseStrength: { value: this.distortion.noiseStrength },
         time: { value: this.distortion.time ?? 0 },
       },
       fragmentShader: `
         uniform vec3 color;
         uniform sampler2D tDiffuse;
-        uniform float blurAmount;
-        uniform float chromaticShift;
         uniform float warpStrength;
-        uniform float warpSpeed;
-        uniform float refractionOffset;
-        uniform float noiseStrength;
         uniform float time;
         varying vec4 vUv;
 
@@ -224,23 +199,11 @@ export class RasterMirrorSystem implements MirrorSystem {
           float len = length(dir);
           vec2 dirNorm = len < 1e-4 ? vec2(1.0, 0.0) : dir / len;
 
-          // noise shimmer
-          if (noiseStrength > 0.0) {
-            float n = sin(dot(uv * vec2(1733.1, 927.7), vec2(12.9898, 78.233)) + time * 57.0);
-            vec2 noiseVec = vec2(n, fract(n * 1.2154) - 0.5);
-            uv += noiseVec * noiseStrength;
-          }
-
           // warp
           float warp = warpStrength;
           if (warp > 0.0) {
-            float wobble = sin(len * 24.0 + time * warpSpeed * 6.28318);
+            float wobble = sin(len * 24.0 + time * 6.28318);
             uv += dirNorm * wobble * warp;
-          }
-
-          // refraction-like offset
-          if (abs(refractionOffset) > 0.0001) {
-            uv += dirNorm * refractionOffset;
           }
 
           // reconstruct projective coords after UV shifts
@@ -248,34 +211,6 @@ export class RasterMirrorSystem implements MirrorSystem {
 
           // base sample
           vec3 base = sampleProj(projSample);
-          float blur = clamp(blurAmount, 0.0, 1.0);
-
-          if (blur > 0.0) {
-            float radius = mix(0.0, 0.06, blur); // tune radius
-            vec3 accum = base;
-            float weight = 1.0;
-            const int samples = 5;
-            for (int i = 1; i <= samples; i++) {
-              float t = float(i) / float(samples);
-              vec2 offset = dir * radius * t;
-              vec4 offProj = vec4((uv + offset) * projUv.w, projUv.zw);
-              vec3 s = sampleProj(offProj);
-              float w = 1.0 - t * 0.65;
-              accum += s * w;
-              weight += w;
-            }
-            base = accum / weight;
-          }
-
-          // chromatic shift
-          float shift = chromaticShift;
-          if (shift > 0.0) {
-            vec2 cOff = dirNorm * shift;
-            float r = texture2DProj( tDiffuse, vec4((uv + cOff) * projUv.w, projUv.zw) ).r;
-            float g = texture2DProj( tDiffuse, vec4(uv * projUv.w, projUv.zw) ).g;
-            float b = texture2DProj( tDiffuse, vec4((uv - cOff) * projUv.w, projUv.zw) ).b;
-            base = vec3(r, g, b);
-          }
 
           gl_FragColor = vec4( blendOverlay( base, color ), 1.0 );
 

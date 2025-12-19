@@ -22,10 +22,6 @@ export type ProjectRenderSettings = {
   tubularSegments: number;
   radialSegments: number;
   colorShift: number;
-  backLightEnabled: boolean;
-  backLightIntensity: number;
-  backLightRange: number;
-  backLightColor: string;
   edgeNeonEnabled: boolean;
   edgeNeonColor: string;
   edgeHueTravelEnabled: boolean;
@@ -41,10 +37,6 @@ export type ProjectRenderSettings = {
   hidePipesInMainCamera: boolean;
   pipeMetalness: number;
   pipeRoughness: number;
-  glassEnabled: boolean;
-  glassTransmission: number;
-  glassOpacity: number;
-  glassIor: number;
   cornerTension: number;
   neonEnabled: boolean;
   neonStrength: number;
@@ -72,6 +64,28 @@ export type ProjectRenderSettings = {
   prismVignette: number;
   prismScanlines: number;
   prismSpeed: number;
+  flowmapEnabled: boolean;
+  flowmapStrength: number;
+  flowmapViscosity: number;
+  fractalEnabled: boolean;
+  fractalStrength: number;
+  fractalIterations: number;
+  fractalZoom: number;
+  fractalCenterX: number;
+  fractalCenterY: number;
+  fractalCRe: number;
+  fractalCIm: number;
+  fractalMode: 'julia' | 'mandelbrot';
+  fractalSegments: number;
+  fractalRotation: number;
+  fractalDomainMix: number;
+  fractalDomainFrequency: number;
+  fractalPaletteShift: number;
+  fractalColorScheme: 'cosine' | 'escape';
+  curlEnabled: boolean;
+  curlStrength: number;
+  curlScale: number;
+  curlTimeRate: number;
 };
 
 export type ProjectMirrorSettings = {
@@ -83,12 +97,7 @@ export type ProjectMirrorSettings = {
   renderer: 'raster' | 'ray' | 'rayAllFaces' | 'physicalRay';
   rayBounces: number;
   reflectionMode: MirrorReflectionMode;
-  blur: number;
-  chromaticShift: number;
   warpStrength: number;
-  warpSpeed: number;
-  refractionOffset: number;
-  noiseStrength: number;
   bounceAttenuation: number;
   bounceAttenuationMode: 'skipFirst' | 'allBounces';
 };

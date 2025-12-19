@@ -3,12 +3,7 @@ import { Reflector } from 'three/examples/jsm/objects/Reflector.js';
 import type { MirrorDistortionUniforms, MirrorSystem } from './types';
 
 type MirrorUniformBag = {
-  blurAmount?: { value: number };
-  chromaticShift?: { value: number };
   warpStrength?: { value: number };
-  warpSpeed?: { value: number };
-  refractionOffset?: { value: number };
-  noiseStrength?: { value: number };
   time?: { value: number };
   surfaceIntensity?: { value: number };
 };
@@ -125,11 +120,6 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
       const target = (face as unknown as { getRenderTarget?: () => { setSize: (w: number, h: number) => void } }).getRenderTarget?.();
       target?.setSize(width, height);
     }
-  }
-
-  setBlur(amount: number) {
-    this.distortion.blur = amount;
-    this.applyDistortionUniforms();
   }
 
   setDistortion(u: MirrorDistortionUniforms) {
@@ -435,12 +425,7 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
   private applyDistortionUniforms() {
     const intensity = this.computeSurfaceIntensity();
     for (const uniforms of this.mirrorUniforms.values()) {
-      if (uniforms.blurAmount) uniforms.blurAmount.value = this.distortion.blur;
-      if (uniforms.chromaticShift) uniforms.chromaticShift.value = this.distortion.chromaticShift;
       if (uniforms.warpStrength) uniforms.warpStrength.value = this.distortion.warpStrength;
-      if (uniforms.warpSpeed) uniforms.warpSpeed.value = this.distortion.warpSpeed;
-      if (uniforms.refractionOffset) uniforms.refractionOffset.value = this.distortion.refractionOffset;
-      if (uniforms.noiseStrength) uniforms.noiseStrength.value = this.distortion.noiseStrength;
       if (uniforms.time) uniforms.time.value = this.distortion.time;
       if (uniforms.surfaceIntensity) uniforms.surfaceIntensity.value = intensity;
     }
@@ -486,12 +471,7 @@ export class PhysicalRayMirrorSystem implements MirrorSystem {
       ...this.baseShader,
       uniforms: {
         ...this.baseShader.uniforms,
-        blurAmount: { value: this.distortion.blur },
-        chromaticShift: { value: this.distortion.chromaticShift },
         warpStrength: { value: this.distortion.warpStrength },
-        warpSpeed: { value: this.distortion.warpSpeed },
-        refractionOffset: { value: this.distortion.refractionOffset },
-        noiseStrength: { value: this.distortion.noiseStrength },
         time: { value: this.distortion.time ?? 0 },
         surfaceIntensity: { value: this.computeSurfaceIntensity() },
       },

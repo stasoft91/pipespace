@@ -47,6 +47,9 @@ import { PROJECT_VERSION, stringifyProjectFile, type ProjectFile, type ProjectSe
 import { Pipe, Simulation } from './simulation';
 import type { SimulationConfig, Vec3 } from './simulation';
 import { PrismWarpShader } from './shaders/prismWarpShader';
+import { CurlNoiseDisplacementShader } from './shaders/curlNoiseDisplacementShader';
+import { FlowmapAdvectionShader } from './shaders/flowmapAdvectionShader';
+import { FractalWarpShader } from './shaders/fractalWarpShader';
 import {
   PhysicalRayMirrorSystem,
   RasterMirrorSystem,
@@ -56,6 +59,12 @@ import {
 import type { MirrorReflectionMode, MirrorSystem } from './mirrors';
 
 type PathType = 'polyline' | 'catmullrom' | 'centripetal' | 'chordal';
+type FractalMode = 'julia' | 'mandelbrot';
+type FractalColorScheme = 'cosine' | 'escape';
+const FRACTAL_COLOR_SCHEME_MAP: Record<FractalColorScheme, number> = {
+  cosine: 0,
+  escape: 1,
+};
 
 type RenderSettings = {
   pathType: PathType;
@@ -63,10 +72,6 @@ type RenderSettings = {
   tubularSegments: number;
   radialSegments: number;
   colorShift: number;
-  backLightEnabled: boolean;
-  backLightIntensity: number;
-  backLightRange: number;
-  backLightColor: string;
   edgeNeonEnabled: boolean;
   edgeNeonColor: string;
   edgeHueTravelEnabled: boolean;
@@ -82,10 +87,6 @@ type RenderSettings = {
   hidePipesInMainCamera: boolean;
   pipeMetalness: number;
   pipeRoughness: number;
-  glassEnabled: boolean;
-  glassTransmission: number;
-  glassOpacity: number;
-  glassIor: number;
   cornerTension: number;
   neonEnabled: boolean;
   neonStrength: number;
@@ -113,6 +114,28 @@ type RenderSettings = {
   prismVignette: number;
   prismScanlines: number;
   prismSpeed: number;
+  flowmapEnabled: boolean;
+  flowmapStrength: number;
+  flowmapViscosity: number;
+  fractalEnabled: boolean;
+  fractalStrength: number;
+  fractalIterations: number;
+  fractalZoom: number;
+  fractalCenterX: number;
+  fractalCenterY: number;
+  fractalCRe: number;
+  fractalCIm: number;
+  fractalMode: FractalMode;
+  fractalSegments: number;
+  fractalRotation: number;
+  fractalDomainMix: number;
+  fractalDomainFrequency: number;
+  fractalPaletteShift: number;
+  fractalColorScheme: FractalColorScheme;
+  curlEnabled: boolean;
+  curlStrength: number;
+  curlScale: number;
+  curlTimeRate: number;
 };
 
 type OrbitSettings = {
@@ -159,12 +182,7 @@ let mirrorReflectionMode: MirrorReflectionMode = 'all'; // how mirrors see each 
 let mirrorRenderer: MirrorRenderer = 'physicalRay';
 let mirrorBounceAttenuation = 0.65;
 let mirrorBounceAttenuationMode: 'skipFirst' | 'allBounces' = 'skipFirst';
-let mirrorBlurAmount = 0;
-let mirrorChromaticShift = 0;
 let mirrorWarpStrength = 0;
-let mirrorWarpSpeed = 1.5;
-let mirrorRefractionOffset = 0;
-let mirrorNoiseStrength = 0;
 const BASE_REFLECTOR_SHADER = (Reflector as any).ReflectorShader as any;
 const rand = (min: number, max: number) => Math.random() * (max - min) + min;
 const randInt = (min: number, max: number) => Math.floor(rand(min, max + 1));
@@ -271,15 +289,11 @@ const defaultSimConfig: SimulationConfig = {
 const turnProxy = { turnChance: defaultSimConfig.turnProbability * 100 };
 
 const renderSettings: RenderSettings = {
-  pathType: 'catmullrom',
+  pathType: 'polyline',
   pipeRadius: 0.08,
   tubularSegments: 16,
   radialSegments: 16,
   colorShift: 0,
-  backLightEnabled: false,
-  backLightIntensity: 1200,
-  backLightRange: 0,
-  backLightColor: '#ffffff',
   edgeNeonEnabled: true,
   edgeNeonColor: '#3de1ff',
   edgeHueTravelEnabled: false,
@@ -295,21 +309,17 @@ const renderSettings: RenderSettings = {
   hidePipesInMainCamera: true,
   pipeMetalness: 0.68,
   pipeRoughness: 0.3,
-  glassEnabled: false,
-  glassTransmission: 0.65,
-  glassOpacity: 0.35,
-  glassIor: 1.2,
   cornerTension: 0,
   neonEnabled: true,
   neonStrength: 0.69,
   neonSize: 1.0,
-  bloomStrength: 1,
+  bloomStrength: 0.2,
   bloomRadius: 1,
   bloomThreshold: 0,
   bloomResolutionScale: 0.5,
   bloomEnabled: true,
-  afterimageEnabled: false,
-  afterimageDamp: 0.96,
+  afterimageEnabled: true,
+  afterimageDamp: 0.42,
   bokehEnabled: false,
   bokehFocus: 32,
   bokehAperture: 0.0002,
@@ -317,7 +327,7 @@ const renderSettings: RenderSettings = {
   filmEnabled: false,
   filmIntensity: 0.35,
   filmGrayscale: false,
-  fxaaEnabled: false,
+  fxaaEnabled: true,
   prismEnabled: false,
   prismStrength: 0.35,
   prismWarp: 0.02,
@@ -326,6 +336,28 @@ const renderSettings: RenderSettings = {
   prismVignette: 0.35,
   prismScanlines: 0.12,
   prismSpeed: 1,
+  flowmapEnabled: false,
+  flowmapStrength: 0.22,
+  flowmapViscosity: 0.5,
+  fractalEnabled: false,
+  fractalStrength: 0.35,
+  fractalIterations: 48,
+  fractalZoom: 1.65,
+  fractalCenterX: 0,
+  fractalCenterY: 0,
+  fractalCRe: -0.70176,
+  fractalCIm: -0.3842,
+  fractalMode: 'julia',
+  fractalSegments: 1,
+  fractalRotation: 0,
+  fractalDomainMix: 0,
+  fractalDomainFrequency: 6,
+  fractalPaletteShift: 0,
+  fractalColorScheme: 'cosine',
+  curlEnabled: false,
+  curlStrength: 0.25,
+  curlScale: 2.25,
+  curlTimeRate: 0.45,
 };
 
 const mirrorGuiSettings = {
@@ -337,12 +369,7 @@ const mirrorGuiSettings = {
   renderer: mirrorRenderer,
   rayBounces: rayMaxBounces,
   reflectionMode: mirrorReflectionMode,
-  blur: mirrorBlurAmount,
-  chromaticShift: mirrorChromaticShift,
   warpStrength: mirrorWarpStrength,
-  warpSpeed: mirrorWarpSpeed,
-  refractionOffset: mirrorRefractionOffset,
-  noiseStrength: mirrorNoiseStrength,
   bounceAttenuation: mirrorBounceAttenuation,
   bounceAttenuationMode: mirrorBounceAttenuationMode,
 };
@@ -353,8 +380,8 @@ const orbitSettings: OrbitSettings = {
 };
 
 const wallDriftSettings = {
-  movement: 0.35,
-  bobStrength: 0.22,
+  movement: 0.05,
+  bobStrength: 0.05,
 };
 
 const railSettings = {
@@ -417,11 +444,6 @@ const camera = new PerspectiveCamera(100, initialWidth / initialHeight, 0.1, 500
 applyCameraZoom(cameraControl.zoomFactor);
 scene.add(camera);
 syncPipeVisibilityToMainCamera();
-const cameraLight = new PointLight(renderSettings.backLightColor, renderSettings.backLightIntensity, renderSettings.backLightRange, 2);
-// Restrict the camera light to the pipe layer so it lights pipes but doesn't hit room/mirror surfaces
-cameraLight.layers.set(PIPE_LAYER);
-cameraLight.visible = renderSettings.backLightEnabled;
-scene.add(cameraLight);
 
 const room = createRoom(defaultSimConfig.gridSize, renderSettings);
 scene.add(room.mesh);
@@ -438,12 +460,7 @@ function createMirrorSystem(kind: MirrorRenderer): MirrorSystem {
       inset: mirrorInset,
       resolution: mirrorTargetSize(),
       distortion: {
-        blur: mirrorBlurAmount,
-        chromaticShift: mirrorChromaticShift,
         warpStrength: mirrorWarpStrength,
-        warpSpeed: mirrorWarpSpeed,
-        refractionOffset: mirrorRefractionOffset,
-        noiseStrength: mirrorNoiseStrength,
         time: 0,
       },
       enabled: mirrorEnabled,
@@ -464,12 +481,7 @@ function createMirrorSystem(kind: MirrorRenderer): MirrorSystem {
       inset: mirrorInset,
       resolution: mirrorTargetSize(),
       distortion: {
-        blur: mirrorBlurAmount,
-        chromaticShift: mirrorChromaticShift,
         warpStrength: mirrorWarpStrength,
-        warpSpeed: mirrorWarpSpeed,
-        refractionOffset: mirrorRefractionOffset,
-        noiseStrength: mirrorNoiseStrength,
         time: 0,
       },
       enabled: mirrorEnabled,
@@ -490,12 +502,7 @@ function createMirrorSystem(kind: MirrorRenderer): MirrorSystem {
       inset: mirrorInset,
       resolution: mirrorTargetSize(),
       distortion: {
-        blur: mirrorBlurAmount,
-        chromaticShift: mirrorChromaticShift,
         warpStrength: mirrorWarpStrength,
-        warpSpeed: mirrorWarpSpeed,
-        refractionOffset: mirrorRefractionOffset,
-        noiseStrength: mirrorNoiseStrength,
         time: 0,
       },
       enabled: mirrorEnabled,
@@ -516,12 +523,7 @@ function createMirrorSystem(kind: MirrorRenderer): MirrorSystem {
     inset: mirrorInset,
     resolution: mirrorTargetSize(),
     distortion: {
-      blur: mirrorBlurAmount,
-      chromaticShift: mirrorChromaticShift,
       warpStrength: mirrorWarpStrength,
-      warpSpeed: mirrorWarpSpeed,
-      refractionOffset: mirrorRefractionOffset,
-      noiseStrength: mirrorNoiseStrength,
       time: 0,
     },
     enabled: mirrorEnabled,
@@ -545,6 +547,9 @@ let bokehPass!: BokehPass;
 let afterimagePass!: AfterimagePass;
 let filmPass!: FilmPass;
 let prismPass!: ShaderPass;
+let fractalPass!: ShaderPass;
+let curlPass!: ShaderPass;
+let flowmapPass!: ShaderPass;
 let outputPass!: OutputPass;
 let fxaaPass!: FXAAPass;
 let guiInstance: GUI | null = null;
@@ -598,6 +603,9 @@ bokehPass = new BokehPass(scene, camera, {
 });
 filmPass = new FilmPass(renderSettings.filmIntensity, renderSettings.filmGrayscale);
 prismPass = new ShaderPass(PrismWarpShader);
+fractalPass = new ShaderPass(FractalWarpShader);
+curlPass = new ShaderPass(CurlNoiseDisplacementShader);
+flowmapPass = new ShaderPass(FlowmapAdvectionShader);
 afterimagePass = new AfterimagePass(renderSettings.afterimageDamp);
 outputPass = new OutputPass();
 fxaaPass = new FXAAPass();
@@ -607,6 +615,9 @@ composer.addPass(bokehPass);
 composer.addPass(bloomPass);
 composer.addPass(filmPass);
 composer.addPass(prismPass);
+composer.addPass(fractalPass);
+composer.addPass(curlPass);
+composer.addPass(flowmapPass);
 composer.addPass(afterimagePass);
 composer.addPass(outputPass);
 composer.addPass(fxaaPass);
@@ -634,7 +645,6 @@ const WORLD_FORWARD = new Vector3(0, 0, 1);
 const CAMERA_MARGIN = 1.5;
 const CAMERA_WALL_EPS = 0.6;
 const camDir = new Vector3();
-const behind = new Vector3();
 const tmpToCenter = new Vector3();
 const wallNormals = [
   new Vector3(1, 0, 0),
@@ -701,6 +711,62 @@ function syncPrismUniforms() {
   uniforms.speed.value = clamp(renderSettings.prismSpeed, 0, 10);
 }
 
+function syncComplexPassResolutions(width?: number, height?: number) {
+  const bounds = width !== undefined && height !== undefined ? { width, height } : simBounds();
+  const pixelRatio = renderer.getPixelRatio();
+  const w = Math.max(1, Math.floor(bounds.width * pixelRatio));
+  const h = Math.max(1, Math.floor(bounds.height * pixelRatio));
+  for (const pass of [fractalPass, curlPass, flowmapPass]) {
+    const uniforms = pass?.uniforms as any;
+    if (uniforms?.resolution?.value?.set) uniforms.resolution.value.set(w, h);
+  }
+}
+
+function syncFractalUniforms() {
+  const uniforms = fractalPass?.uniforms as any;
+  if (!uniforms) return;
+  uniforms.strength.value = clamp(renderSettings.fractalStrength, 0, 2);
+  uniforms.iterations.value = clamp(renderSettings.fractalIterations, 1, 128);
+  const zoom = Number.isFinite(renderSettings.fractalZoom) ? renderSettings.fractalZoom : 1;
+  uniforms.zoom.value = Math.max(0.05, zoom);
+  if (uniforms.center?.value?.set) {
+    uniforms.center.value.set(
+      clamp(renderSettings.fractalCenterX, -2, 2),
+      clamp(renderSettings.fractalCenterY, -2, 2)
+    );
+  }
+  if (uniforms.c?.value?.set) {
+    uniforms.c.value.set(
+      clamp(renderSettings.fractalCRe, -2, 2),
+      clamp(renderSettings.fractalCIm, -2, 2)
+    );
+  }
+  uniforms.mode.value = renderSettings.fractalMode === 'mandelbrot' ? 1.0 : 0.0;
+  uniforms.segments.value = clamp(renderSettings.fractalSegments, 1, 64);
+  uniforms.rotation.value = renderSettings.fractalRotation;
+  uniforms.domainMix.value = clamp(renderSettings.fractalDomainMix, 0, 1);
+  uniforms.domainFrequency.value = clamp(renderSettings.fractalDomainFrequency, 0, 64);
+  uniforms.paletteShift.value = clamp(renderSettings.fractalPaletteShift, -2, 2);
+  if (uniforms.colorScheme) {
+    uniforms.colorScheme.value = FRACTAL_COLOR_SCHEME_MAP[renderSettings.fractalColorScheme] ?? 0;
+  }
+}
+
+function syncCurlUniforms() {
+  const uniforms = curlPass?.uniforms as any;
+  if (!uniforms) return;
+  uniforms.strength.value = clamp(renderSettings.curlStrength, 0, 2);
+  uniforms.curlScale.value = clamp(renderSettings.curlScale, 0.01, 30);
+  uniforms.timeRate.value = clamp(renderSettings.curlTimeRate, 0, 10);
+}
+
+function syncFlowmapUniforms() {
+  const uniforms = flowmapPass?.uniforms as any;
+  if (!uniforms) return;
+  uniforms.strength.value = clamp(renderSettings.flowmapStrength, 0, 2);
+  uniforms.viscosity.value = clamp(renderSettings.flowmapViscosity, 0, 1);
+}
+
 function syncPostProcessingPasses() {
   bokehPass.enabled = Boolean(renderSettings.bokehEnabled);
   renderSettings.bokehFocus = Math.max(0, renderSettings.bokehFocus);
@@ -722,6 +788,15 @@ function syncPostProcessingPasses() {
   prismPass.enabled = Boolean(renderSettings.prismEnabled);
   syncPrismUniforms();
 
+  fractalPass.enabled = Boolean(renderSettings.fractalEnabled);
+  syncFractalUniforms();
+
+  curlPass.enabled = Boolean(renderSettings.curlEnabled);
+  syncCurlUniforms();
+
+  flowmapPass.enabled = Boolean(renderSettings.flowmapEnabled);
+  syncFlowmapUniforms();
+
   afterimagePass.enabled = Boolean(renderSettings.afterimageEnabled);
   afterimagePass.damp = clamp(renderSettings.afterimageDamp, 0, 1);
 
@@ -734,18 +809,9 @@ function updateMirrorResolution() {
   roomMirrors.setResolution(width, height);
 }
 
-function updateMirrorBlur() {
-  roomMirrors.setBlur(mirrorBlurAmount);
-}
-
 function updateMirrorDistortionUniforms(time: number) {
   roomMirrors.setDistortion({
-    blur: mirrorBlurAmount,
-    chromaticShift: mirrorChromaticShift,
     warpStrength: mirrorWarpStrength,
-    warpSpeed: mirrorWarpSpeed,
-    refractionOffset: mirrorRefractionOffset,
-    noiseStrength: mirrorNoiseStrength,
     time,
   });
 }
@@ -807,6 +873,7 @@ function resize() {
   composer.setSize(width, height);
   updateBloomResolution(width, height);
   syncPrismResolution(width, height);
+  syncComplexPassResolutions(width, height);
   updateMirrorResolution();
 }
 
@@ -1077,12 +1144,6 @@ function stepFrame(dt: number) {
     camera.rotateZ(roll);
   }
   camera.getWorldDirection(camDir);
-  behind.copy(camDir).multiplyScalar(-0.6);
-  cameraLight.position.copy(camera.position).add(behind);
-  cameraLight.intensity = renderSettings.backLightIntensity;
-  cameraLight.distance = renderSettings.backLightRange;
-  cameraLight.visible = renderSettings.backLightEnabled;
-  (cameraLight.color as Color).set(renderSettings.backLightColor);
 
   pipeManager.sync(sim.pipes, renderSettings);
   edgeNeons.sync(room.size, mirrorInset, renderSettings, state.elapsed);
@@ -1096,6 +1157,12 @@ function stepFrame(dt: number) {
   lastCameraMode = cameraControl.mode;
   const prismUniforms = prismPass?.uniforms as any;
   if (prismUniforms?.time) prismUniforms.time.value = state.elapsed;
+  const fractalUniforms = fractalPass?.uniforms as any;
+  if (fractalUniforms?.time) fractalUniforms.time.value = state.elapsed;
+  const curlUniforms = curlPass?.uniforms as any;
+  if (curlUniforms?.time) curlUniforms.time.value = state.elapsed;
+  const flowmapUniforms = flowmapPass?.uniforms as any;
+  if (flowmapUniforms?.time) flowmapUniforms.time.value = state.elapsed;
   composer.render(dt);
 }
 
@@ -1528,25 +1595,6 @@ function setupGui() {
   pipeFolder.add(renderSettings, 'neonSize', 0.98, 1.2, 0.005).name('Neon size').onChange(() => {
     modulationBaseSetters['pipes.neonSize']?.(renderSettings.neonSize);
   });
-  pipeFolder.add(renderSettings, 'glassEnabled').name('Glass mode').onChange((enabled: boolean) => {
-    renderSettings.glassEnabled = enabled;
-    updatePipeMaterial(renderSettings);
-  });
-  pipeFolder.add(renderSettings, 'glassTransmission', 0, 1, 0.01).name('Glass transmission').onChange((v: number) => {
-    renderSettings.glassTransmission = v;
-    updatePipeMaterial(renderSettings);
-    modulationBaseSetters['pipes.glassTransmission']?.(v);
-  });
-  pipeFolder.add(renderSettings, 'glassOpacity', 0, 1, 0.01).name('Glass opacity').onChange((v: number) => {
-    renderSettings.glassOpacity = v;
-    updatePipeMaterial(renderSettings);
-    modulationBaseSetters['pipes.glassOpacity']?.(v);
-  });
-  pipeFolder.add(renderSettings, 'glassIor', 1, 2.5, 0.01).name('Glass IOR').onChange((v: number) => {
-    renderSettings.glassIor = v;
-    updatePipeMaterial(renderSettings);
-    modulationBaseSetters['pipes.glassIor']?.(v);
-  });
 
   const edgeNeonFolder = gui.addFolder('Edge neon');
   edgeNeonFolder.add(renderSettings, 'edgeNeonEnabled').name('Enabled (shares neon size)');
@@ -1606,7 +1654,7 @@ function setupGui() {
       Raster: 'raster',
       'Ray (experimental)': 'ray',
       'Ray (all faces)': 'rayAllFaces',
-      'Ray tunnel (recursive)': 'physicalRay',
+      'Ray (recursive)': 'physicalRay',
     })
     .name('Renderer')
     .onChange((v: MirrorRenderer) => {
@@ -1614,7 +1662,6 @@ function setupGui() {
       roomMirrors.dispose();
       roomMirrors = createMirrorSystem(v);
       updateMirrorResolution();
-      updateMirrorBlur();
       updateMirrorDistortionUniforms(state.elapsed);
       updateMirrorMask();
     });
@@ -1628,7 +1675,6 @@ function setupGui() {
         roomMirrors.dispose();
         roomMirrors = createMirrorSystem(mirrorRenderer);
         updateMirrorResolution();
-        updateMirrorBlur();
         updateMirrorDistortionUniforms(state.elapsed);
         updateMirrorMask();
       }
@@ -1643,7 +1689,6 @@ function setupGui() {
         roomMirrors.dispose();
         roomMirrors = createMirrorSystem(mirrorRenderer);
         updateMirrorResolution();
-        updateMirrorBlur();
         updateMirrorDistortionUniforms(state.elapsed);
         updateMirrorMask();
       }
@@ -1660,7 +1705,6 @@ function setupGui() {
         roomMirrors.dispose();
         roomMirrors = createMirrorSystem(mirrorRenderer);
         updateMirrorResolution();
-        updateMirrorBlur();
         updateMirrorDistortionUniforms(state.elapsed);
         updateMirrorMask();
       }
@@ -1685,47 +1729,11 @@ function setupGui() {
       modulationBaseSetters['mirror.inset']?.(mirrorInset);
     });
   mirrorFolder
-    .add(mirrorGuiSettings, 'blur', 0, 1, 0.01)
-    .name('Radial blur')
-    .onChange((v: number) => {
-      mirrorBlurAmount = Math.max(0, Math.min(1, v));
-      updateMirrorBlur();
-      modulationBaseSetters['mirror.blur']?.(mirrorBlurAmount);
-    });
-  mirrorFolder
-    .add(mirrorGuiSettings, 'chromaticShift', 0, 0.1, 0.0005)
-    .name('Chromatic shift')
-    .onChange((v: number) => {
-      mirrorChromaticShift = Math.max(0, v);
-      modulationBaseSetters['mirror.chromaticShift']?.(mirrorChromaticShift);
-    });
-  mirrorFolder
     .add(mirrorGuiSettings, 'warpStrength', 0, 0.05, 0.0005)
     .name('Warp strength')
     .onChange((v: number) => {
       mirrorWarpStrength = Math.max(0, v);
       modulationBaseSetters['mirror.warpStrength']?.(mirrorWarpStrength);
-    });
-  mirrorFolder
-    .add(mirrorGuiSettings, 'warpSpeed', 0, 5, 0.05)
-    .name('Warp speed')
-    .onChange((v: number) => {
-      mirrorWarpSpeed = Math.max(0, v);
-      modulationBaseSetters['mirror.warpSpeed']?.(mirrorWarpSpeed);
-    });
-  mirrorFolder
-    .add(mirrorGuiSettings, 'refractionOffset', -0.05, 0.05, 0.0005)
-    .name('Refraction offset')
-    .onChange((v: number) => {
-      mirrorRefractionOffset = v;
-      modulationBaseSetters['mirror.refractionOffset']?.(mirrorRefractionOffset);
-    });
-  mirrorFolder
-    .add(mirrorGuiSettings, 'noiseStrength', 0, 0.01, 0.0002)
-    .name('Noise shimmer')
-    .onChange((v: number) => {
-      mirrorNoiseStrength = Math.max(0, v);
-      modulationBaseSetters['mirror.noiseStrength']?.(mirrorNoiseStrength);
     });
   mirrorFolder
     .add(mirrorGuiSettings, 'maxResolution', 256, 4096 * 4, 64)
@@ -1742,30 +1750,8 @@ function setupGui() {
       mirrorFacesPerFrame = Math.max(1, Math.floor(v));
       modulationBaseSetters['mirror.facesPerFrame']?.(mirrorFacesPerFrame);
     });
-  updateMirrorBlur();
   mirrorFolder.add(renderSettings, 'showGrid').name('Show grid').onChange((visible: boolean) => {
     gridLines.visible = visible;
-  });
-
-  const camLightFolder = gui.addFolder('Camera light');
-  camLightFolder.add(renderSettings, 'backLightEnabled').name('Enabled');
-  camLightFolder
-    .add(renderSettings, 'backLightIntensity', 0, 1200, 0.1)
-    .name('Intensity')
-    .onChange((v: number) => {
-      cameraLight.intensity = v;
-      modulationBaseSetters['light.backIntensity']?.(v);
-    });
-  camLightFolder
-    .add(renderSettings, 'backLightRange', 0, 420, 1)
-    .name('Range (0=inf)')
-    .onChange((v: number) => {
-      cameraLight.distance = v;
-      modulationBaseSetters['light.backRange']?.(v);
-    });
-  camLightFolder.addColor(renderSettings, 'backLightColor').name('Color').onChange((v: string) => {
-    cameraLight.color.set(v);
-    modulationBaseSetters['light.backHue']?.(hueFromHex(renderSettings.backLightColor));
   });
 
   const cameraFolder = gui.addFolder('Camera');
@@ -2048,6 +2034,282 @@ function setupGui() {
     modulationBaseSetters['post.prismSpeed']?.(renderSettings.prismSpeed);
   });
 
+  const experimentalFolder = postFolder.addFolder('Experimental');
+
+  const flowmapFolder = experimentalFolder.addFolder('Flowmap Advection');
+  flowmapFolder.add(renderSettings, 'flowmapEnabled').name('Enabled').onChange((v: boolean) => {
+    renderSettings.flowmapEnabled = v;
+    flowmapPass.enabled = v;
+    modulationBaseSetters['post.flowmapEnabled']?.(Number(v));
+  });
+  flowmapFolder.add(renderSettings, 'flowmapStrength', 0, 2, 0.01).name('Strength').onChange((v: number) => {
+    renderSettings.flowmapStrength = clamp(v, 0, 2);
+    syncFlowmapUniforms();
+    modulationBaseSetters['post.flowmapStrength']?.(renderSettings.flowmapStrength);
+  });
+  flowmapFolder.add(renderSettings, 'flowmapViscosity', 0, 1, 0.01).name('Viscosity').onChange((v: number) => {
+    renderSettings.flowmapViscosity = clamp(v, 0, 1);
+    syncFlowmapUniforms();
+    modulationBaseSetters['post.flowmapViscosity']?.(renderSettings.flowmapViscosity);
+  });
+
+  const fractalFolder = experimentalFolder.addFolder('Fractal Warp');
+  fractalFolder.add(renderSettings, 'fractalEnabled').name('Enabled').onChange((v: boolean) => {
+    renderSettings.fractalEnabled = v;
+    fractalPass.enabled = v;
+    modulationBaseSetters['post.fractalEnabled']?.(Number(v));
+  });
+  fractalFolder.add(renderSettings, 'fractalStrength', 0, 2, 0.01).name('Strength').onChange((v: number) => {
+    renderSettings.fractalStrength = clamp(v, 0, 2);
+    syncFractalUniforms();
+    modulationBaseSetters['post.fractalStrength']?.(renderSettings.fractalStrength);
+  });
+  fractalFolder
+    .add(renderSettings, 'fractalMode', { Julia: 'julia', Mandelbrot: 'mandelbrot' })
+    .name('Mode')
+    .onChange((v: FractalMode) => {
+      renderSettings.fractalMode = v;
+      syncFractalUniforms();
+      modulationBaseSetters['post.fractalMode']?.(v === 'mandelbrot' ? 1 : 0);
+    });
+  fractalFolder.add(renderSettings, 'fractalIterations', 1, 128, 1).name('Iterations').onChange((v: number) => {
+    renderSettings.fractalIterations = clamp(Math.round(v), 1, 128);
+    syncFractalUniforms();
+    modulationBaseSetters['post.fractalIterations']?.(renderSettings.fractalIterations);
+  });
+  fractalFolder.add(renderSettings, 'fractalZoom').name('Zoom').onChange((v: number) => {
+    renderSettings.fractalZoom = Math.max(0.05, v);
+    syncFractalUniforms();
+    modulationBaseSetters['post.fractalZoom']?.(renderSettings.fractalZoom);
+  });
+  fractalFolder.add(renderSettings, 'fractalCRe', -1.5, 1.5, 0.0001).name('c.re').onChange((v: number) => {
+    renderSettings.fractalCRe = clamp(v, -2, 2);
+    syncFractalUniforms();
+    modulationBaseSetters['post.fractalCRe']?.(renderSettings.fractalCRe);
+  });
+  fractalFolder.add(renderSettings, 'fractalCIm', -1.5, 1.5, 0.0001).name('c.im').onChange((v: number) => {
+    renderSettings.fractalCIm = clamp(v, -2, 2);
+    syncFractalUniforms();
+    modulationBaseSetters['post.fractalCIm']?.(renderSettings.fractalCIm);
+  });
+  fractalFolder.add(renderSettings, 'fractalCenterX', -2, 2, 0.001).name('Center X').onChange((v: number) => {
+    renderSettings.fractalCenterX = clamp(v, -2, 2);
+    syncFractalUniforms();
+    modulationBaseSetters['post.fractalCenterX']?.(renderSettings.fractalCenterX);
+  });
+  fractalFolder.add(renderSettings, 'fractalCenterY', -2, 2, 0.001).name('Center Y').onChange((v: number) => {
+    renderSettings.fractalCenterY = clamp(v, -2, 2);
+    syncFractalUniforms();
+    modulationBaseSetters['post.fractalCenterY']?.(renderSettings.fractalCenterY);
+  });
+  fractalFolder.add(renderSettings, 'fractalSegments', 1, 24, 1).name('Segments').onChange((v: number) => {
+    renderSettings.fractalSegments = clamp(Math.round(v), 1, 64);
+    syncFractalUniforms();
+    modulationBaseSetters['post.fractalSegments']?.(renderSettings.fractalSegments);
+  });
+  fractalFolder.add(renderSettings, 'fractalRotation', -Math.PI, Math.PI, 0.001).name('Rotation').onChange((v: number) => {
+    renderSettings.fractalRotation = v;
+    syncFractalUniforms();
+    modulationBaseSetters['post.fractalRotation']?.(renderSettings.fractalRotation);
+  });
+
+  const applyFractalPreset = (preset: Partial<RenderSettings>) => {
+    Object.assign(renderSettings, preset);
+    renderSettings.fractalStrength = clamp(renderSettings.fractalStrength, 0, 2);
+    renderSettings.fractalIterations = clamp(Math.round(renderSettings.fractalIterations), 1, 128);
+    renderSettings.fractalZoom = Math.max(0.05, renderSettings.fractalZoom);
+    renderSettings.fractalCenterX = clamp(renderSettings.fractalCenterX, -2, 2);
+    renderSettings.fractalCenterY = clamp(renderSettings.fractalCenterY, -2, 2);
+    renderSettings.fractalCRe = clamp(renderSettings.fractalCRe, -2, 2);
+    renderSettings.fractalCIm = clamp(renderSettings.fractalCIm, -2, 2);
+    renderSettings.fractalSegments = clamp(Math.round(renderSettings.fractalSegments), 1, 64);
+    renderSettings.fractalDomainMix = clamp(renderSettings.fractalDomainMix, 0, 1);
+    renderSettings.fractalDomainFrequency = clamp(renderSettings.fractalDomainFrequency, 0, 64);
+    renderSettings.fractalPaletteShift = clamp(renderSettings.fractalPaletteShift, -2, 2);
+
+    syncPostProcessingPasses();
+
+    modulationBaseSetters['post.fractalEnabled']?.(Number(renderSettings.fractalEnabled));
+    modulationBaseSetters['post.fractalStrength']?.(renderSettings.fractalStrength);
+    modulationBaseSetters['post.fractalMode']?.(renderSettings.fractalMode === 'mandelbrot' ? 1 : 0);
+    modulationBaseSetters['post.fractalIterations']?.(renderSettings.fractalIterations);
+    modulationBaseSetters['post.fractalZoom']?.(renderSettings.fractalZoom);
+    modulationBaseSetters['post.fractalCRe']?.(renderSettings.fractalCRe);
+    modulationBaseSetters['post.fractalCIm']?.(renderSettings.fractalCIm);
+    modulationBaseSetters['post.fractalCenterX']?.(renderSettings.fractalCenterX);
+    modulationBaseSetters['post.fractalCenterY']?.(renderSettings.fractalCenterY);
+    modulationBaseSetters['post.fractalSegments']?.(renderSettings.fractalSegments);
+    modulationBaseSetters['post.fractalRotation']?.(renderSettings.fractalRotation);
+    modulationBaseSetters['post.fractalDomainMix']?.(renderSettings.fractalDomainMix);
+    modulationBaseSetters['post.fractalDomainFrequency']?.(renderSettings.fractalDomainFrequency);
+    modulationBaseSetters['post.fractalPaletteShift']?.(renderSettings.fractalPaletteShift);
+
+    for (const controller of gui.controllersRecursive()) {
+      controller.updateDisplay();
+    }
+  };
+
+  const poiFolder = fractalFolder.addFolder('Points of Interest');
+  const poiActions = {
+    juliaClassic: () =>
+      applyFractalPreset({
+        fractalEnabled: true,
+        fractalMode: 'julia',
+        fractalCRe: -0.70176,
+        fractalCIm: -0.3842,
+        fractalCenterX: 0,
+        fractalCenterY: 0,
+        fractalZoom: 1.65,
+        fractalIterations: 64,
+        fractalStrength: 0.85,
+        fractalColorScheme: 'cosine',
+        fractalDomainMix: 0.35,
+        fractalDomainFrequency: 6,
+        fractalPaletteShift: 0,
+        fractalSegments: 1,
+        fractalRotation: 0,
+      }),
+    juliaRabbit: () =>
+      applyFractalPreset({
+        fractalEnabled: true,
+        fractalMode: 'julia',
+        fractalCRe: -0.123,
+        fractalCIm: 0.745,
+        fractalCenterX: 0,
+        fractalCenterY: 0,
+        fractalZoom: 1.8,
+        fractalIterations: 96,
+        fractalStrength: 0.9,
+        fractalColorScheme: 'cosine',
+        fractalDomainMix: 0.45,
+        fractalDomainFrequency: 10,
+        fractalPaletteShift: 0,
+        fractalSegments: 1,
+        fractalRotation: 0,
+      }),
+    juliaSpiral: () =>
+      applyFractalPreset({
+        fractalEnabled: true,
+        fractalMode: 'julia',
+        fractalCRe: -0.8,
+        fractalCIm: 0.156,
+        fractalCenterX: 0,
+        fractalCenterY: 0,
+        fractalZoom: 2.05,
+        fractalIterations: 96,
+        fractalStrength: 0.95,
+        fractalColorScheme: 'escape',
+        fractalDomainMix: 0.4,
+        fractalDomainFrequency: 9,
+        fractalPaletteShift: 0.05,
+        fractalSegments: 1,
+        fractalRotation: 0,
+      }),
+    mandelbrotSeahorse: () =>
+      applyFractalPreset({
+        fractalEnabled: true,
+        fractalMode: 'mandelbrot',
+        fractalCenterX: -0.743643887,
+        fractalCenterY: 0.131825904,
+        fractalZoom: 1800,
+        fractalIterations: 128,
+        fractalStrength: 1.1,
+        fractalColorScheme: 'escape',
+        fractalDomainMix: 0.55,
+        fractalDomainFrequency: 12,
+        fractalPaletteShift: 0.1,
+        fractalSegments: 1,
+        fractalRotation: 0,
+      }),
+    mandelbrotElephant: () =>
+      applyFractalPreset({
+        fractalEnabled: true,
+        fractalMode: 'mandelbrot',
+        fractalCenterX: 0.285,
+        fractalCenterY: 0.01,
+        fractalZoom: 1200,
+        fractalIterations: 128,
+        fractalStrength: 1.05,
+        fractalColorScheme: 'cosine',
+        fractalDomainMix: 0.5,
+        fractalDomainFrequency: 9,
+        fractalPaletteShift: 0,
+        fractalSegments: 1,
+        fractalRotation: 0,
+      }),
+    mandelbrotSpiral: () =>
+      applyFractalPreset({
+        fractalEnabled: true,
+        fractalMode: 'mandelbrot',
+        fractalCenterX: -0.761574,
+        fractalCenterY: -0.0847596,
+        fractalZoom: 2600,
+        fractalIterations: 128,
+        fractalStrength: 1.15,
+        fractalColorScheme: 'escape',
+        fractalDomainMix: 0.55,
+        fractalDomainFrequency: 14,
+        fractalPaletteShift: 0.15,
+        fractalSegments: 1,
+        fractalRotation: 0,
+      }),
+  };
+  poiFolder.add(poiActions, 'juliaClassic').name('Julia: Classic');
+  poiFolder.add(poiActions, 'juliaRabbit').name('Julia: Rabbit');
+  poiFolder.add(poiActions, 'juliaSpiral').name('Julia: Spiral');
+  poiFolder.add(poiActions, 'mandelbrotSeahorse').name('Mandelbrot: Seahorse Valley');
+  poiFolder.add(poiActions, 'mandelbrotElephant').name('Mandelbrot: Elephant Valley');
+  poiFolder.add(poiActions, 'mandelbrotSpiral').name('Mandelbrot: Spiral');
+
+  const domainFolder = fractalFolder.addFolder('Domain Color');
+  domainFolder
+    .add(renderSettings, 'fractalColorScheme', {
+      Cosine: 'cosine',
+      'Escape Time': 'escape',
+    })
+    .name('Scheme')
+    .onChange((v: FractalColorScheme) => {
+      renderSettings.fractalColorScheme = v;
+      syncFractalUniforms();
+    });
+  domainFolder.add(renderSettings, 'fractalDomainMix', 0, 1, 0.01).name('Mix').onChange((v: number) => {
+    renderSettings.fractalDomainMix = clamp(v, 0, 1);
+    syncFractalUniforms();
+    modulationBaseSetters['post.fractalDomainMix']?.(renderSettings.fractalDomainMix);
+  });
+  domainFolder.add(renderSettings, 'fractalDomainFrequency', 0, 20, 0.01).name('Frequency').onChange((v: number) => {
+    renderSettings.fractalDomainFrequency = clamp(v, 0, 64);
+    syncFractalUniforms();
+    modulationBaseSetters['post.fractalDomainFrequency']?.(renderSettings.fractalDomainFrequency);
+  });
+  domainFolder.add(renderSettings, 'fractalPaletteShift', -1, 1, 0.001).name('Palette shift').onChange((v: number) => {
+    renderSettings.fractalPaletteShift = clamp(v, -2, 2);
+    syncFractalUniforms();
+    modulationBaseSetters['post.fractalPaletteShift']?.(renderSettings.fractalPaletteShift);
+  });
+
+  const curlFolder = experimentalFolder.addFolder('Curl Noise Displacement');
+  curlFolder.add(renderSettings, 'curlEnabled').name('Enabled').onChange((v: boolean) => {
+    renderSettings.curlEnabled = v;
+    curlPass.enabled = v;
+    modulationBaseSetters['post.curlEnabled']?.(Number(v));
+  });
+  curlFolder.add(renderSettings, 'curlStrength', 0, 2, 0.01).name('Strength').onChange((v: number) => {
+    renderSettings.curlStrength = clamp(v, 0, 2);
+    syncCurlUniforms();
+    modulationBaseSetters['post.curlStrength']?.(renderSettings.curlStrength);
+  });
+  curlFolder.add(renderSettings, 'curlScale', 0.1, 10, 0.01).name('Curl scale').onChange((v: number) => {
+    renderSettings.curlScale = clamp(v, 0.01, 30);
+    syncCurlUniforms();
+    modulationBaseSetters['post.curlScale']?.(renderSettings.curlScale);
+  });
+  curlFolder.add(renderSettings, 'curlTimeRate', 0, 2.5, 0.01).name('Time rate').onChange((v: number) => {
+    renderSettings.curlTimeRate = clamp(v, 0, 10);
+    syncCurlUniforms();
+    modulationBaseSetters['post.curlTimeRate']?.(renderSettings.curlTimeRate);
+  });
+
 }
 
 function setupModulationTargets() {
@@ -2189,27 +2451,6 @@ function setupModulationTargets() {
       roomMirrors.update(room.size, renderSettings.roomColor);
     },
   });
-  register('mirror.blur', 'Mirrors', 'Blur', {
-    min: 0,
-    max: 1,
-    range: 1,
-    get: () => mirrorBlurAmount,
-    set: (v: number) => {
-      mirrorBlurAmount = clamp(v, 0, 1);
-      mirrorGuiSettings.blur = mirrorBlurAmount;
-      updateMirrorBlur();
-    },
-  });
-  register('mirror.chromaticShift', 'Mirrors', 'Chromatic shift', {
-    min: 0,
-    max: 0.1,
-    range: 0.1,
-    get: () => mirrorChromaticShift,
-    set: (v: number) => {
-      mirrorChromaticShift = clamp(v, 0, 0.1);
-      mirrorGuiSettings.chromaticShift = mirrorChromaticShift;
-    },
-  });
   register('mirror.warpStrength', 'Mirrors', 'Warp strength', {
     min: 0,
     max: 0.05,
@@ -2218,36 +2459,6 @@ function setupModulationTargets() {
     set: (v: number) => {
       mirrorWarpStrength = clamp(v, 0, 0.05);
       mirrorGuiSettings.warpStrength = mirrorWarpStrength;
-    },
-  });
-  register('mirror.warpSpeed', 'Mirrors', 'Warp speed', {
-    min: 0,
-    max: 5,
-    range: 5,
-    get: () => mirrorWarpSpeed,
-    set: (v: number) => {
-      mirrorWarpSpeed = clamp(v, 0, 5);
-      mirrorGuiSettings.warpSpeed = mirrorWarpSpeed;
-    },
-  });
-  register('mirror.refractionOffset', 'Mirrors', 'Refraction offset', {
-    min: -0.05,
-    max: 0.05,
-    range: 0.1,
-    get: () => mirrorRefractionOffset,
-    set: (v: number) => {
-      mirrorRefractionOffset = clamp(v, -0.05, 0.05);
-      mirrorGuiSettings.refractionOffset = mirrorRefractionOffset;
-    },
-  });
-  register('mirror.noiseStrength', 'Mirrors', 'Shimmer', {
-    min: 0,
-    max: 0.01,
-    range: 0.01,
-    get: () => mirrorNoiseStrength,
-    set: (v: number) => {
-      mirrorNoiseStrength = clamp(v, 0, 0.01);
-      mirrorGuiSettings.noiseStrength = mirrorNoiseStrength;
     },
   });
   register('mirror.maxResolution', 'Mirrors', 'Max resolution', {
@@ -2360,7 +2571,7 @@ function setupModulationTargets() {
     get: () => renderSettings.pipeMetalness,
     set: (v: number) => {
       renderSettings.pipeMetalness = clamp(v, 0, 1);
-      if (!renderSettings.glassEnabled) pipeMaterial.metalness = renderSettings.pipeMetalness;
+      pipeMaterial.metalness = renderSettings.pipeMetalness;
     },
   });
   register('pipes.roughness', 'Pipes', 'Roughness', {
@@ -2370,37 +2581,7 @@ function setupModulationTargets() {
     get: () => renderSettings.pipeRoughness,
     set: (v: number) => {
       renderSettings.pipeRoughness = clamp(v, 0, 1);
-      if (!renderSettings.glassEnabled) pipeMaterial.roughness = renderSettings.pipeRoughness;
-    },
-  });
-  register('pipes.glassTransmission', 'Pipes', 'Glass transmission', {
-    min: 0,
-    max: 1,
-    range: 1,
-    get: () => renderSettings.glassTransmission,
-    set: (v: number) => {
-      renderSettings.glassTransmission = clamp(v, 0, 1);
-      updatePipeMaterial(renderSettings);
-    },
-  });
-  register('pipes.glassOpacity', 'Pipes', 'Glass opacity', {
-    min: 0,
-    max: 1,
-    range: 1,
-    get: () => renderSettings.glassOpacity,
-    set: (v: number) => {
-      renderSettings.glassOpacity = clamp(v, 0, 1);
-      updatePipeMaterial(renderSettings);
-    },
-  });
-  register('pipes.glassIor', 'Pipes', 'Glass IOR', {
-    min: 1,
-    max: 2.5,
-    range: 1.5,
-    get: () => renderSettings.glassIor,
-    set: (v: number) => {
-      renderSettings.glassIor = clamp(v, 1, 2.5);
-      updatePipeMaterial(renderSettings);
+      pipeMaterial.roughness = renderSettings.pipeRoughness;
     },
   });
   register('pipes.neonStrength', 'Pipes', 'Neon strength', {
@@ -2419,38 +2600,6 @@ function setupModulationTargets() {
     get: () => renderSettings.neonSize,
     set: (v: number) => {
       renderSettings.neonSize = clamp(v, 0.98, 1.2);
-    },
-  });
-
-  register('light.backHue', 'Lighting', 'Camera light hue', {
-    min: 0,
-    max: 1,
-    range: 1,
-    get: () => hueFromHex(renderSettings.backLightColor),
-    set: (v: number) => {
-      const next = applyHueToHex(renderSettings.backLightColor, v);
-      renderSettings.backLightColor = next;
-      cameraLight.color.set(next);
-    },
-  });
-  register('light.backIntensity', 'Lighting', 'Camera light intensity', {
-    min: 0,
-    max: 1200,
-    range: 1200,
-    get: () => renderSettings.backLightIntensity,
-    set: (v: number) => {
-      renderSettings.backLightIntensity = clamp(v, 0, 1200);
-      cameraLight.intensity = renderSettings.backLightIntensity;
-    },
-  });
-  register('light.backRange', 'Lighting', 'Camera light range', {
-    min: 0,
-    max: 420,
-    range: 420,
-    get: () => renderSettings.backLightRange,
-    set: (v: number) => {
-      renderSettings.backLightRange = clamp(v, 0, 420);
-      cameraLight.distance = renderSettings.backLightRange;
     },
   });
 
@@ -2676,6 +2825,218 @@ function setupModulationTargets() {
     set: (v: number) => {
       renderSettings.afterimageDamp = clamp(v, 0, 1);
       afterimagePass.damp = renderSettings.afterimageDamp;
+    },
+  });
+
+  register('post.flowmapEnabled', 'Post FX', 'Flowmap advection enabled', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => Number(renderSettings.flowmapEnabled),
+    set: (v: number) => {
+      renderSettings.flowmapEnabled = v >= 0.5;
+      flowmapPass.enabled = renderSettings.flowmapEnabled;
+    },
+  });
+  register('post.flowmapStrength', 'Post FX', 'Flowmap strength', {
+    min: 0,
+    max: 2,
+    range: 2,
+    get: () => renderSettings.flowmapStrength,
+    set: (v: number) => {
+      renderSettings.flowmapStrength = clamp(v, 0, 2);
+      syncFlowmapUniforms();
+    },
+  });
+  register('post.flowmapViscosity', 'Post FX', 'Flowmap viscosity', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.flowmapViscosity,
+    set: (v: number) => {
+      renderSettings.flowmapViscosity = clamp(v, 0, 1);
+      syncFlowmapUniforms();
+    },
+  });
+
+  register('post.fractalEnabled', 'Post FX', 'Fractal warp enabled', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => Number(renderSettings.fractalEnabled),
+    set: (v: number) => {
+      renderSettings.fractalEnabled = v >= 0.5;
+      fractalPass.enabled = renderSettings.fractalEnabled;
+    },
+  });
+  register('post.fractalStrength', 'Post FX', 'Fractal warp strength', {
+    min: 0,
+    max: 2,
+    range: 2,
+    get: () => renderSettings.fractalStrength,
+    set: (v: number) => {
+      renderSettings.fractalStrength = clamp(v, 0, 2);
+      syncFractalUniforms();
+    },
+  });
+  register('post.fractalMode', 'Post FX', 'Fractal mode (0=julia, 1=mandelbrot)', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => (renderSettings.fractalMode === 'mandelbrot' ? 1 : 0),
+    set: (v: number) => {
+      renderSettings.fractalMode = v >= 0.5 ? 'mandelbrot' : 'julia';
+      syncFractalUniforms();
+    },
+  });
+  register('post.fractalIterations', 'Post FX', 'Fractal iterations', {
+    min: 1,
+    max: 128,
+    range: 128,
+    get: () => renderSettings.fractalIterations,
+    set: (v: number) => {
+      renderSettings.fractalIterations = clamp(Math.round(v), 1, 128);
+      syncFractalUniforms();
+    },
+  });
+  register('post.fractalZoom', 'Post FX', 'Fractal zoom', {
+    min: 0.05,
+    range: 8,
+    get: () => renderSettings.fractalZoom,
+    set: (v: number) => {
+      renderSettings.fractalZoom = Math.max(0.05, v);
+      syncFractalUniforms();
+    },
+  });
+  register('post.fractalCRe', 'Post FX', 'Fractal c.re', {
+    min: -1.5,
+    max: 1.5,
+    range: 3,
+    get: () => renderSettings.fractalCRe,
+    set: (v: number) => {
+      renderSettings.fractalCRe = clamp(v, -2, 2);
+      syncFractalUniforms();
+    },
+  });
+  register('post.fractalCIm', 'Post FX', 'Fractal c.im', {
+    min: -1.5,
+    max: 1.5,
+    range: 3,
+    get: () => renderSettings.fractalCIm,
+    set: (v: number) => {
+      renderSettings.fractalCIm = clamp(v, -2, 2);
+      syncFractalUniforms();
+    },
+  });
+  register('post.fractalCenterX', 'Post FX', 'Fractal center X', {
+    min: -2,
+    max: 2,
+    range: 4,
+    get: () => renderSettings.fractalCenterX,
+    set: (v: number) => {
+      renderSettings.fractalCenterX = clamp(v, -2, 2);
+      syncFractalUniforms();
+    },
+  });
+  register('post.fractalCenterY', 'Post FX', 'Fractal center Y', {
+    min: -2,
+    max: 2,
+    range: 4,
+    get: () => renderSettings.fractalCenterY,
+    set: (v: number) => {
+      renderSettings.fractalCenterY = clamp(v, -2, 2);
+      syncFractalUniforms();
+    },
+  });
+  register('post.fractalSegments', 'Post FX', 'Fractal segments', {
+    min: 1,
+    max: 24,
+    range: 23,
+    get: () => renderSettings.fractalSegments,
+    set: (v: number) => {
+      renderSettings.fractalSegments = clamp(Math.round(v), 1, 64);
+      syncFractalUniforms();
+    },
+  });
+  register('post.fractalRotation', 'Post FX', 'Fractal rotation', {
+    min: -Math.PI,
+    max: Math.PI,
+    range: Math.PI * 2,
+    get: () => renderSettings.fractalRotation,
+    set: (v: number) => {
+      renderSettings.fractalRotation = v;
+      syncFractalUniforms();
+    },
+  });
+  register('post.fractalDomainMix', 'Post FX', 'Fractal domain mix', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.fractalDomainMix,
+    set: (v: number) => {
+      renderSettings.fractalDomainMix = clamp(v, 0, 1);
+      syncFractalUniforms();
+    },
+  });
+  register('post.fractalDomainFrequency', 'Post FX', 'Fractal domain frequency', {
+    min: 0,
+    max: 20,
+    range: 20,
+    get: () => renderSettings.fractalDomainFrequency,
+    set: (v: number) => {
+      renderSettings.fractalDomainFrequency = clamp(v, 0, 64);
+      syncFractalUniforms();
+    },
+  });
+  register('post.fractalPaletteShift', 'Post FX', 'Fractal palette shift', {
+    min: -1,
+    max: 1,
+    range: 2,
+    get: () => renderSettings.fractalPaletteShift,
+    set: (v: number) => {
+      renderSettings.fractalPaletteShift = clamp(v, -2, 2);
+      syncFractalUniforms();
+    },
+  });
+
+  register('post.curlEnabled', 'Post FX', 'Curl noise enabled', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => Number(renderSettings.curlEnabled),
+    set: (v: number) => {
+      renderSettings.curlEnabled = v >= 0.5;
+      curlPass.enabled = renderSettings.curlEnabled;
+    },
+  });
+  register('post.curlStrength', 'Post FX', 'Curl noise strength', {
+    min: 0,
+    max: 2,
+    range: 2,
+    get: () => renderSettings.curlStrength,
+    set: (v: number) => {
+      renderSettings.curlStrength = clamp(v, 0, 2);
+      syncCurlUniforms();
+    },
+  });
+  register('post.curlScale', 'Post FX', 'Curl noise scale', {
+    min: 0.1,
+    max: 10,
+    range: 10,
+    get: () => renderSettings.curlScale,
+    set: (v: number) => {
+      renderSettings.curlScale = clamp(v, 0.01, 30);
+      syncCurlUniforms();
+    },
+  });
+  register('post.curlTimeRate', 'Post FX', 'Curl noise time rate', {
+    min: 0,
+    max: 2.5,
+    range: 2.5,
+    get: () => renderSettings.curlTimeRate,
+    set: (v: number) => {
+      renderSettings.curlTimeRate = clamp(v, 0, 10);
+      syncCurlUniforms();
     },
   });
 
@@ -3093,10 +3454,6 @@ function randomizeAll() {
   renderSettings.showGrid = randBool(0.25);
   renderSettings.pipeMetalness = rand(0.08, 0.4);
   renderSettings.pipeRoughness = rand(0.05, 0.45);
-  renderSettings.glassEnabled = randBool(0.45);
-  renderSettings.glassTransmission = rand(0.4, 0.9);
-  renderSettings.glassOpacity = rand(0.12, 0.55);
-  renderSettings.glassIor = rand(1.05, 1.55);
   renderSettings.cornerTension = rand(0, 0.4);
   renderSettings.neonEnabled = randBool(0.8);
   renderSettings.neonStrength = rand(0.4, 1.4);
@@ -3799,12 +4156,7 @@ function buildProjectSettings(): ProjectSettings {
       renderer: mirrorRenderer,
       rayBounces: rayMaxBounces,
       reflectionMode: mirrorReflectionMode,
-      blur: mirrorBlurAmount,
-      chromaticShift: mirrorChromaticShift,
       warpStrength: mirrorWarpStrength,
-      warpSpeed: mirrorWarpSpeed,
-      refractionOffset: mirrorRefractionOffset,
-      noiseStrength: mirrorNoiseStrength,
       bounceAttenuation: mirrorBounceAttenuation,
       bounceAttenuationMode: mirrorBounceAttenuationMode,
     },
@@ -3866,12 +4218,7 @@ function applyProjectSettings(settings: ProjectSettings) {
       : 'physicalRay';
   rayMaxBounces = clamp(Math.floor(settings.mirror.rayBounces), 1, 16);
   mirrorReflectionMode = settings.mirror.reflectionMode;
-  mirrorBlurAmount = clamp(settings.mirror.blur, 0, 1);
-  mirrorChromaticShift = clamp(settings.mirror.chromaticShift, 0, 0.1);
   mirrorWarpStrength = clamp(settings.mirror.warpStrength, 0, 0.2);
-  mirrorWarpSpeed = clamp(settings.mirror.warpSpeed, 0, 20);
-  mirrorRefractionOffset = clamp(settings.mirror.refractionOffset, -1, 1);
-  mirrorNoiseStrength = clamp(settings.mirror.noiseStrength, 0, 1);
   mirrorBounceAttenuation = clamp(settings.mirror.bounceAttenuation, 0, 10);
   mirrorBounceAttenuationMode = settings.mirror.bounceAttenuationMode;
 
@@ -3884,12 +4231,7 @@ function applyProjectSettings(settings: ProjectSettings) {
     renderer: mirrorRenderer,
     rayBounces: rayMaxBounces,
     reflectionMode: mirrorReflectionMode,
-    blur: mirrorBlurAmount,
-    chromaticShift: mirrorChromaticShift,
     warpStrength: mirrorWarpStrength,
-    warpSpeed: mirrorWarpSpeed,
-    refractionOffset: mirrorRefractionOffset,
-    noiseStrength: mirrorNoiseStrength,
     bounceAttenuation: mirrorBounceAttenuation,
     bounceAttenuationMode: mirrorBounceAttenuationMode,
   });
@@ -3916,6 +4258,7 @@ function applyProjectSettings(settings: ProjectSettings) {
   syncPostProcessingPasses();
   updateBloomResolution();
   syncPrismResolution();
+  syncComplexPassResolutions();
 
   if (prevMirrorRenderer !== mirrorRenderer) {
     roomMirrors.dispose();
@@ -3924,7 +4267,6 @@ function applyProjectSettings(settings: ProjectSettings) {
   roomMirrors.setEnabled(mirrorEnabled);
   roomMirrors.setInset(mirrorInset);
   updateMirrorResolution();
-  updateMirrorBlur();
   updateMirrorDistortionUniforms(state.elapsed);
   updateMirrorMask();
   roomMirrors.update(room.size, renderSettings.roomColor);
@@ -4009,13 +4351,13 @@ function applyRenderSchedule(schedule: RenderSchedule) {
 
 function updatePipeMaterial(settings: RenderSettings) {
   pipeMaterial.vertexColors = true;
-  pipeMaterial.metalness = settings.glassEnabled ? 0 : settings.pipeMetalness;
-  pipeMaterial.roughness = settings.glassEnabled ? Math.min(0.25, settings.pipeRoughness) : settings.pipeRoughness;
-  pipeMaterial.transparent = settings.glassEnabled;
-  pipeMaterial.transmission = settings.glassEnabled ? settings.glassTransmission : 0;
-  pipeMaterial.opacity = settings.glassEnabled ? settings.glassOpacity : 1;
-  pipeMaterial.ior = settings.glassEnabled ? settings.glassIor : 1.0;
-  pipeMaterial.thickness = settings.glassEnabled ? 0.4 : 0;
+  pipeMaterial.metalness = settings.pipeMetalness;
+  pipeMaterial.roughness = settings.pipeRoughness;
+  pipeMaterial.transparent = false;
+  pipeMaterial.transmission = 0;
+  pipeMaterial.opacity = 1;
+  pipeMaterial.ior = 1.0;
+  pipeMaterial.thickness = 0;
   pipeMaterial.envMap = null;
   pipeMaterial.envMapIntensity = 0;
   pipeMaterial.needsUpdate = true;
