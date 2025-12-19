@@ -1,4 +1,4 @@
-import { DoubleSide, Mesh, PerspectiveCamera, PlaneGeometry, Scene, Vector3, WebGLRenderer } from 'three';
+import { DoubleSide, Mesh, PerspectiveCamera, PlaneGeometry, Scene, Vector2, Vector3, WebGLRenderer } from 'three';
 import { Reflector } from 'three/examples/jsm/objects/Reflector.js';
 import type { MirrorDistortionUniforms, MirrorSystem } from './types';
 
@@ -244,14 +244,58 @@ export class RayMirrorSystemAllFaces implements MirrorSystem {
         warpStrength: { value: this.distortion.warpStrength },
         time: { value: this.distortion.time ?? 0 },
         surfaceIntensity: { value: this.computeSurfaceIntensity() },
+        mFractalEnabled: { value: 0.0 },
+        mFractalStrength: { value: 0.35 },
+        mFractalIterations: { value: 48.0 },
+        mFractalZoom: { value: 1.65 },
+        mFractalCenter: { value: new Vector2(0.0, 0.0) },
+        mFractalC: { value: new Vector2(-0.70176, -0.3842) },
+        mFractalMode: { value: 0.0 }, // 0=julia, 1=mandelbrot
+        mFractalSegments: { value: 1.0 },
+        mFractalRotation: { value: 0.0 },
+        mFractalDomainMix: { value: 0.35 },
+        mFractalDomainFrequency: { value: 6.0 },
+        mFractalPaletteShift: { value: 0.0 },
+        mFractalColorScheme: { value: 0.0 }, // 0=cosine, 1=escape
+        mFractalResolution: { value: new Vector2(this.resolution.width, this.resolution.height) },
       },
+      vertexShader: `
+        uniform mat4 textureMatrix;
+        varying vec4 vUv;
+        varying vec2 vSurfaceUv;
+
+        void main() {
+          vSurfaceUv = uv;
+          vUv = textureMatrix * vec4( position, 1.0 );
+          gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+        }
+      `,
       fragmentShader: `
         uniform vec3 color;
         uniform sampler2D tDiffuse;
         uniform float surfaceIntensity;
+        uniform float time;
+        uniform float mFractalEnabled;
+        uniform float mFractalStrength;
+        uniform float mFractalIterations;
+        uniform float mFractalZoom;
+        uniform vec2 mFractalCenter;
+        uniform vec2 mFractalC;
+        uniform float mFractalMode;
+        uniform float mFractalSegments;
+        uniform float mFractalRotation;
+        uniform float mFractalDomainMix;
+        uniform float mFractalDomainFrequency;
+        uniform float mFractalPaletteShift;
+        uniform float mFractalColorScheme;
+        uniform vec2 mFractalResolution;
         varying vec4 vUv;
+        varying vec2 vSurfaceUv;
 
         #include <logdepthbuf_pars_fragment>
+
+        const float PI = 3.141592653589793;
+        const float TAU = 6.283185307179586;
 
         float blendOverlay( float base, float blend ) {
           return( base < 0.5 ? ( 2.0 * base * blend ) : ( 1.0 - 2.0 * ( 1.0 - base ) * ( 1.0 - blend ) ) );
@@ -261,12 +305,116 @@ export class RayMirrorSystemAllFaces implements MirrorSystem {
           return vec3( blendOverlay( base.r, blend.r ), blendOverlay( base.g, blend.g ), blendOverlay( base.b, blend.b ) );
         }
 
+        vec3 sampleProj(vec4 proj) {
+          return texture2DProj( tDiffuse, proj ).rgb;
+        }
+
+        vec2 kaleidoscope(vec2 p, float segs, float rot) {
+          segs = max(1.0, segs);
+          if (segs <= 1.5) return p;
+          float a = atan(p.y, p.x) + rot;
+          float r = length(p);
+          float seg = 2.0 * PI / segs;
+          a = mod(a, seg);
+          a = abs(a - seg * 0.5);
+          return vec2(cos(a), sin(a)) * r;
+        }
+
+        vec2 csqr(vec2 z) {
+          return vec2(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y);
+        }
+
+        vec3 cosinePalette(float t, vec3 a, vec3 b, vec3 c, vec3 d) {
+          return a + b * cos(TAU * (c * t + d));
+        }
+
         void main() {
           #include <logdepthbuf_fragment>
-          vec4 base = texture2DProj( tDiffuse, vUv );
-          base.rgb *= surfaceIntensity;
-          base.rgb = clamp(base.rgb * 0.5, 0.0, 1.5); // stronger clamp to reduce persistent glare
-          gl_FragColor = vec4( blendOverlay( base.rgb, color ), 1.0 );
+          vec4 projUv = vUv;
+          vec2 uv = projUv.xy / projUv.w;
+          vec2 uvSample = clamp(uv, 0.0, 1.0);
+
+          vec3 col = vec3(0.0);
+          float fEnabled = mFractalEnabled;
+          float fStrength = clamp(mFractalStrength, 0.0, 2.0);
+          if (fEnabled > 0.5 && fStrength > 0.0001) {
+            vec2 wallUv = vSurfaceUv;
+            vec2 p = wallUv * 2.0 - 1.0;
+            float zf = max(0.0005, mFractalZoom);
+            vec2 delta = p / zf;
+            delta = kaleidoscope(delta, mFractalSegments, mFractalRotation);
+            vec2 coord = mFractalCenter + delta;
+
+            vec2 z = mix(coord, vec2(0.0), step(0.5, mFractalMode));
+            vec2 k = mix(mFractalC, coord, step(0.5, mFractalMode));
+
+            int maxIter = int(clamp(mFractalIterations, 1.0, 128.0));
+            float it = 0.0;
+            float escaped = 0.0;
+            for (int i = 0; i < 128; i++) {
+              if (i >= maxIter) break;
+              z = csqr(z) + k;
+              it = float(i);
+              if (dot(z, z) > 16.0) {
+                escaped = 1.0;
+                break;
+              }
+            }
+
+            float smoothIt = it;
+            if (escaped > 0.5) {
+              float zz = max(1e-12, dot(z, z));
+              float log_zn = log(zz) / 2.0;
+              float nu = log(log_zn / log(2.0)) / log(2.0);
+              smoothIt = it + 1.0 - nu;
+            }
+
+            float tNorm = clamp(smoothIt / float(maxIter), 0.0, 1.0);
+            float ridge = pow(tNorm, 0.75) * escaped;
+            float m = it / float(maxIter);
+            float edge = smoothstep(0.0, 1.0, 1.0 - m) * escaped;
+            float magZ = log(length(z) + 1e-6);
+            vec2 fDir = normalize(vec2(z.y, -z.x) + 1e-4);
+            float fWarp = fStrength * 0.035 * edge * (0.4 + 0.6 * sin(magZ * 1.7 + time * 0.25));
+            vec2 uvWarp = clamp(uvSample + fDir * fWarp, 0.0, 1.0);
+
+            vec4 projSample = vec4(uvWarp * projUv.w, projUv.zw);
+            col = sampleProj(projSample);
+
+            float dm = clamp(mFractalDomainMix, 0.0, 1.0) * fStrength;
+            if (dm > 0.0001) {
+              float freq = max(0.0, mFractalDomainFrequency);
+              float scheme = floor(mFractalColorScheme + 0.5);
+              float argCoord = atan(coord.y, coord.x) / TAU;
+              float ps = mFractalPaletteShift;
+              float mixWeight = clamp(dm * (0.35 + 0.65 * ridge), 0.0, 1.0);
+
+              vec3 dc = vec3(0.0);
+              if (scheme < 0.5) {
+                float tt = fract(tNorm * (0.15 * freq + 1.0) + argCoord + ps);
+                vec3 a = vec3(0.5);
+                vec3 b = vec3(0.5);
+                vec3 c0 = vec3(1.0);
+                vec3 d = vec3(0.0, 0.33, 0.67) + ps;
+                dc = cosinePalette(tt, a, b, c0, d) * (0.6 + 0.4 * ridge);
+              } else {
+                float stripe = 0.55 + 0.45 * sin((smoothIt) * (0.12 * freq + 0.75) + ps * TAU);
+                vec3 a = vec3(0.42, 0.4, 0.5);
+                vec3 b = vec3(0.58, 0.6, 0.5);
+                vec3 c0 = vec3(1.0, 1.0, 1.0);
+                vec3 d = vec3(0.0, 0.2, 0.4) + ps;
+                dc = cosinePalette(tNorm, a, b, c0, d) * stripe * (0.5 + 0.5 * ridge);
+              }
+              col = mix(col, dc, mixWeight);
+            }
+          } else {
+            vec4 projSample = vec4(uvSample * projUv.w, projUv.zw);
+            col = sampleProj(projSample);
+          }
+
+          col *= surfaceIntensity;
+          col = clamp(col * 0.5, 0.0, 1.5);
+          gl_FragColor = vec4( blendOverlay( col, color ), 1.0 );
 
           #include <tonemapping_fragment>
           #include <colorspace_fragment>

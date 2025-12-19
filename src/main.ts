@@ -37,6 +37,7 @@ import { BokehPass } from 'three/examples/jsm/postprocessing/BokehPass.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { FilmPass } from 'three/examples/jsm/postprocessing/FilmPass.js';
 import { FXAAPass } from 'three/examples/jsm/postprocessing/FXAAPass.js';
+import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
@@ -49,7 +50,7 @@ import type { SimulationConfig, Vec3 } from './simulation';
 import { PrismWarpShader } from './shaders/prismWarpShader';
 import { CurlNoiseDisplacementShader } from './shaders/curlNoiseDisplacementShader';
 import { FlowmapAdvectionShader } from './shaders/flowmapAdvectionShader';
-import { FractalWarpShader } from './shaders/fractalWarpShader';
+// FractalWarpShader is intentionally not used as a post effect; mirror fractals are handled in wall shaders.
 import {
   PhysicalRayMirrorSystem,
   RasterMirrorSystem,
@@ -106,6 +107,7 @@ type RenderSettings = {
   filmIntensity: number;
   filmGrayscale: boolean;
   fxaaEnabled: boolean;
+  smaaEnabled: boolean;
   prismEnabled: boolean;
   prismStrength: number;
   prismWarp: number;
@@ -117,21 +119,21 @@ type RenderSettings = {
   flowmapEnabled: boolean;
   flowmapStrength: number;
   flowmapViscosity: number;
-  fractalEnabled: boolean;
-  fractalStrength: number;
-  fractalIterations: number;
-  fractalZoom: number;
-  fractalCenterX: number;
-  fractalCenterY: number;
-  fractalCRe: number;
-  fractalCIm: number;
-  fractalMode: FractalMode;
-  fractalSegments: number;
-  fractalRotation: number;
-  fractalDomainMix: number;
-  fractalDomainFrequency: number;
-  fractalPaletteShift: number;
-  fractalColorScheme: FractalColorScheme;
+  mirrorFractalEnabled: boolean;
+  mirrorFractalStrength: number;
+  mirrorFractalIterations: number;
+  mirrorFractalZoom: number;
+  mirrorFractalCenterX: number;
+  mirrorFractalCenterY: number;
+  mirrorFractalCRe: number;
+  mirrorFractalCIm: number;
+  mirrorFractalMode: FractalMode;
+  mirrorFractalSegments: number;
+  mirrorFractalRotation: number;
+  mirrorFractalDomainMix: number;
+  mirrorFractalDomainFrequency: number;
+  mirrorFractalPaletteShift: number;
+  mirrorFractalColorScheme: FractalColorScheme;
   curlEnabled: boolean;
   curlStrength: number;
   curlScale: number;
@@ -328,6 +330,7 @@ const renderSettings: RenderSettings = {
   filmIntensity: 0.35,
   filmGrayscale: false,
   fxaaEnabled: true,
+  smaaEnabled: false,
   prismEnabled: false,
   prismStrength: 0.35,
   prismWarp: 0.02,
@@ -339,21 +342,21 @@ const renderSettings: RenderSettings = {
   flowmapEnabled: false,
   flowmapStrength: 0.22,
   flowmapViscosity: 0.5,
-  fractalEnabled: false,
-  fractalStrength: 0.35,
-  fractalIterations: 48,
-  fractalZoom: 1.65,
-  fractalCenterX: 0,
-  fractalCenterY: 0,
-  fractalCRe: -0.70176,
-  fractalCIm: -0.3842,
-  fractalMode: 'julia',
-  fractalSegments: 1,
-  fractalRotation: 0,
-  fractalDomainMix: 0,
-  fractalDomainFrequency: 6,
-  fractalPaletteShift: 0,
-  fractalColorScheme: 'cosine',
+  mirrorFractalEnabled: false,
+  mirrorFractalStrength: 0.35,
+  mirrorFractalIterations: 48,
+  mirrorFractalZoom: 1.65,
+  mirrorFractalCenterX: 0,
+  mirrorFractalCenterY: 0,
+  mirrorFractalCRe: -0.70176,
+  mirrorFractalCIm: -0.3842,
+  mirrorFractalMode: 'julia',
+  mirrorFractalSegments: 1,
+  mirrorFractalRotation: 0,
+  mirrorFractalDomainMix: 0.35,
+  mirrorFractalDomainFrequency: 6,
+  mirrorFractalPaletteShift: 0,
+  mirrorFractalColorScheme: 'cosine',
   curlEnabled: false,
   curlStrength: 0.25,
   curlScale: 2.25,
@@ -547,11 +550,11 @@ let bokehPass!: BokehPass;
 let afterimagePass!: AfterimagePass;
 let filmPass!: FilmPass;
 let prismPass!: ShaderPass;
-let fractalPass!: ShaderPass;
 let curlPass!: ShaderPass;
 let flowmapPass!: ShaderPass;
 let outputPass!: OutputPass;
 let fxaaPass!: FXAAPass;
+let smaaPass!: SMAAPass;
 let guiInstance: GUI | null = null;
 let gridSizeController: any;
 let targetCountController: any;
@@ -603,11 +606,11 @@ bokehPass = new BokehPass(scene, camera, {
 });
 filmPass = new FilmPass(renderSettings.filmIntensity, renderSettings.filmGrayscale);
 prismPass = new ShaderPass(PrismWarpShader);
-fractalPass = new ShaderPass(FractalWarpShader);
 curlPass = new ShaderPass(CurlNoiseDisplacementShader);
 flowmapPass = new ShaderPass(FlowmapAdvectionShader);
 afterimagePass = new AfterimagePass(renderSettings.afterimageDamp);
 outputPass = new OutputPass();
+smaaPass = new SMAAPass();
 fxaaPass = new FXAAPass();
 
 composer.addPass(renderPass);
@@ -615,10 +618,10 @@ composer.addPass(bokehPass);
 composer.addPass(bloomPass);
 composer.addPass(filmPass);
 composer.addPass(prismPass);
-composer.addPass(fractalPass);
 composer.addPass(curlPass);
 composer.addPass(flowmapPass);
 composer.addPass(afterimagePass);
+composer.addPass(smaaPass);
 composer.addPass(outputPass);
 composer.addPass(fxaaPass);
 
@@ -716,39 +719,52 @@ function syncComplexPassResolutions(width?: number, height?: number) {
   const pixelRatio = renderer.getPixelRatio();
   const w = Math.max(1, Math.floor(bounds.width * pixelRatio));
   const h = Math.max(1, Math.floor(bounds.height * pixelRatio));
-  for (const pass of [fractalPass, curlPass, flowmapPass]) {
+  for (const pass of [curlPass, flowmapPass]) {
     const uniforms = pass?.uniforms as any;
     if (uniforms?.resolution?.value?.set) uniforms.resolution.value.set(w, h);
   }
 }
 
-function syncFractalUniforms() {
-  const uniforms = fractalPass?.uniforms as any;
-  if (!uniforms) return;
-  uniforms.strength.value = clamp(renderSettings.fractalStrength, 0, 2);
-  uniforms.iterations.value = clamp(renderSettings.fractalIterations, 1, 128);
-  const zoom = Number.isFinite(renderSettings.fractalZoom) ? renderSettings.fractalZoom : 1;
-  uniforms.zoom.value = Math.max(0.05, zoom);
-  if (uniforms.center?.value?.set) {
-    uniforms.center.value.set(
-      clamp(renderSettings.fractalCenterX, -2, 2),
-      clamp(renderSettings.fractalCenterY, -2, 2)
-    );
-  }
-  if (uniforms.c?.value?.set) {
-    uniforms.c.value.set(
-      clamp(renderSettings.fractalCRe, -2, 2),
-      clamp(renderSettings.fractalCIm, -2, 2)
-    );
-  }
-  uniforms.mode.value = renderSettings.fractalMode === 'mandelbrot' ? 1.0 : 0.0;
-  uniforms.segments.value = clamp(renderSettings.fractalSegments, 1, 64);
-  uniforms.rotation.value = renderSettings.fractalRotation;
-  uniforms.domainMix.value = clamp(renderSettings.fractalDomainMix, 0, 1);
-  uniforms.domainFrequency.value = clamp(renderSettings.fractalDomainFrequency, 0, 64);
-  uniforms.paletteShift.value = clamp(renderSettings.fractalPaletteShift, -2, 2);
-  if (uniforms.colorScheme) {
-    uniforms.colorScheme.value = FRACTAL_COLOR_SCHEME_MAP[renderSettings.fractalColorScheme] ?? 0;
+function syncMirrorFractalUniforms(width?: number, height?: number) {
+  const faces = roomMirrors?.faces;
+  if (!faces || faces.length === 0) return;
+
+  const enabled = Boolean(renderSettings.mirrorFractalEnabled);
+  const strength = clamp(renderSettings.mirrorFractalStrength, 0, 2);
+  const iterations = clamp(renderSettings.mirrorFractalIterations, 1, 128);
+  const zoom = Number.isFinite(renderSettings.mirrorFractalZoom) ? renderSettings.mirrorFractalZoom : 1;
+  const zoomClamped = Math.max(0.05, zoom);
+  const centerX = clamp(renderSettings.mirrorFractalCenterX, -2, 2);
+  const centerY = clamp(renderSettings.mirrorFractalCenterY, -2, 2);
+  const cRe = clamp(renderSettings.mirrorFractalCRe, -2, 2);
+  const cIm = clamp(renderSettings.mirrorFractalCIm, -2, 2);
+  const mode = renderSettings.mirrorFractalMode === 'mandelbrot' ? 1.0 : 0.0;
+  const segments = clamp(renderSettings.mirrorFractalSegments, 1, 64);
+  const rotation = renderSettings.mirrorFractalRotation;
+  const domainMix = clamp(renderSettings.mirrorFractalDomainMix, 0, 1);
+  const domainFrequency = clamp(renderSettings.mirrorFractalDomainFrequency, 0, 64);
+  const paletteShift = clamp(renderSettings.mirrorFractalPaletteShift, -2, 2);
+  const colorScheme = FRACTAL_COLOR_SCHEME_MAP[renderSettings.mirrorFractalColorScheme] ?? 0;
+
+  for (const face of faces) {
+    const uniforms = (face.material as any)?.uniforms as any;
+    if (!uniforms) continue;
+    if (uniforms.mFractalEnabled) uniforms.mFractalEnabled.value = enabled ? 1.0 : 0.0;
+    if (uniforms.mFractalStrength) uniforms.mFractalStrength.value = strength;
+    if (uniforms.mFractalIterations) uniforms.mFractalIterations.value = iterations;
+    if (uniforms.mFractalZoom) uniforms.mFractalZoom.value = zoomClamped;
+    if (uniforms.mFractalCenter?.value?.set) uniforms.mFractalCenter.value.set(centerX, centerY);
+    if (uniforms.mFractalC?.value?.set) uniforms.mFractalC.value.set(cRe, cIm);
+    if (uniforms.mFractalMode) uniforms.mFractalMode.value = mode;
+    if (uniforms.mFractalSegments) uniforms.mFractalSegments.value = segments;
+    if (uniforms.mFractalRotation) uniforms.mFractalRotation.value = rotation;
+    if (uniforms.mFractalDomainMix) uniforms.mFractalDomainMix.value = domainMix;
+    if (uniforms.mFractalDomainFrequency) uniforms.mFractalDomainFrequency.value = domainFrequency;
+    if (uniforms.mFractalPaletteShift) uniforms.mFractalPaletteShift.value = paletteShift;
+    if (uniforms.mFractalColorScheme) uniforms.mFractalColorScheme.value = colorScheme;
+    if (width !== undefined && height !== undefined && uniforms.mFractalResolution?.value?.set) {
+      uniforms.mFractalResolution.value.set(width, height);
+    }
   }
 }
 
@@ -788,9 +804,6 @@ function syncPostProcessingPasses() {
   prismPass.enabled = Boolean(renderSettings.prismEnabled);
   syncPrismUniforms();
 
-  fractalPass.enabled = Boolean(renderSettings.fractalEnabled);
-  syncFractalUniforms();
-
   curlPass.enabled = Boolean(renderSettings.curlEnabled);
   syncCurlUniforms();
 
@@ -801,12 +814,15 @@ function syncPostProcessingPasses() {
   afterimagePass.damp = clamp(renderSettings.afterimageDamp, 0, 1);
 
   outputPass.enabled = true;
-  fxaaPass.enabled = Boolean(renderSettings.fxaaEnabled);
+  const smaaOn = Boolean(renderSettings.smaaEnabled);
+  smaaPass.enabled = smaaOn;
+  fxaaPass.enabled = Boolean(renderSettings.fxaaEnabled) && !smaaOn;
 }
 
 function updateMirrorResolution() {
   const { width, height } = mirrorTargetSize();
   roomMirrors.setResolution(width, height);
+  syncMirrorFractalUniforms(width, height);
 }
 
 function updateMirrorDistortionUniforms(time: number) {
@@ -1151,14 +1167,13 @@ function stepFrame(dt: number) {
   camera.updateMatrixWorld();
   updateMirrorMask();
   updateMirrorDistortionUniforms(state.elapsed);
+  syncMirrorFractalUniforms();
   roomMirrors.updateFrame?.(renderer, scene, camera);
   updateInfo(sim, state);
 
   lastCameraMode = cameraControl.mode;
   const prismUniforms = prismPass?.uniforms as any;
   if (prismUniforms?.time) prismUniforms.time.value = state.elapsed;
-  const fractalUniforms = fractalPass?.uniforms as any;
-  if (fractalUniforms?.time) fractalUniforms.time.value = state.elapsed;
   const curlUniforms = curlPass?.uniforms as any;
   if (curlUniforms?.time) curlUniforms.time.value = state.elapsed;
   const flowmapUniforms = flowmapPass?.uniforms as any;
@@ -1754,6 +1769,243 @@ function setupGui() {
     gridLines.visible = visible;
   });
 
+  const mirrorFractalFolder = mirrorFolder.addFolder('Fractal Warp');
+  mirrorFractalFolder.add(renderSettings, 'mirrorFractalEnabled').name('Enabled').onChange((v: boolean) => {
+    renderSettings.mirrorFractalEnabled = v;
+    syncMirrorFractalUniforms();
+    modulationBaseSetters['post.fractalEnabled']?.(Number(renderSettings.mirrorFractalEnabled));
+  });
+  mirrorFractalFolder.add(renderSettings, 'mirrorFractalStrength', 0, 2, 0.01).name('Strength').onChange((v: number) => {
+    renderSettings.mirrorFractalStrength = clamp(v, 0, 2);
+    syncMirrorFractalUniforms();
+    modulationBaseSetters['post.fractalStrength']?.(renderSettings.mirrorFractalStrength);
+  });
+  mirrorFractalFolder
+    .add(renderSettings, 'mirrorFractalMode', { Julia: 'julia', Mandelbrot: 'mandelbrot' })
+    .name('Mode')
+    .onChange((v: FractalMode) => {
+      renderSettings.mirrorFractalMode = v;
+      syncMirrorFractalUniforms();
+      modulationBaseSetters['post.fractalMode']?.(renderSettings.mirrorFractalMode === 'mandelbrot' ? 1 : 0);
+    });
+  mirrorFractalFolder.add(renderSettings, 'mirrorFractalIterations', 1, 128, 1).name('Iterations').onChange((v: number) => {
+    renderSettings.mirrorFractalIterations = clamp(Math.round(v), 1, 128);
+    syncMirrorFractalUniforms();
+    modulationBaseSetters['post.fractalIterations']?.(renderSettings.mirrorFractalIterations);
+  });
+  mirrorFractalFolder.add(renderSettings, 'mirrorFractalZoom').name('Zoom').onChange((v: number) => {
+    renderSettings.mirrorFractalZoom = Math.max(0.05, v);
+    syncMirrorFractalUniforms();
+    modulationBaseSetters['post.fractalZoom']?.(renderSettings.mirrorFractalZoom);
+  });
+  mirrorFractalFolder.add(renderSettings, 'mirrorFractalCRe', -1.5, 1.5, 0.0001).name('c.re').onChange((v: number) => {
+    renderSettings.mirrorFractalCRe = clamp(v, -2, 2);
+    syncMirrorFractalUniforms();
+    modulationBaseSetters['post.fractalCRe']?.(renderSettings.mirrorFractalCRe);
+  });
+  mirrorFractalFolder.add(renderSettings, 'mirrorFractalCIm', -1.5, 1.5, 0.0001).name('c.im').onChange((v: number) => {
+    renderSettings.mirrorFractalCIm = clamp(v, -2, 2);
+    syncMirrorFractalUniforms();
+    modulationBaseSetters['post.fractalCIm']?.(renderSettings.mirrorFractalCIm);
+  });
+  mirrorFractalFolder.add(renderSettings, 'mirrorFractalCenterX', -2, 2, 0.001).name('Center X').onChange((v: number) => {
+    renderSettings.mirrorFractalCenterX = clamp(v, -2, 2);
+    syncMirrorFractalUniforms();
+    modulationBaseSetters['post.fractalCenterX']?.(renderSettings.mirrorFractalCenterX);
+  });
+  mirrorFractalFolder.add(renderSettings, 'mirrorFractalCenterY', -2, 2, 0.001).name('Center Y').onChange((v: number) => {
+    renderSettings.mirrorFractalCenterY = clamp(v, -2, 2);
+    syncMirrorFractalUniforms();
+    modulationBaseSetters['post.fractalCenterY']?.(renderSettings.mirrorFractalCenterY);
+  });
+  mirrorFractalFolder.add(renderSettings, 'mirrorFractalSegments', 1, 24, 1).name('Segments').onChange((v: number) => {
+    renderSettings.mirrorFractalSegments = clamp(Math.round(v), 1, 64);
+    syncMirrorFractalUniforms();
+    modulationBaseSetters['post.fractalSegments']?.(renderSettings.mirrorFractalSegments);
+  });
+  mirrorFractalFolder.add(renderSettings, 'mirrorFractalRotation', -Math.PI, Math.PI, 0.001).name('Rotation').onChange((v: number) => {
+    renderSettings.mirrorFractalRotation = v;
+    syncMirrorFractalUniforms();
+    modulationBaseSetters['post.fractalRotation']?.(renderSettings.mirrorFractalRotation);
+  });
+
+  const applyMirrorFractalPreset = (preset: Partial<RenderSettings>) => {
+    Object.assign(renderSettings, preset);
+    renderSettings.mirrorFractalEnabled = Boolean(renderSettings.mirrorFractalEnabled);
+    renderSettings.mirrorFractalStrength = clamp(renderSettings.mirrorFractalStrength, 0, 2);
+    renderSettings.mirrorFractalIterations = clamp(Math.round(renderSettings.mirrorFractalIterations), 1, 128);
+    renderSettings.mirrorFractalZoom = Math.max(0.05, renderSettings.mirrorFractalZoom);
+    renderSettings.mirrorFractalCenterX = clamp(renderSettings.mirrorFractalCenterX, -2, 2);
+    renderSettings.mirrorFractalCenterY = clamp(renderSettings.mirrorFractalCenterY, -2, 2);
+    renderSettings.mirrorFractalCRe = clamp(renderSettings.mirrorFractalCRe, -2, 2);
+    renderSettings.mirrorFractalCIm = clamp(renderSettings.mirrorFractalCIm, -2, 2);
+    renderSettings.mirrorFractalSegments = clamp(Math.round(renderSettings.mirrorFractalSegments), 1, 64);
+    renderSettings.mirrorFractalDomainMix = clamp(renderSettings.mirrorFractalDomainMix, 0, 1);
+    renderSettings.mirrorFractalDomainFrequency = clamp(renderSettings.mirrorFractalDomainFrequency, 0, 64);
+    renderSettings.mirrorFractalPaletteShift = clamp(renderSettings.mirrorFractalPaletteShift, -2, 2);
+
+    syncMirrorFractalUniforms();
+
+    // Keep existing modulation schedules stable: post.fractal* now drive mirror fractals.
+    modulationBaseSetters['post.fractalEnabled']?.(Number(renderSettings.mirrorFractalEnabled));
+    modulationBaseSetters['post.fractalStrength']?.(renderSettings.mirrorFractalStrength);
+    modulationBaseSetters['post.fractalMode']?.(renderSettings.mirrorFractalMode === 'mandelbrot' ? 1 : 0);
+    modulationBaseSetters['post.fractalIterations']?.(renderSettings.mirrorFractalIterations);
+    modulationBaseSetters['post.fractalZoom']?.(renderSettings.mirrorFractalZoom);
+    modulationBaseSetters['post.fractalCRe']?.(renderSettings.mirrorFractalCRe);
+    modulationBaseSetters['post.fractalCIm']?.(renderSettings.mirrorFractalCIm);
+    modulationBaseSetters['post.fractalCenterX']?.(renderSettings.mirrorFractalCenterX);
+    modulationBaseSetters['post.fractalCenterY']?.(renderSettings.mirrorFractalCenterY);
+    modulationBaseSetters['post.fractalSegments']?.(renderSettings.mirrorFractalSegments);
+    modulationBaseSetters['post.fractalRotation']?.(renderSettings.mirrorFractalRotation);
+    modulationBaseSetters['post.fractalDomainMix']?.(renderSettings.mirrorFractalDomainMix);
+    modulationBaseSetters['post.fractalDomainFrequency']?.(renderSettings.mirrorFractalDomainFrequency);
+    modulationBaseSetters['post.fractalPaletteShift']?.(renderSettings.mirrorFractalPaletteShift);
+
+    for (const controller of gui.controllersRecursive()) {
+      controller.updateDisplay();
+    }
+  };
+
+  const mirrorPoiFolder = mirrorFractalFolder.addFolder('Points of Interest');
+  const mirrorPoiActions = {
+    juliaClassic: () =>
+      applyMirrorFractalPreset({
+        mirrorFractalEnabled: true,
+        mirrorFractalMode: 'julia',
+        mirrorFractalCRe: -0.70176,
+        mirrorFractalCIm: -0.3842,
+        mirrorFractalCenterX: 0,
+        mirrorFractalCenterY: 0,
+        mirrorFractalZoom: 1.65,
+        mirrorFractalIterations: 64,
+        mirrorFractalStrength: 0.85,
+        mirrorFractalColorScheme: 'cosine',
+        mirrorFractalDomainMix: 0.35,
+        mirrorFractalDomainFrequency: 6,
+        mirrorFractalPaletteShift: 0,
+        mirrorFractalSegments: 1,
+        mirrorFractalRotation: 0,
+      }),
+    juliaRabbit: () =>
+      applyMirrorFractalPreset({
+        mirrorFractalEnabled: true,
+        mirrorFractalMode: 'julia',
+        mirrorFractalCRe: -0.123,
+        mirrorFractalCIm: 0.745,
+        mirrorFractalCenterX: 0,
+        mirrorFractalCenterY: 0,
+        mirrorFractalZoom: 1.8,
+        mirrorFractalIterations: 96,
+        mirrorFractalStrength: 0.9,
+        mirrorFractalColorScheme: 'cosine',
+        mirrorFractalDomainMix: 0.45,
+        mirrorFractalDomainFrequency: 10,
+        mirrorFractalPaletteShift: 0,
+        mirrorFractalSegments: 1,
+        mirrorFractalRotation: 0,
+      }),
+    juliaSpiral: () =>
+      applyMirrorFractalPreset({
+        mirrorFractalEnabled: true,
+        mirrorFractalMode: 'julia',
+        mirrorFractalCRe: -0.8,
+        mirrorFractalCIm: 0.156,
+        mirrorFractalCenterX: 0,
+        mirrorFractalCenterY: 0,
+        mirrorFractalZoom: 2.05,
+        mirrorFractalIterations: 96,
+        mirrorFractalStrength: 0.95,
+        mirrorFractalColorScheme: 'escape',
+        mirrorFractalDomainMix: 0.4,
+        mirrorFractalDomainFrequency: 9,
+        mirrorFractalPaletteShift: 0.05,
+        mirrorFractalSegments: 1,
+        mirrorFractalRotation: 0,
+      }),
+    mandelbrotSeahorse: () =>
+      applyMirrorFractalPreset({
+        mirrorFractalEnabled: true,
+        mirrorFractalMode: 'mandelbrot',
+        mirrorFractalCenterX: -0.743643887,
+        mirrorFractalCenterY: 0.131825904,
+        mirrorFractalZoom: 1800,
+        mirrorFractalIterations: 128,
+        mirrorFractalStrength: 1.1,
+        mirrorFractalColorScheme: 'escape',
+        mirrorFractalDomainMix: 0.55,
+        mirrorFractalDomainFrequency: 12,
+        mirrorFractalPaletteShift: 0.1,
+        mirrorFractalSegments: 1,
+        mirrorFractalRotation: 0,
+      }),
+    mandelbrotElephant: () =>
+      applyMirrorFractalPreset({
+        mirrorFractalEnabled: true,
+        mirrorFractalMode: 'mandelbrot',
+        mirrorFractalCenterX: 0.285,
+        mirrorFractalCenterY: 0.01,
+        mirrorFractalZoom: 1200,
+        mirrorFractalIterations: 128,
+        mirrorFractalStrength: 1.05,
+        mirrorFractalColorScheme: 'cosine',
+        mirrorFractalDomainMix: 0.5,
+        mirrorFractalDomainFrequency: 9,
+        mirrorFractalPaletteShift: 0,
+        mirrorFractalSegments: 1,
+        mirrorFractalRotation: 0,
+      }),
+    mandelbrotSpiral: () =>
+      applyMirrorFractalPreset({
+        mirrorFractalEnabled: true,
+        mirrorFractalMode: 'mandelbrot',
+        mirrorFractalCenterX: -0.761574,
+        mirrorFractalCenterY: -0.0847596,
+        mirrorFractalZoom: 2600,
+        mirrorFractalIterations: 128,
+        mirrorFractalStrength: 1.15,
+        mirrorFractalColorScheme: 'escape',
+        mirrorFractalDomainMix: 0.55,
+        mirrorFractalDomainFrequency: 14,
+        mirrorFractalPaletteShift: 0.15,
+        mirrorFractalSegments: 1,
+        mirrorFractalRotation: 0,
+      }),
+  };
+  mirrorPoiFolder.add(mirrorPoiActions, 'juliaClassic').name('Julia: Classic');
+  mirrorPoiFolder.add(mirrorPoiActions, 'juliaRabbit').name('Julia: Rabbit');
+  mirrorPoiFolder.add(mirrorPoiActions, 'juliaSpiral').name('Julia: Spiral');
+  mirrorPoiFolder.add(mirrorPoiActions, 'mandelbrotSeahorse').name('Mandelbrot: Seahorse Valley');
+  mirrorPoiFolder.add(mirrorPoiActions, 'mandelbrotElephant').name('Mandelbrot: Elephant Valley');
+  mirrorPoiFolder.add(mirrorPoiActions, 'mandelbrotSpiral').name('Mandelbrot: Spiral');
+
+  const mirrorDomainFolder = mirrorFractalFolder.addFolder('Domain Color');
+  mirrorDomainFolder
+    .add(renderSettings, 'mirrorFractalColorScheme', {
+      Cosine: 'cosine',
+      'Escape Time': 'escape',
+    })
+    .name('Scheme')
+    .onChange((v: FractalColorScheme) => {
+      renderSettings.mirrorFractalColorScheme = v;
+      syncMirrorFractalUniforms();
+    });
+  mirrorDomainFolder.add(renderSettings, 'mirrorFractalDomainMix', 0, 1, 0.01).name('Mix').onChange((v: number) => {
+    renderSettings.mirrorFractalDomainMix = clamp(v, 0, 1);
+    syncMirrorFractalUniforms();
+    modulationBaseSetters['post.fractalDomainMix']?.(renderSettings.mirrorFractalDomainMix);
+  });
+  mirrorDomainFolder.add(renderSettings, 'mirrorFractalDomainFrequency', 0, 20, 0.01).name('Frequency').onChange((v: number) => {
+    renderSettings.mirrorFractalDomainFrequency = clamp(v, 0, 64);
+    syncMirrorFractalUniforms();
+    modulationBaseSetters['post.fractalDomainFrequency']?.(renderSettings.mirrorFractalDomainFrequency);
+  });
+  mirrorDomainFolder.add(renderSettings, 'mirrorFractalPaletteShift', -1, 1, 0.001).name('Palette shift').onChange((v: number) => {
+    renderSettings.mirrorFractalPaletteShift = clamp(v, -2, 2);
+    syncMirrorFractalUniforms();
+    modulationBaseSetters['post.fractalPaletteShift']?.(renderSettings.mirrorFractalPaletteShift);
+  });
+
   const cameraFolder = gui.addFolder('Camera');
   cameraModeController = cameraFolder
     .add(cameraControl, 'mode', ['wall', 'wallDrift', 'orbit', 'manual', 'rail'])
@@ -1912,10 +2164,29 @@ function setupGui() {
     .name('Randomize camera');
 
   const postFolder = gui.addFolder('Post FX');
-  postFolder.add(renderSettings, 'fxaaEnabled').name('FXAA').onChange((v: boolean) => {
+  const fxaaController = postFolder.add(renderSettings, 'fxaaEnabled').name('FXAA');
+  const smaaController = postFolder.add(renderSettings, 'smaaEnabled').name('SMAA');
+  fxaaController.onChange((v: boolean) => {
     renderSettings.fxaaEnabled = v;
+    if (v) {
+      renderSettings.smaaEnabled = false;
+      smaaPass.enabled = false;
+      smaaController.updateDisplay();
+      modulationBaseSetters['post.smaaEnabled']?.(0);
+    }
     fxaaPass.enabled = v;
     modulationBaseSetters['post.fxaaEnabled']?.(Number(v));
+  });
+  smaaController.onChange((v: boolean) => {
+    renderSettings.smaaEnabled = v;
+    if (v) {
+      renderSettings.fxaaEnabled = false;
+      fxaaPass.enabled = false;
+      fxaaController.updateDisplay();
+      modulationBaseSetters['post.fxaaEnabled']?.(0);
+    }
+    smaaPass.enabled = v;
+    modulationBaseSetters['post.smaaEnabled']?.(Number(v));
   });
 
   const afterimageFolder = postFolder.addFolder('Afterimage');
@@ -2051,241 +2322,6 @@ function setupGui() {
     renderSettings.flowmapViscosity = clamp(v, 0, 1);
     syncFlowmapUniforms();
     modulationBaseSetters['post.flowmapViscosity']?.(renderSettings.flowmapViscosity);
-  });
-
-  const fractalFolder = experimentalFolder.addFolder('Fractal Warp');
-  fractalFolder.add(renderSettings, 'fractalEnabled').name('Enabled').onChange((v: boolean) => {
-    renderSettings.fractalEnabled = v;
-    fractalPass.enabled = v;
-    modulationBaseSetters['post.fractalEnabled']?.(Number(v));
-  });
-  fractalFolder.add(renderSettings, 'fractalStrength', 0, 2, 0.01).name('Strength').onChange((v: number) => {
-    renderSettings.fractalStrength = clamp(v, 0, 2);
-    syncFractalUniforms();
-    modulationBaseSetters['post.fractalStrength']?.(renderSettings.fractalStrength);
-  });
-  fractalFolder
-    .add(renderSettings, 'fractalMode', { Julia: 'julia', Mandelbrot: 'mandelbrot' })
-    .name('Mode')
-    .onChange((v: FractalMode) => {
-      renderSettings.fractalMode = v;
-      syncFractalUniforms();
-      modulationBaseSetters['post.fractalMode']?.(v === 'mandelbrot' ? 1 : 0);
-    });
-  fractalFolder.add(renderSettings, 'fractalIterations', 1, 128, 1).name('Iterations').onChange((v: number) => {
-    renderSettings.fractalIterations = clamp(Math.round(v), 1, 128);
-    syncFractalUniforms();
-    modulationBaseSetters['post.fractalIterations']?.(renderSettings.fractalIterations);
-  });
-  fractalFolder.add(renderSettings, 'fractalZoom').name('Zoom').onChange((v: number) => {
-    renderSettings.fractalZoom = Math.max(0.05, v);
-    syncFractalUniforms();
-    modulationBaseSetters['post.fractalZoom']?.(renderSettings.fractalZoom);
-  });
-  fractalFolder.add(renderSettings, 'fractalCRe', -1.5, 1.5, 0.0001).name('c.re').onChange((v: number) => {
-    renderSettings.fractalCRe = clamp(v, -2, 2);
-    syncFractalUniforms();
-    modulationBaseSetters['post.fractalCRe']?.(renderSettings.fractalCRe);
-  });
-  fractalFolder.add(renderSettings, 'fractalCIm', -1.5, 1.5, 0.0001).name('c.im').onChange((v: number) => {
-    renderSettings.fractalCIm = clamp(v, -2, 2);
-    syncFractalUniforms();
-    modulationBaseSetters['post.fractalCIm']?.(renderSettings.fractalCIm);
-  });
-  fractalFolder.add(renderSettings, 'fractalCenterX', -2, 2, 0.001).name('Center X').onChange((v: number) => {
-    renderSettings.fractalCenterX = clamp(v, -2, 2);
-    syncFractalUniforms();
-    modulationBaseSetters['post.fractalCenterX']?.(renderSettings.fractalCenterX);
-  });
-  fractalFolder.add(renderSettings, 'fractalCenterY', -2, 2, 0.001).name('Center Y').onChange((v: number) => {
-    renderSettings.fractalCenterY = clamp(v, -2, 2);
-    syncFractalUniforms();
-    modulationBaseSetters['post.fractalCenterY']?.(renderSettings.fractalCenterY);
-  });
-  fractalFolder.add(renderSettings, 'fractalSegments', 1, 24, 1).name('Segments').onChange((v: number) => {
-    renderSettings.fractalSegments = clamp(Math.round(v), 1, 64);
-    syncFractalUniforms();
-    modulationBaseSetters['post.fractalSegments']?.(renderSettings.fractalSegments);
-  });
-  fractalFolder.add(renderSettings, 'fractalRotation', -Math.PI, Math.PI, 0.001).name('Rotation').onChange((v: number) => {
-    renderSettings.fractalRotation = v;
-    syncFractalUniforms();
-    modulationBaseSetters['post.fractalRotation']?.(renderSettings.fractalRotation);
-  });
-
-  const applyFractalPreset = (preset: Partial<RenderSettings>) => {
-    Object.assign(renderSettings, preset);
-    renderSettings.fractalStrength = clamp(renderSettings.fractalStrength, 0, 2);
-    renderSettings.fractalIterations = clamp(Math.round(renderSettings.fractalIterations), 1, 128);
-    renderSettings.fractalZoom = Math.max(0.05, renderSettings.fractalZoom);
-    renderSettings.fractalCenterX = clamp(renderSettings.fractalCenterX, -2, 2);
-    renderSettings.fractalCenterY = clamp(renderSettings.fractalCenterY, -2, 2);
-    renderSettings.fractalCRe = clamp(renderSettings.fractalCRe, -2, 2);
-    renderSettings.fractalCIm = clamp(renderSettings.fractalCIm, -2, 2);
-    renderSettings.fractalSegments = clamp(Math.round(renderSettings.fractalSegments), 1, 64);
-    renderSettings.fractalDomainMix = clamp(renderSettings.fractalDomainMix, 0, 1);
-    renderSettings.fractalDomainFrequency = clamp(renderSettings.fractalDomainFrequency, 0, 64);
-    renderSettings.fractalPaletteShift = clamp(renderSettings.fractalPaletteShift, -2, 2);
-
-    syncPostProcessingPasses();
-
-    modulationBaseSetters['post.fractalEnabled']?.(Number(renderSettings.fractalEnabled));
-    modulationBaseSetters['post.fractalStrength']?.(renderSettings.fractalStrength);
-    modulationBaseSetters['post.fractalMode']?.(renderSettings.fractalMode === 'mandelbrot' ? 1 : 0);
-    modulationBaseSetters['post.fractalIterations']?.(renderSettings.fractalIterations);
-    modulationBaseSetters['post.fractalZoom']?.(renderSettings.fractalZoom);
-    modulationBaseSetters['post.fractalCRe']?.(renderSettings.fractalCRe);
-    modulationBaseSetters['post.fractalCIm']?.(renderSettings.fractalCIm);
-    modulationBaseSetters['post.fractalCenterX']?.(renderSettings.fractalCenterX);
-    modulationBaseSetters['post.fractalCenterY']?.(renderSettings.fractalCenterY);
-    modulationBaseSetters['post.fractalSegments']?.(renderSettings.fractalSegments);
-    modulationBaseSetters['post.fractalRotation']?.(renderSettings.fractalRotation);
-    modulationBaseSetters['post.fractalDomainMix']?.(renderSettings.fractalDomainMix);
-    modulationBaseSetters['post.fractalDomainFrequency']?.(renderSettings.fractalDomainFrequency);
-    modulationBaseSetters['post.fractalPaletteShift']?.(renderSettings.fractalPaletteShift);
-
-    for (const controller of gui.controllersRecursive()) {
-      controller.updateDisplay();
-    }
-  };
-
-  const poiFolder = fractalFolder.addFolder('Points of Interest');
-  const poiActions = {
-    juliaClassic: () =>
-      applyFractalPreset({
-        fractalEnabled: true,
-        fractalMode: 'julia',
-        fractalCRe: -0.70176,
-        fractalCIm: -0.3842,
-        fractalCenterX: 0,
-        fractalCenterY: 0,
-        fractalZoom: 1.65,
-        fractalIterations: 64,
-        fractalStrength: 0.85,
-        fractalColorScheme: 'cosine',
-        fractalDomainMix: 0.35,
-        fractalDomainFrequency: 6,
-        fractalPaletteShift: 0,
-        fractalSegments: 1,
-        fractalRotation: 0,
-      }),
-    juliaRabbit: () =>
-      applyFractalPreset({
-        fractalEnabled: true,
-        fractalMode: 'julia',
-        fractalCRe: -0.123,
-        fractalCIm: 0.745,
-        fractalCenterX: 0,
-        fractalCenterY: 0,
-        fractalZoom: 1.8,
-        fractalIterations: 96,
-        fractalStrength: 0.9,
-        fractalColorScheme: 'cosine',
-        fractalDomainMix: 0.45,
-        fractalDomainFrequency: 10,
-        fractalPaletteShift: 0,
-        fractalSegments: 1,
-        fractalRotation: 0,
-      }),
-    juliaSpiral: () =>
-      applyFractalPreset({
-        fractalEnabled: true,
-        fractalMode: 'julia',
-        fractalCRe: -0.8,
-        fractalCIm: 0.156,
-        fractalCenterX: 0,
-        fractalCenterY: 0,
-        fractalZoom: 2.05,
-        fractalIterations: 96,
-        fractalStrength: 0.95,
-        fractalColorScheme: 'escape',
-        fractalDomainMix: 0.4,
-        fractalDomainFrequency: 9,
-        fractalPaletteShift: 0.05,
-        fractalSegments: 1,
-        fractalRotation: 0,
-      }),
-    mandelbrotSeahorse: () =>
-      applyFractalPreset({
-        fractalEnabled: true,
-        fractalMode: 'mandelbrot',
-        fractalCenterX: -0.743643887,
-        fractalCenterY: 0.131825904,
-        fractalZoom: 1800,
-        fractalIterations: 128,
-        fractalStrength: 1.1,
-        fractalColorScheme: 'escape',
-        fractalDomainMix: 0.55,
-        fractalDomainFrequency: 12,
-        fractalPaletteShift: 0.1,
-        fractalSegments: 1,
-        fractalRotation: 0,
-      }),
-    mandelbrotElephant: () =>
-      applyFractalPreset({
-        fractalEnabled: true,
-        fractalMode: 'mandelbrot',
-        fractalCenterX: 0.285,
-        fractalCenterY: 0.01,
-        fractalZoom: 1200,
-        fractalIterations: 128,
-        fractalStrength: 1.05,
-        fractalColorScheme: 'cosine',
-        fractalDomainMix: 0.5,
-        fractalDomainFrequency: 9,
-        fractalPaletteShift: 0,
-        fractalSegments: 1,
-        fractalRotation: 0,
-      }),
-    mandelbrotSpiral: () =>
-      applyFractalPreset({
-        fractalEnabled: true,
-        fractalMode: 'mandelbrot',
-        fractalCenterX: -0.761574,
-        fractalCenterY: -0.0847596,
-        fractalZoom: 2600,
-        fractalIterations: 128,
-        fractalStrength: 1.15,
-        fractalColorScheme: 'escape',
-        fractalDomainMix: 0.55,
-        fractalDomainFrequency: 14,
-        fractalPaletteShift: 0.15,
-        fractalSegments: 1,
-        fractalRotation: 0,
-      }),
-  };
-  poiFolder.add(poiActions, 'juliaClassic').name('Julia: Classic');
-  poiFolder.add(poiActions, 'juliaRabbit').name('Julia: Rabbit');
-  poiFolder.add(poiActions, 'juliaSpiral').name('Julia: Spiral');
-  poiFolder.add(poiActions, 'mandelbrotSeahorse').name('Mandelbrot: Seahorse Valley');
-  poiFolder.add(poiActions, 'mandelbrotElephant').name('Mandelbrot: Elephant Valley');
-  poiFolder.add(poiActions, 'mandelbrotSpiral').name('Mandelbrot: Spiral');
-
-  const domainFolder = fractalFolder.addFolder('Domain Color');
-  domainFolder
-    .add(renderSettings, 'fractalColorScheme', {
-      Cosine: 'cosine',
-      'Escape Time': 'escape',
-    })
-    .name('Scheme')
-    .onChange((v: FractalColorScheme) => {
-      renderSettings.fractalColorScheme = v;
-      syncFractalUniforms();
-    });
-  domainFolder.add(renderSettings, 'fractalDomainMix', 0, 1, 0.01).name('Mix').onChange((v: number) => {
-    renderSettings.fractalDomainMix = clamp(v, 0, 1);
-    syncFractalUniforms();
-    modulationBaseSetters['post.fractalDomainMix']?.(renderSettings.fractalDomainMix);
-  });
-  domainFolder.add(renderSettings, 'fractalDomainFrequency', 0, 20, 0.01).name('Frequency').onChange((v: number) => {
-    renderSettings.fractalDomainFrequency = clamp(v, 0, 64);
-    syncFractalUniforms();
-    modulationBaseSetters['post.fractalDomainFrequency']?.(renderSettings.fractalDomainFrequency);
-  });
-  domainFolder.add(renderSettings, 'fractalPaletteShift', -1, 1, 0.001).name('Palette shift').onChange((v: number) => {
-    renderSettings.fractalPaletteShift = clamp(v, -2, 2);
-    syncFractalUniforms();
-    modulationBaseSetters['post.fractalPaletteShift']?.(renderSettings.fractalPaletteShift);
   });
 
   const curlFolder = experimentalFolder.addFolder('Curl Noise Displacement');
@@ -2651,7 +2687,25 @@ function setupModulationTargets() {
     get: () => Number(renderSettings.fxaaEnabled),
     set: (v: number) => {
       renderSettings.fxaaEnabled = v >= 0.5;
+      if (renderSettings.fxaaEnabled) {
+        renderSettings.smaaEnabled = false;
+        smaaPass.enabled = false;
+      }
       fxaaPass.enabled = renderSettings.fxaaEnabled;
+    },
+  });
+  register('post.smaaEnabled', 'Post FX', 'SMAA enabled', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => Number(renderSettings.smaaEnabled),
+    set: (v: number) => {
+      renderSettings.smaaEnabled = v >= 0.5;
+      if (renderSettings.smaaEnabled) {
+        renderSettings.fxaaEnabled = false;
+        fxaaPass.enabled = false;
+      }
+      smaaPass.enabled = renderSettings.smaaEnabled;
     },
   });
 
@@ -2859,143 +2913,144 @@ function setupModulationTargets() {
     },
   });
 
-  register('post.fractalEnabled', 'Post FX', 'Fractal warp enabled', {
+  // Legacy ids: post.fractal* now control mirror fractals (post fractal pass removed).
+  register('post.fractalEnabled', 'Mirrors', 'Fractal enabled', {
     min: 0,
     max: 1,
     range: 1,
-    get: () => Number(renderSettings.fractalEnabled),
+    get: () => Number(renderSettings.mirrorFractalEnabled),
     set: (v: number) => {
-      renderSettings.fractalEnabled = v >= 0.5;
-      fractalPass.enabled = renderSettings.fractalEnabled;
+      renderSettings.mirrorFractalEnabled = v >= 0.5;
+      syncMirrorFractalUniforms();
     },
   });
-  register('post.fractalStrength', 'Post FX', 'Fractal warp strength', {
+  register('post.fractalStrength', 'Mirrors', 'Fractal strength', {
     min: 0,
     max: 2,
     range: 2,
-    get: () => renderSettings.fractalStrength,
+    get: () => renderSettings.mirrorFractalStrength,
     set: (v: number) => {
-      renderSettings.fractalStrength = clamp(v, 0, 2);
-      syncFractalUniforms();
+      renderSettings.mirrorFractalStrength = clamp(v, 0, 2);
+      syncMirrorFractalUniforms();
     },
   });
-  register('post.fractalMode', 'Post FX', 'Fractal mode (0=julia, 1=mandelbrot)', {
+  register('post.fractalMode', 'Mirrors', 'Fractal mode (0=julia, 1=mandelbrot)', {
     min: 0,
     max: 1,
     range: 1,
-    get: () => (renderSettings.fractalMode === 'mandelbrot' ? 1 : 0),
+    get: () => (renderSettings.mirrorFractalMode === 'mandelbrot' ? 1 : 0),
     set: (v: number) => {
-      renderSettings.fractalMode = v >= 0.5 ? 'mandelbrot' : 'julia';
-      syncFractalUniforms();
+      renderSettings.mirrorFractalMode = v >= 0.5 ? 'mandelbrot' : 'julia';
+      syncMirrorFractalUniforms();
     },
   });
-  register('post.fractalIterations', 'Post FX', 'Fractal iterations', {
+  register('post.fractalIterations', 'Mirrors', 'Fractal iterations', {
     min: 1,
     max: 128,
     range: 128,
-    get: () => renderSettings.fractalIterations,
+    get: () => renderSettings.mirrorFractalIterations,
     set: (v: number) => {
-      renderSettings.fractalIterations = clamp(Math.round(v), 1, 128);
-      syncFractalUniforms();
+      renderSettings.mirrorFractalIterations = clamp(Math.round(v), 1, 128);
+      syncMirrorFractalUniforms();
     },
   });
-  register('post.fractalZoom', 'Post FX', 'Fractal zoom', {
+  register('post.fractalZoom', 'Mirrors', 'Fractal zoom', {
     min: 0.05,
     range: 8,
-    get: () => renderSettings.fractalZoom,
+    get: () => renderSettings.mirrorFractalZoom,
     set: (v: number) => {
-      renderSettings.fractalZoom = Math.max(0.05, v);
-      syncFractalUniforms();
+      renderSettings.mirrorFractalZoom = Math.max(0.05, v);
+      syncMirrorFractalUniforms();
     },
   });
-  register('post.fractalCRe', 'Post FX', 'Fractal c.re', {
+  register('post.fractalCRe', 'Mirrors', 'Fractal c.re', {
     min: -1.5,
     max: 1.5,
     range: 3,
-    get: () => renderSettings.fractalCRe,
+    get: () => renderSettings.mirrorFractalCRe,
     set: (v: number) => {
-      renderSettings.fractalCRe = clamp(v, -2, 2);
-      syncFractalUniforms();
+      renderSettings.mirrorFractalCRe = clamp(v, -2, 2);
+      syncMirrorFractalUniforms();
     },
   });
-  register('post.fractalCIm', 'Post FX', 'Fractal c.im', {
+  register('post.fractalCIm', 'Mirrors', 'Fractal c.im', {
     min: -1.5,
     max: 1.5,
     range: 3,
-    get: () => renderSettings.fractalCIm,
+    get: () => renderSettings.mirrorFractalCIm,
     set: (v: number) => {
-      renderSettings.fractalCIm = clamp(v, -2, 2);
-      syncFractalUniforms();
+      renderSettings.mirrorFractalCIm = clamp(v, -2, 2);
+      syncMirrorFractalUniforms();
     },
   });
-  register('post.fractalCenterX', 'Post FX', 'Fractal center X', {
+  register('post.fractalCenterX', 'Mirrors', 'Fractal center X', {
     min: -2,
     max: 2,
     range: 4,
-    get: () => renderSettings.fractalCenterX,
+    get: () => renderSettings.mirrorFractalCenterX,
     set: (v: number) => {
-      renderSettings.fractalCenterX = clamp(v, -2, 2);
-      syncFractalUniforms();
+      renderSettings.mirrorFractalCenterX = clamp(v, -2, 2);
+      syncMirrorFractalUniforms();
     },
   });
-  register('post.fractalCenterY', 'Post FX', 'Fractal center Y', {
+  register('post.fractalCenterY', 'Mirrors', 'Fractal center Y', {
     min: -2,
     max: 2,
     range: 4,
-    get: () => renderSettings.fractalCenterY,
+    get: () => renderSettings.mirrorFractalCenterY,
     set: (v: number) => {
-      renderSettings.fractalCenterY = clamp(v, -2, 2);
-      syncFractalUniforms();
+      renderSettings.mirrorFractalCenterY = clamp(v, -2, 2);
+      syncMirrorFractalUniforms();
     },
   });
-  register('post.fractalSegments', 'Post FX', 'Fractal segments', {
+  register('post.fractalSegments', 'Mirrors', 'Fractal segments', {
     min: 1,
     max: 24,
     range: 23,
-    get: () => renderSettings.fractalSegments,
+    get: () => renderSettings.mirrorFractalSegments,
     set: (v: number) => {
-      renderSettings.fractalSegments = clamp(Math.round(v), 1, 64);
-      syncFractalUniforms();
+      renderSettings.mirrorFractalSegments = clamp(Math.round(v), 1, 64);
+      syncMirrorFractalUniforms();
     },
   });
-  register('post.fractalRotation', 'Post FX', 'Fractal rotation', {
+  register('post.fractalRotation', 'Mirrors', 'Fractal rotation', {
     min: -Math.PI,
     max: Math.PI,
     range: Math.PI * 2,
-    get: () => renderSettings.fractalRotation,
+    get: () => renderSettings.mirrorFractalRotation,
     set: (v: number) => {
-      renderSettings.fractalRotation = v;
-      syncFractalUniforms();
+      renderSettings.mirrorFractalRotation = v;
+      syncMirrorFractalUniforms();
     },
   });
-  register('post.fractalDomainMix', 'Post FX', 'Fractal domain mix', {
+  register('post.fractalDomainMix', 'Mirrors', 'Fractal domain mix', {
     min: 0,
     max: 1,
     range: 1,
-    get: () => renderSettings.fractalDomainMix,
+    get: () => renderSettings.mirrorFractalDomainMix,
     set: (v: number) => {
-      renderSettings.fractalDomainMix = clamp(v, 0, 1);
-      syncFractalUniforms();
+      renderSettings.mirrorFractalDomainMix = clamp(v, 0, 1);
+      syncMirrorFractalUniforms();
     },
   });
-  register('post.fractalDomainFrequency', 'Post FX', 'Fractal domain frequency', {
+  register('post.fractalDomainFrequency', 'Mirrors', 'Fractal domain frequency', {
     min: 0,
     max: 20,
     range: 20,
-    get: () => renderSettings.fractalDomainFrequency,
+    get: () => renderSettings.mirrorFractalDomainFrequency,
     set: (v: number) => {
-      renderSettings.fractalDomainFrequency = clamp(v, 0, 64);
-      syncFractalUniforms();
+      renderSettings.mirrorFractalDomainFrequency = clamp(v, 0, 64);
+      syncMirrorFractalUniforms();
     },
   });
-  register('post.fractalPaletteShift', 'Post FX', 'Fractal palette shift', {
+  register('post.fractalPaletteShift', 'Mirrors', 'Fractal palette shift', {
     min: -1,
     max: 1,
     range: 2,
-    get: () => renderSettings.fractalPaletteShift,
+    get: () => renderSettings.mirrorFractalPaletteShift,
     set: (v: number) => {
-      renderSettings.fractalPaletteShift = clamp(v, -2, 2);
-      syncFractalUniforms();
+      renderSettings.mirrorFractalPaletteShift = clamp(v, -2, 2);
+      syncMirrorFractalUniforms();
     },
   });
 
@@ -4200,6 +4255,78 @@ function applyProjectSettings(settings: ProjectSettings) {
     if (value !== undefined) {
       (renderSettings as any)[key] = value;
     }
+  }
+
+  // Back-compat: older projects may still have post-fractal settings. Since the post fractal pass
+  // has been removed, migrate them into the mirror fractal settings if the mirror settings are absent.
+  const legacyRenderSettings = settings.renderSettings as any;
+  const hasMirrorFractal =
+    legacyRenderSettings?.mirrorFractalEnabled !== undefined ||
+    legacyRenderSettings?.mirrorFractalStrength !== undefined ||
+    legacyRenderSettings?.mirrorFractalIterations !== undefined ||
+    legacyRenderSettings?.mirrorFractalZoom !== undefined;
+  const hasLegacyPostFractal =
+    legacyRenderSettings?.fractalEnabled !== undefined ||
+    legacyRenderSettings?.fractalStrength !== undefined ||
+    legacyRenderSettings?.fractalIterations !== undefined ||
+    legacyRenderSettings?.fractalZoom !== undefined;
+  if (!hasMirrorFractal && hasLegacyPostFractal) {
+    renderSettings.mirrorFractalEnabled = Boolean(legacyRenderSettings.fractalEnabled ?? renderSettings.mirrorFractalEnabled);
+    renderSettings.mirrorFractalStrength = clamp(
+      Number(legacyRenderSettings.fractalStrength ?? renderSettings.mirrorFractalStrength),
+      0,
+      2
+    );
+    renderSettings.mirrorFractalIterations = clamp(
+      Math.round(Number(legacyRenderSettings.fractalIterations ?? renderSettings.mirrorFractalIterations)),
+      1,
+      128
+    );
+    renderSettings.mirrorFractalZoom = Math.max(
+      0.05,
+      Number(legacyRenderSettings.fractalZoom ?? renderSettings.mirrorFractalZoom)
+    );
+    renderSettings.mirrorFractalCenterX = clamp(
+      Number(legacyRenderSettings.fractalCenterX ?? renderSettings.mirrorFractalCenterX),
+      -2,
+      2
+    );
+    renderSettings.mirrorFractalCenterY = clamp(
+      Number(legacyRenderSettings.fractalCenterY ?? renderSettings.mirrorFractalCenterY),
+      -2,
+      2
+    );
+    renderSettings.mirrorFractalCRe = clamp(Number(legacyRenderSettings.fractalCRe ?? renderSettings.mirrorFractalCRe), -2, 2);
+    renderSettings.mirrorFractalCIm = clamp(Number(legacyRenderSettings.fractalCIm ?? renderSettings.mirrorFractalCIm), -2, 2);
+    renderSettings.mirrorFractalMode =
+      legacyRenderSettings.fractalMode === 'mandelbrot' || legacyRenderSettings.fractalMode === 'julia'
+        ? legacyRenderSettings.fractalMode
+        : renderSettings.mirrorFractalMode;
+    renderSettings.mirrorFractalSegments = clamp(
+      Math.round(Number(legacyRenderSettings.fractalSegments ?? renderSettings.mirrorFractalSegments)),
+      1,
+      64
+    );
+    renderSettings.mirrorFractalRotation = Number(legacyRenderSettings.fractalRotation ?? renderSettings.mirrorFractalRotation);
+    renderSettings.mirrorFractalDomainMix = clamp(
+      Number(legacyRenderSettings.fractalDomainMix ?? renderSettings.mirrorFractalDomainMix),
+      0,
+      1
+    );
+    renderSettings.mirrorFractalDomainFrequency = clamp(
+      Number(legacyRenderSettings.fractalDomainFrequency ?? renderSettings.mirrorFractalDomainFrequency),
+      0,
+      64
+    );
+    renderSettings.mirrorFractalPaletteShift = clamp(
+      Number(legacyRenderSettings.fractalPaletteShift ?? renderSettings.mirrorFractalPaletteShift),
+      -2,
+      2
+    );
+    renderSettings.mirrorFractalColorScheme =
+      legacyRenderSettings.fractalColorScheme === 'escape' || legacyRenderSettings.fractalColorScheme === 'cosine'
+        ? legacyRenderSettings.fractalColorScheme
+        : renderSettings.mirrorFractalColorScheme;
   }
 
   const prevMirrorRenderer = mirrorRenderer;
