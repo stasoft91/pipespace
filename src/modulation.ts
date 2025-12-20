@@ -14,8 +14,15 @@ export type LfoConfig = {
   id: string;
   targetId: string;
   wave: Waveform;
-  freqHz: number;
-  useGlobalBpm: boolean;
+  /**
+   * Musical length as a fraction of a 4-beat bar (i.e. a "whole note" in 4/4).
+   * Examples:
+   * - 1/4  => one beat (quarter note)
+   * - 1/1  => one bar (whole note)
+   * - 2/1  => two bars
+   *
+   * The effective frequency is computed from the global BPM.
+   */
   bpmCoefficient: number;
   amount: number;
   offset: number;
@@ -55,6 +62,19 @@ type LfoRuntimeState = {
   lastHoldTime: number;
 };
 
+type HeldTargetState = {
+  /**
+   * Base value captured when a segment first becomes active for this target.
+   * While held, manual base changes are ignored for modulation math.
+   */
+  baseValue: number;
+  /**
+   * Last value applied while a segment was active. When the segment ends, this
+   * value is committed into the base so the parameter holds the last modulated value.
+   */
+  lastApplied: number;
+};
+
 const TAU = Math.PI * 2;
 
 const clamp = (v: number, min: number, max: number) => Math.min(max, Math.max(min, v));
@@ -69,6 +89,7 @@ export class ModulationManager {
   private lfoRuntime = new Map<string, LfoRuntimeState>();
   private envelopes: EnvelopeConfig[] = [];
   private envelopeRuntime = new Map<string, LfoRuntimeState>();
+  private heldTargets = new Map<string, HeldTargetState>();
   private scratchValues = new Map<string, number>();
   private bypass = false;
   private globalBpm = 120;
@@ -92,6 +113,8 @@ export class ModulationManager {
   setBypass(enabled: boolean) {
     this.bypass = enabled;
     if (enabled) {
+      // When bypassing, drop any "held" segment state so manual bases take effect again.
+      this.heldTargets.clear();
       this.applyBaseValues();
     }
   }
@@ -115,8 +138,6 @@ export class ModulationManager {
       id: partial.id ?? `lfo-${Math.random().toString(16).slice(2)}`,
       targetId: defaultTargetId,
       wave: partial.wave ?? 'sine',
-      freqHz: partial.freqHz ?? 0.2,
-      useGlobalBpm: partial.useGlobalBpm ?? false,
       bpmCoefficient: partial.bpmCoefficient ?? 1,
       amount: partial.amount ?? 0.35,
       offset: partial.offset ?? 0,
@@ -184,6 +205,8 @@ export class ModulationManager {
         this.baseValues.set(id, target.getCurrent());
       }
     }
+    // External base sync means the authored "manual" state changed; reset segment holds.
+    this.heldTargets.clear();
   }
 
   update(timeSeconds: number, dt: number) {
@@ -191,17 +214,17 @@ export class ModulationManager {
     if (this.lastUpdateSeconds !== null && timeSeconds < this.lastUpdateSeconds - 1e-6) {
       this.lfoRuntime.clear();
       this.envelopeRuntime.clear();
+      this.heldTargets.clear();
       this.lastUpdateSeconds = null;
     }
     this.lastUpdateSeconds = timeSeconds;
     const values = this.scratchValues;
     values.clear();
 
-    for (const [id, target] of this.targets) {
-      const base = this.baseValues.get(id);
-      values.set(id, base ?? target.getCurrent());
-    }
-
+    // Figure out which targets are currently driven by any active segment.
+    const activeTargets = new Set<string>();
+    const activeEnvelopes: EnvelopeConfig[] = [];
+    const activeLfos: LfoConfig[] = [];
     if (!this.bypass) {
       for (const env of this.envelopes) {
         if (!env.enabled) continue;
@@ -210,6 +233,47 @@ export class ModulationManager {
         if (startSeconds === undefined || endSeconds === undefined) continue;
         if (endSeconds <= startSeconds) continue;
         if (timeSeconds < startSeconds || timeSeconds > endSeconds) continue;
+        if (!this.targets.has(env.targetId)) continue;
+        activeEnvelopes.push(env);
+        activeTargets.add(env.targetId);
+      }
+      for (const lfo of this.lfos) {
+        if (!lfo.enabled) continue;
+        const startSeconds = lfo.startSeconds ?? -Infinity;
+        const endSeconds = lfo.endSeconds ?? Infinity;
+        if (timeSeconds < startSeconds || timeSeconds > endSeconds) continue;
+        if (!this.targets.has(lfo.targetId)) continue;
+        activeLfos.push(lfo);
+        activeTargets.add(lfo.targetId);
+      }
+    }
+
+    // If a target was held previously but is no longer driven now, commit the last driven value
+    // into the base so the parameter "sticks" after the segment ends.
+    for (const [targetId, hold] of this.heldTargets) {
+      if (!activeTargets.has(targetId)) {
+        this.baseValues.set(targetId, hold.lastApplied);
+        this.heldTargets.delete(targetId);
+      }
+    }
+
+    // If a target becomes driven now, capture its current base as the locked baseline.
+    for (const targetId of activeTargets) {
+      if (this.heldTargets.has(targetId)) continue;
+      const target = this.targets.get(targetId);
+      if (!target) continue;
+      const base = this.baseValues.get(targetId) ?? target.getCurrent();
+      this.heldTargets.set(targetId, { baseValue: base, lastApplied: base });
+    }
+
+    for (const [id, target] of this.targets) {
+      const held = this.heldTargets.get(id);
+      const base = held ? held.baseValue : this.baseValues.get(id);
+      values.set(id, base ?? target.getCurrent());
+    }
+
+    if (!this.bypass) {
+      for (const env of activeEnvelopes) {
         const target = this.targets.get(env.targetId);
         if (!target) continue;
         const raw = this.sampleEnvelopeWave(env, timeSeconds);
@@ -218,11 +282,7 @@ export class ModulationManager {
         values.set(target.id, next);
       }
 
-      for (const lfo of this.lfos) {
-        if (!lfo.enabled) continue;
-        const startSeconds = lfo.startSeconds ?? -Infinity;
-        const endSeconds = lfo.endSeconds ?? Infinity;
-        if (timeSeconds < startSeconds || timeSeconds > endSeconds) continue;
+      for (const lfo of activeLfos) {
         const target = this.targets.get(lfo.targetId);
         if (!target) continue;
         const base = values.get(target.id) ?? this.baseValues.get(target.id) ?? target.getCurrent();
@@ -240,6 +300,10 @@ export class ModulationManager {
       let v = value;
       if (target.min !== undefined) v = Math.max(target.min, v);
       if (target.max !== undefined) v = Math.min(target.max, v);
+      const held = this.heldTargets.get(id);
+      if (held) {
+        held.lastApplied = v;
+      }
       const current = target.getCurrent();
       if (Math.abs(current - v) < 1e-6) continue;
       target.apply(v);
@@ -270,8 +334,15 @@ export class ModulationManager {
       lastHoldTime: timeSeconds,
     };
 
-    const bpmFreq = (this.globalBpm / 60) * Math.max(0, lfo.bpmCoefficient);
-    const effectiveFreq = lfo.useGlobalBpm ? bpmFreq : lfo.freqHz;
+    // Treat bpmCoefficient as a musical duration (fraction of a 4-beat bar).
+    // The smaller the coefficient, the faster the modulation (shorter period).
+    const beatsPerSecond = this.globalBpm / 60;
+    const beatsPerBar = 4;
+    const coeff = lfo.bpmCoefficient;
+    const effectiveFreq =
+      coeff > 0
+        ? beatsPerSecond / (beatsPerBar * coeff)
+        : 0;
     const phase = effectiveFreq <= 0 ? lfo.phase : timeSeconds * effectiveFreq * TAU + lfo.phase;
     let raw: number;
 

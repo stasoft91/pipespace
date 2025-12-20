@@ -157,10 +157,15 @@ const BACKEND_RENDER_URL = 'http://localhost:3333/render';
 async function requestBackendRender(schedule: RenderSchedule) {
   if (videoCaptureSettings.recording) return;
   console.log('Requesting backend render…');
+  const scheduleWithSettings: RenderSchedule = { ...schedule, settings: snapshotProjectSettings() };
   const res = await fetch(BACKEND_RENDER_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ schedule, appUrl: window.location.origin + '/', outputBase: `render-${Date.now()}` }),
+    body: JSON.stringify({
+      schedule: scheduleWithSettings,
+      appUrl: window.location.origin + '/',
+      outputBase: `render-${Date.now()}`,
+    }),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -1191,6 +1196,20 @@ function supportsWebCodecs() {
   return typeof VideoEncoder !== 'undefined' && typeof createImageBitmap !== 'undefined';
 }
 
+const CAPTURE_FPS = 60;
+
+function estimateCaptureBitrate(width: number, height: number, fps: number) {
+  // Scale bitrate with pixel throughput so low-res renders are faster and smaller,
+  // while high-res renders preserve detail.
+  const pixelsPerSecond = Math.max(1, Math.floor(width)) * Math.max(1, Math.floor(height)) * Math.max(1, Math.floor(fps));
+  // Bits per pixel (per second). Tuned so 1080p60 lands near ~27Mbps, and 360p60 ~3Mbps.
+  const bpp = 0.22;
+  const raw = pixelsPerSecond * bpp;
+  const clamped = clamp(raw, 2_000_000, 60_000_000);
+  // Round to 100kbps to avoid noisy values.
+  return Math.round(clamped / 100_000) * 100_000;
+}
+
 const VIDEO_RESOLUTIONS = [360, 720, 1080, 1920] as const;
 type VideoResolution = (typeof VIDEO_RESOLUTIONS)[number];
 
@@ -1222,7 +1241,8 @@ async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | n
   const width = canvas.width;
   const height = canvas.height;
   const safeDuration = Math.max(0.1, durationSeconds);
-  const totalFrames = Math.max(1, Math.round(safeDuration * 60));
+  const totalFrames = Math.max(1, Math.round(safeDuration * CAPTURE_FPS));
+  const bitrate = estimateCaptureBitrate(width, height, CAPTURE_FPS);
 
   const chunks: BlobPart[] = [];
   const encoder = new VideoEncoder({
@@ -1245,8 +1265,8 @@ async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | n
     codec: 'vp09.00.10.08',
     width,
     height,
-    bitrate: 30_000_000,
-    framerate: 60,
+    bitrate,
+    framerate: CAPTURE_FPS,
   });
 
   // Pause RAF during offline render
@@ -1255,7 +1275,7 @@ async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | n
 
   for (let i = 0; i < totalFrames; i++) {
     setRecordingProgress(i / totalFrames, 'Encoding (WebCodecs)');
-    stepFrame(1 / 60);
+    stepFrame(1 / CAPTURE_FPS);
     const frame = new VideoFrame(canvas, { timestamp: i });
     encoder.encode(frame);
     frame.close();
@@ -1291,7 +1311,7 @@ async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | n
   view.setUint8(11, '0'.charCodeAt(0));
   view.setUint16(12, width, true);
   view.setUint16(14, height, true);
-  view.setUint32(16, 60, true); // framerate
+  view.setUint32(16, CAPTURE_FPS, true); // framerate
   view.setUint32(20, 1, true); // timescale
   view.setUint32(24, frameCount, true); // frame count
   view.setUint32(28, 0, true); // unused
@@ -1362,19 +1382,20 @@ async function renderVideoCapture(
     return;
   }
 
-  const stream = canvas.captureStream(60);
+  const stream = canvas.captureStream(CAPTURE_FPS);
   const track = stream.getVideoTracks()[0];
   if (track && (track as any).applyConstraints) {
-    (track as any).applyConstraints({ frameRate: 60 }).catch(() => {
+    (track as any).applyConstraints({ frameRate: CAPTURE_FPS }).catch(() => {
       /* ignore constraint failures */
     });
   }
   const chunks: BlobPart[] = [];
   let recorder: MediaRecorder;
+  const bitsPerSecond = estimateCaptureBitrate(canvas.width, canvas.height, CAPTURE_FPS);
   try {
     recorder = new MediaRecorder(stream, {
       mimeType,
-      videoBitsPerSecond: 25_000_000,
+      videoBitsPerSecond: bitsPerSecond,
     });
   } catch (err) {
     console.error('Failed to start video recording', err);
@@ -4420,6 +4441,12 @@ timelineHandle = initTimeline({
 });
 
 function applyRenderSchedule(schedule: RenderSchedule) {
+  if (schedule.settings) {
+    const wasBypassed = modulation.isBypassed();
+    modulation.setBypass(true);
+    applyProjectSettings(schedule.settings);
+    modulation.setBypass(wasBypassed);
+  }
   modulationGlobals.bpm = schedule.bpm;
   modulation.setGlobalBpm(schedule.bpm);
   for (const lfo of modulation.getLfos().slice()) {

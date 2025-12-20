@@ -7,7 +7,7 @@ import Peaks, {
   type WaveformViewPointerEvent,
 } from 'peaks.js';
 import { ModulationManager, type EnvelopeConfig, type LfoConfig, type ModulationTarget, type Waveform } from './modulation';
-import { type ProjectFile, type ProjectTimeline, parseProjectFile } from './project';
+import { type ProjectFile, type ProjectTimeline, type ProjectSettings, parseProjectFile } from './project';
 
 export type RenderSchedule = {
   bpm: number;
@@ -15,6 +15,7 @@ export type RenderSchedule = {
   lfos: LfoConfig[];
   envelopes?: EnvelopeConfig[];
   videoResolution: number;
+  settings?: ProjectSettings;
 };
 
 export type TimelineInitOptions = {
@@ -470,8 +471,14 @@ export function initTimeline(options: TimelineInitOptions) {
       const offset = isFinite(offsetAbs / scale) ? offsetAbs / scale : 0;
       const amount = isFinite(amountAbs / scale) ? amountAbs / scale : 0;
 
-      const freqHz = 1 / duration;
-      const phase = -start * freqHz * Math.PI * 2;
+      // LFOs are BPM-synced; choose a coefficient so the LFO completes ~1 cycle over the segment.
+      // bpmCoefficient is expressed as a fraction of a 4-beat bar (1/1 = 1 bar, 1/4 = 1 beat).
+      const bar = barSeconds();
+      const bpmCoefficient = bar > 0 ? duration / bar : 1;
+      const beatsPerSecond = bpm / 60;
+      const beatsPerBar = 4;
+      const effectiveFreq = bpmCoefficient > 0 ? beatsPerSecond / (beatsPerBar * bpmCoefficient) : 0;
+      const phase = effectiveFreq <= 0 ? 0 : -start * effectiveFreq * Math.PI * 2;
 
       modulation.removeEnvelope(env.id);
       envelopeBySegmentId.delete(segmentId);
@@ -479,9 +486,7 @@ export function initTimeline(options: TimelineInitOptions) {
       const created = modulation.addLfo({
         targetId: env.targetId,
         wave: env.wave,
-        freqHz,
-        useGlobalBpm: false,
-        bpmCoefficient: 1,
+        bpmCoefficient,
         amount,
         offset,
         phase,
@@ -828,32 +833,6 @@ export function initTimeline(options: TimelineInitOptions) {
       });
       addRow('Wave', waveSelect);
 
-      const freqInput = document.createElement('input');
-      freqInput.type = 'number';
-      freqInput.step = '0.01';
-      freqInput.min = '0';
-      freqInput.max = '20';
-      freqInput.value = String(lfo.freqHz);
-      freqInput.addEventListener('change', () => {
-        lfo.freqHz = Math.max(0, Number(freqInput.value) || 0);
-      });
-      addRow('Freq (Hz)', freqInput);
-
-      const useBpmInput = document.createElement('input');
-      useBpmInput.type = 'checkbox';
-      useBpmInput.checked = lfo.useGlobalBpm;
-      useBpmInput.addEventListener('change', () => {
-        lfo.useGlobalBpm = useBpmInput.checked;
-      });
-      addRow('Use BPM', useBpmInput);
-
-      const coeffInput = document.createElement('input');
-      coeffInput.type = 'number';
-      coeffInput.step = '0.01';
-      coeffInput.min = '0.01';
-      coeffInput.max = '16';
-      coeffInput.value = String(lfo.bpmCoefficient);
-
       const approxEq = (a: number, b: number) => Math.abs(a - b) <= 1e-6;
       const presetButtons: Array<{ value: number; btn: HTMLButtonElement }> = [];
       const updatePresetSelections = () => {
@@ -862,17 +841,9 @@ export function initTimeline(options: TimelineInitOptions) {
         }
       };
       const setBpmCoeff = (value: number) => {
-        lfo.bpmCoefficient = Math.max(0.01, value);
-        coeffInput.value = String(lfo.bpmCoefficient);
+        lfo.bpmCoefficient = Math.max(1e-6, value);
         updatePresetSelections();
       };
-
-      coeffInput.addEventListener('change', () => {
-        lfo.bpmCoefficient = Math.max(0.01, Number(coeffInput.value) || 1);
-        coeffInput.value = String(lfo.bpmCoefficient);
-        updatePresetSelections();
-      });
-      addRow('BPM coeff', coeffInput);
 
       const addPresetRow = (labelText: string, presets: Array<{ label: string; value: number }>) => {
         const group = document.createElement('div');
@@ -1541,8 +1512,6 @@ export function initTimeline(options: TimelineInitOptions) {
         id: lfo.id,
         targetId: lfo.targetId,
         wave: lfo.wave,
-        freqHz: lfo.freqHz,
-        useGlobalBpm: lfo.useGlobalBpm,
         bpmCoefficient: lfo.bpmCoefficient,
         amount: lfo.amount,
         offset: lfo.offset,
@@ -1572,8 +1541,6 @@ export function initTimeline(options: TimelineInitOptions) {
           id: lfo.id,
           targetId: lfo.targetId,
           wave: lfo.wave,
-          freqHz: lfo.freqHz,
-          useGlobalBpm: lfo.useGlobalBpm,
           bpmCoefficient: lfo.bpmCoefficient,
           amount: lfo.amount,
           offset: lfo.offset,
