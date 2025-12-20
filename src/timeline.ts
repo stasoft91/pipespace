@@ -1,4 +1,11 @@
-import Peaks, { type PeaksInstance, type Segment, type SegmentDragEvent, type SegmentsInsertEvent } from 'peaks.js';
+import Peaks, {
+  type PeaksInstance,
+  type Segment,
+  type SegmentDragEvent,
+  type SegmentPointerEvent,
+  type SegmentsInsertEvent,
+  type WaveformViewPointerEvent,
+} from 'peaks.js';
 import { ModulationManager, type EnvelopeConfig, type LfoConfig, type ModulationTarget, type Waveform } from './modulation';
 import { type ProjectFile, type ProjectTimeline, parseProjectFile } from './project';
 
@@ -341,14 +348,36 @@ export function initTimeline(options: TimelineInitOptions) {
 
   const refreshSegmentColors = () => {
     if (!peaks) return;
+    const zoomView = peaks.views.getView('zoomview');
+    // Peaks keeps segment overlay drag handlers around; explicitly toggle dragging so
+    // only the currently-selected segment is draggable.
+    zoomView?.enableSegmentDragging(false);
     const segments = peaks.segments.getSegments();
     for (const seg of segments) {
       const id = seg.id;
       if (!id) continue;
       const kind = getSegmentKind(id);
       const base = kind === 'envelope' ? COLOR_ENV : COLOR_LFO;
-      seg.update({ color: id === selectedSegmentId ? COLOR_SELECTED : base });
+      const selected = id === selectedSegmentId;
+      seg.update({
+        color: selected ? COLOR_SELECTED : base,
+        editable: selected,
+      });
     }
+    if (selectedSegmentId) {
+      const selectedSeg = peaks.segments.getSegment(selectedSegmentId);
+      if (selectedSeg) {
+        // Ensure the selected segment is above any overlapping segments, so dragging
+        // targets the selected region (not the top-most).
+        const segmentsLayer =
+          (zoomView as any)?.getSegmentsLayer?.() ??
+          (zoomView as any)?._segmentsLayer ??
+          null;
+        const shape = segmentsLayer?.getSegmentShape?.(selectedSeg) ?? null;
+        (shape as any)?._moveToTop?.();
+      }
+    }
+    zoomView?.enableSegmentDragging(true);
   };
 
   const selectSegment = (segmentId: string | null) => {
@@ -364,7 +393,189 @@ export function initTimeline(options: TimelineInitOptions) {
     lfoContextMenu.textContent = '';
   };
 
-  const showContextMenu = (clientX: number, clientY: number, segmentId: string) => {
+  const convertSelectedEvent = (toKind: TimelineEventKind) => {
+    const segmentId = selectedSegmentId;
+    if (!segmentId) return;
+
+    const existingLfo = lfoBySegmentId.get(segmentId);
+    const existingEnv = envelopeBySegmentId.get(segmentId);
+    if (toKind === 'envelope' && !existingLfo) return;
+    if (toKind === 'lfo' && !existingEnv) return;
+
+    const seg = peaks?.segments.getSegment(segmentId);
+    const getWindow = (startSeconds?: number, endSeconds?: number) => {
+      const start = seg?.startTime ?? startSeconds ?? 0;
+      const end = seg?.endTime ?? endSeconds ?? start + barSeconds();
+      return { start, end };
+    };
+
+    if (toKind === 'envelope' && existingLfo) {
+      const lfo = existingLfo;
+      const { start, end } = getWindow(lfo.startSeconds, lfo.endSeconds);
+      const target = modulation.getTarget(lfo.targetId);
+      const base = target ? target.getCurrent() : 0;
+      const delta = computeDeltaRange(lfo);
+      let min = base + delta.min;
+      let max = base + delta.max;
+      if (min > max) {
+        const tmp = min;
+        min = max;
+        max = tmp;
+      }
+      if (target?.min !== undefined) {
+        min = Math.max(target.min, min);
+        max = Math.max(target.min, max);
+      }
+      if (target?.max !== undefined) {
+        min = Math.min(target.max, min);
+        max = Math.min(target.max, max);
+      }
+
+      modulation.removeLfo(lfo.id);
+      lfoBySegmentId.delete(segmentId);
+
+      const created = modulation.addEnvelope({
+        targetId: lfo.targetId,
+        wave: lfo.wave,
+        min,
+        max,
+        enabled: lfo.enabled,
+        startSeconds: start,
+        endSeconds: end,
+      });
+      if (!created) return;
+      const env = created as TimelineEnvelope;
+      env.segmentId = segmentId;
+      env.startSeconds = start;
+      env.endSeconds = end;
+      envelopeBySegmentId.set(segmentId, env);
+      (seg as any)?.update?.({ labelText: target ? target.label : env.targetId });
+      if (seg) {
+        (seg as any).envelopeId = env.id;
+        delete (seg as any).lfoId;
+      }
+    }
+
+    if (toKind === 'lfo' && existingEnv) {
+      const env = existingEnv;
+      const { start, end } = getWindow(env.startSeconds, env.endSeconds);
+      const duration = Math.max(1e-6, end - start);
+      const target = modulation.getTarget(env.targetId);
+      const base = target ? target.getCurrent() : (env.min + env.max) * 0.5;
+      const scale = target ? getTargetScale(target) : 1;
+
+      const center = (env.min + env.max) * 0.5;
+      const offsetAbs = center - base;
+      const amountAbs = Math.abs(env.max - env.min) * 0.5;
+      const offset = isFinite(offsetAbs / scale) ? offsetAbs / scale : 0;
+      const amount = isFinite(amountAbs / scale) ? amountAbs / scale : 0;
+
+      const freqHz = 1 / duration;
+      const phase = -start * freqHz * Math.PI * 2;
+
+      modulation.removeEnvelope(env.id);
+      envelopeBySegmentId.delete(segmentId);
+
+      const created = modulation.addLfo({
+        targetId: env.targetId,
+        wave: env.wave,
+        freqHz,
+        useGlobalBpm: false,
+        bpmCoefficient: 1,
+        amount,
+        offset,
+        phase,
+        bipolar: true,
+        smoothSeconds: 0,
+        enabled: env.enabled,
+        startSeconds: start,
+        endSeconds: end,
+      });
+      if (!created) return;
+      const lfo = created as TimelineLfo;
+      lfo.segmentId = segmentId;
+      lfo.startSeconds = start;
+      lfo.endSeconds = end;
+      lfoBySegmentId.set(segmentId, lfo);
+      (seg as any)?.update?.({ labelText: target ? target.label : lfo.targetId });
+      if (seg) {
+        (seg as any).lfoId = lfo.id;
+        delete (seg as any).envelopeId;
+      }
+    }
+
+    renderLfoList();
+    renderLfoEditor();
+    refreshSegmentColors();
+  };
+
+  const addEventAtTime = (timeSeconds: number, anchor: 'start' | 'end') => {
+    if (!peaks) return;
+    const bar = barSeconds();
+    if (!isFinite(bar) || bar <= 0) return;
+
+    const t = clampTime(timeSeconds);
+    let start: number;
+    let end: number;
+
+    if (anchor === 'start') {
+      start = snapToBar(t, 'floor');
+      end = start + bar;
+    } else {
+      end = snapToBar(t, 'ceil');
+      start = end - bar;
+    }
+
+    start = clampTime(start);
+    end = clampTime(end);
+
+    if (end <= start) {
+      end = clampTime(start + bar);
+    }
+    if (end <= start) return;
+
+    const seg = peaks.segments.add({
+      startTime: start,
+      endTime: end,
+      // Markers + draggable overlay are created at segment construction time in Peaks,
+      // so keep these enabled and then hide/lock via selection state.
+      editable: true,
+      markers: true,
+      color: insertKind === 'envelope' ? COLOR_ENV : COLOR_LFO,
+    });
+    createEventForSegment(seg);
+    options.onSegmentInserted?.(seg);
+  };
+
+  const showTimelineContextMenu = (clientX: number, clientY: number, timeSeconds: number) => {
+    lfoContextMenu.textContent = '';
+
+    const kindLabel = insertKind === 'envelope' ? 'ENV' : 'LFO';
+
+    const startBtn = document.createElement('button');
+    startBtn.type = 'button';
+    startBtn.textContent = `New ${kindLabel}: use this as START`;
+    startBtn.addEventListener('click', () => {
+      addEventAtTime(timeSeconds, 'start');
+      hideContextMenu();
+    });
+    lfoContextMenu.appendChild(startBtn);
+
+    const endBtn = document.createElement('button');
+    endBtn.type = 'button';
+    endBtn.textContent = `New ${kindLabel}: use this as END`;
+    endBtn.addEventListener('click', () => {
+      addEventAtTime(timeSeconds, 'end');
+      hideContextMenu();
+    });
+    lfoContextMenu.appendChild(endBtn);
+
+    lfoContextMenu.style.left = `${clientX}px`;
+    lfoContextMenu.style.top = `${clientY}px`;
+    lfoContextMenu.style.display = 'block';
+  };
+
+  const showSegmentContextMenu = (clientX: number, clientY: number, segmentId: string) => {
     const lfo = lfoBySegmentId.get(segmentId);
     const env = envelopeBySegmentId.get(segmentId);
     const kind: TimelineEventKind | null = lfo ? 'lfo' : env ? 'envelope' : null;
@@ -386,6 +597,16 @@ export function initTimeline(options: TimelineInitOptions) {
       hideContextMenu();
     });
     lfoContextMenu.appendChild(fullTrackBtn);
+
+    const convertBtn = document.createElement('button');
+    convertBtn.type = 'button';
+    convertBtn.textContent = kind === 'lfo' ? 'Convert to Envelope' : 'Convert to LFO';
+    convertBtn.addEventListener('click', () => {
+      selectSegment(segmentId);
+      convertSelectedEvent(kind === 'lfo' ? 'envelope' : 'lfo');
+      hideContextMenu();
+    });
+    lfoContextMenu.appendChild(convertBtn);
 
     lfoContextMenu.style.left = `${clientX}px`;
     lfoContextMenu.style.top = `${clientY}px`;
@@ -470,7 +691,7 @@ export function initTimeline(options: TimelineInitOptions) {
         e.preventDefault();
         e.stopPropagation();
         selectSegment(segmentId);
-        showContextMenu(e.clientX, e.clientY, segmentId);
+        showSegmentContextMenu(e.clientX, e.clientY, segmentId);
       });
       lfoList.appendChild(item);
     }
@@ -524,7 +745,16 @@ export function initTimeline(options: TimelineInitOptions) {
     if (lfo) {
       const header = document.createElement('div');
       header.className = 'lfo-editor-title';
-      header.textContent = `LFO ${lfo.id}`;
+      const title = document.createElement('span');
+      title.textContent = `LFO ${lfo.id}`;
+      header.appendChild(title);
+
+      const convertBtn = document.createElement('button');
+      convertBtn.type = 'button';
+      convertBtn.className = 'lfo-convert';
+      convertBtn.textContent = 'Convert → ENV';
+      convertBtn.addEventListener('click', () => convertSelectedEvent('envelope'));
+      header.appendChild(convertBtn);
       lfoEditor.appendChild(header);
 
       const enabledInput = document.createElement('input');
@@ -749,7 +979,16 @@ export function initTimeline(options: TimelineInitOptions) {
     if (env) {
       const header = document.createElement('div');
       header.className = 'lfo-editor-title';
-      header.textContent = `Envelope ${env.id}`;
+      const title = document.createElement('span');
+      title.textContent = `Envelope ${env.id}`;
+      header.appendChild(title);
+
+      const convertBtn = document.createElement('button');
+      convertBtn.type = 'button';
+      convertBtn.className = 'lfo-convert';
+      convertBtn.textContent = 'Convert → LFO';
+      convertBtn.addEventListener('click', () => convertSelectedEvent('lfo'));
+      header.appendChild(convertBtn);
       lfoEditor.appendChild(header);
 
       const enabledInput = document.createElement('input');
@@ -1064,7 +1303,8 @@ export function initTimeline(options: TimelineInitOptions) {
         zoomView?.enableSegmentDragging(true);
         zoomView?.setSegmentDragMode('overlap');
         zoomView?.setMinSegmentDragWidth(3);
-        zoomView?.setWaveformDragMode('insert-segment');
+        // Left click should seek/select, not insert new segments (insertion is via context menu).
+        zoomView?.setWaveformDragMode('scroll');
         updatePlayBtn();
 
         peaks.on('player.timeupdate', updatePlayBtn);
@@ -1083,7 +1323,10 @@ export function initTimeline(options: TimelineInitOptions) {
             id: segmentId,
             startTime: start,
             endTime: end,
+            // Markers + draggable overlay are created at segment construction time in Peaks.
+            // We hide markers and "lock" editing via selection state in refreshSegmentColors().
             editable: true,
+            markers: true,
             labelText: target ? target.label : lfo.targetId,
             color: segmentId === selectedSegmentId ? COLOR_SELECTED : COLOR_LFO,
           });
@@ -1097,6 +1340,7 @@ export function initTimeline(options: TimelineInitOptions) {
             startTime: start,
             endTime: end,
             editable: true,
+            markers: true,
             labelText: target ? target.label : env.targetId,
             color: segmentId === selectedSegmentId ? COLOR_SELECTED : COLOR_ENV,
           });
@@ -1123,6 +1367,24 @@ export function initTimeline(options: TimelineInitOptions) {
         peaks.on('segments.click', (event) => {
           selectSegment(event.segment.id ?? null);
         });
+
+        peaks.on('segments.contextmenu', (event: SegmentPointerEvent) => {
+          event.evt.preventDefault();
+          event.evt.stopPropagation();
+          event.preventViewEvent();
+          const segmentId = event.segment.id ?? null;
+          if (!segmentId) return;
+          selectSegment(segmentId);
+          showSegmentContextMenu(event.evt.clientX, event.evt.clientY, segmentId);
+        });
+
+        const onWaveformContextMenu = (event: WaveformViewPointerEvent) => {
+          event.evt.preventDefault();
+          event.evt.stopPropagation();
+          showTimelineContextMenu(event.evt.clientX, event.evt.clientY, event.time);
+        };
+        peaks.on('zoomview.contextmenu', onWaveformContextMenu);
+        peaks.on('overview.contextmenu', onWaveformContextMenu);
 
         peaks.on('segments.remove', (event) => {
           removeEventsForSegments(event.segments);

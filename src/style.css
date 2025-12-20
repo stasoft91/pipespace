@@ -127,9 +127,28 @@ body {
 }
 
 .lfo-editor-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   font-size: 12px;
   font-weight: 600;
   margin-bottom: 6px;
+}
+
+.lfo-convert {
+  flex: 0 0 auto;
+  background: #0f1622;
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.lfo-convert:hover {
+  background: #162235;
 }
 
 .lfo-row {
