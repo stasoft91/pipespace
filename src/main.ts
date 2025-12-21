@@ -58,6 +58,9 @@ import {
   RayMirrorSystemAllFaces,
 } from './mirrors';
 import type { MirrorReflectionMode, MirrorSystem } from './mirrors';
+import { createTeapotVisual, type TeapotVisual } from './simulations/teapot';
+import { createJuliaBulbVisual, type JuliaBulbVisual } from './simulations/juliaBulb';
+import { normalizeSimulationId, type SimulationId } from './simulations/types';
 
 type PathType = 'polyline' | 'catmullrom' | 'centripetal' | 'chordal';
 type FractalMode = 'julia' | 'mandelbrot';
@@ -66,6 +69,12 @@ const FRACTAL_COLOR_SCHEME_MAP: Record<FractalColorScheme, number> = {
   cosine: 0,
   escape: 1,
 };
+
+// Optional URL override for quick switching (e.g. `?sim=teapot`). Project/schedule settings still take precedence.
+const simulationUi = {
+  simulation: (normalizeSimulationId(new URLSearchParams(window.location.search).get('sim')) ?? 'tubes') as SimulationId,
+};
+let activeSimulationId: SimulationId = simulationUi.simulation;
 
 type RenderSettings = {
   pathType: PathType;
@@ -138,6 +147,28 @@ type RenderSettings = {
   curlStrength: number;
   curlScale: number;
   curlTimeRate: number;
+  juliaBulbCount: number;
+  juliaScale: number;
+  juliaSpeed: number;
+  juliaSpin: number;
+  juliaPower: number;
+  juliaIterations: number;
+  juliaCX: number;
+  juliaCY: number;
+  juliaCZ: number;
+  juliaZoom: number;
+  juliaColorA: string;
+  juliaColorB: string;
+  juliaFogColor: string;
+  juliaFogDensity: number;
+  juliaDepthMix: number;
+  juliaDepthCurve: number;
+  juliaIntensity: number;
+  juliaReflectivity: number;
+  juliaMetalness: number;
+  juliaRoughness: number;
+  juliaMaxSteps: number;
+  juliaSurfaceDistance: number;
 };
 
 type OrbitSettings = {
@@ -366,6 +397,28 @@ const renderSettings: RenderSettings = {
   curlStrength: 0.25,
   curlScale: 2.25,
   curlTimeRate: 0.45,
+  juliaBulbCount: 1,
+  juliaScale: 0.12,
+  juliaSpeed: 0.05,
+  juliaSpin: 0.25,
+  juliaPower: 8,
+  juliaIterations: 20,
+  juliaCX: -0.8,
+  juliaCY: -1.0,
+  juliaCZ: -0.07,
+  juliaZoom: 1.0,
+  juliaColorA: '#ff00dd',
+  juliaColorB: '#37ff00',
+  juliaFogColor: '#000000',
+  juliaFogDensity: 0.2,
+  juliaDepthMix: 1,
+  juliaDepthCurve: 3,
+  juliaIntensity: 1.2,
+  juliaReflectivity: 1,
+  juliaMetalness: 1,
+  juliaRoughness: 0,
+  juliaMaxSteps: 128,
+  juliaSurfaceDistance: 0.001,
 };
 
 const mirrorGuiSettings = {
@@ -431,6 +484,7 @@ const cameraControl = {
 };
 
 const PIPE_LAYER = 1;
+const MAX_JULIA_BULBS = 12;
 
 const sim = new Simulation(defaultSimConfig);
 
@@ -542,11 +596,25 @@ function createMirrorSystem(kind: MirrorRenderer): MirrorSystem {
 let roomMirrors: MirrorSystem = createMirrorSystem(mirrorRenderer);
 
 let gridLines = createGridOutline(defaultSimConfig.gridSize);
-gridLines.visible = renderSettings.showGrid;
+syncGridVisibility();
 scene.add(gridLines);
+
+let teapotVisual: TeapotVisual | null = null;
+let juliaBulbVisual: JuliaBulbVisual | null = null;
 
 const pipeMaterial = new MeshPhysicalMaterial({ vertexColors: true });
 updatePipeMaterial(renderSettings);
+
+teapotVisual = createTeapotVisual(PIPE_LAYER, room.size, { sizeFactor: 0.5 });
+teapotVisual.setVisible(activeSimulationId === 'teapot');
+scene.add(teapotVisual.mesh);
+// Ensure teapot material picks up the current pipe metal/roughness defaults.
+updatePipeMaterial(renderSettings);
+
+juliaBulbVisual = createJuliaBulbVisual(PIPE_LAYER, room.size);
+juliaBulbVisual.setVisible(activeSimulationId === 'juliabulb');
+juliaBulbVisual.syncToRoom(room.size, mirrorInset, renderSettings);
+scene.add(juliaBulbVisual.mesh);
 
 let edgeNeons!: EdgeNeonSystem;
 let pipeManager!: PipeVisualManager;
@@ -636,6 +704,7 @@ modulationBaseSetters = setupModulationTargets();
 
 const state = {
   paused: false,
+  autoPaused: false,
   elapsed: 0,
   fpsSmoothed: 0,
 };
@@ -879,11 +948,38 @@ function updateMirrorMask() {
 }
 
 function syncPipeVisibilityToMainCamera() {
-  if (renderSettings.hidePipesInMainCamera) {
+  const hidePipes = renderSettings.hidePipesInMainCamera && activeSimulationId === 'tubes';
+  if (hidePipes) {
     camera.layers.disable(PIPE_LAYER);
   } else {
     camera.layers.enable(PIPE_LAYER);
   }
+}
+
+function syncGridVisibility() {
+  gridLines.visible = Boolean(renderSettings.showGrid) && activeSimulationId === 'tubes';
+}
+
+function setActiveSimulation(next: SimulationId) {
+  const normalized = normalizeSimulationId(next) ?? 'tubes';
+  if (normalized === activeSimulationId) return;
+  activeSimulationId = normalized;
+  simulationUi.simulation = normalized;
+
+  if (teapotVisual) {
+    teapotVisual.setVisible(normalized === 'teapot');
+  }
+  if (juliaBulbVisual) {
+    juliaBulbVisual.setVisible(normalized === 'juliabulb');
+  }
+
+  // Ensure only the active simulation contributes to reflections.
+  if (normalized !== 'tubes') {
+    pipeManager.sync([], renderSettings);
+  }
+
+  syncGridVisibility();
+  syncPipeVisibilityToMainCamera();
 }
 
 function resize() {
@@ -1018,11 +1114,15 @@ function stepFrame(dt: number) {
   const enteringOrbit = cameraControl.mode === 'orbit' && lastCameraMode !== 'orbit';
   const enteringWallDrift = cameraControl.mode === 'wallDrift' && lastCameraMode !== 'wallDrift';
 
-  if (!state.paused) {
+  if (activeSimulationId === 'tubes' && !state.paused && !state.autoPaused) {
     const allStuck = sim.update(dt);
     if (allStuck) {
-      state.paused = true;
+      state.autoPaused = true;
     }
+  }
+  if (activeSimulationId === 'juliabulb') {
+    const simDt = state.paused ? 0 : dt;
+    juliaBulbVisual?.update(simDt, state.elapsed, room.size, mirrorInset, renderSettings);
   }
 
   const orbitRadius = room.size * 0.5;
@@ -1166,7 +1266,9 @@ function stepFrame(dt: number) {
   }
   camera.getWorldDirection(camDir);
 
-  pipeManager.sync(sim.pipes, renderSettings);
+  if (activeSimulationId === 'tubes') {
+    pipeManager.sync(sim.pipes, renderSettings);
+  }
   edgeNeons.sync(room.size, mirrorInset, renderSettings, state.elapsed);
   // Update mirrors after the camera and scene have settled for this frame
   camera.updateMatrixWorld();
@@ -1174,7 +1276,15 @@ function stepFrame(dt: number) {
   updateMirrorDistortionUniforms(state.elapsed);
   syncMirrorFractalUniforms();
   roomMirrors.updateFrame?.(renderer, scene, camera);
-  updateInfo(sim, state);
+  if (activeSimulationId === 'tubes') {
+    updateInfo(sim, state);
+  } else if (activeSimulationId === 'teapot') {
+    infoOverlay.textContent = `teapot • fps: ${state.fpsSmoothed.toFixed(0)}`;
+  } else if (activeSimulationId === 'juliabulb') {
+    infoOverlay.textContent = `julia bulb • fps: ${state.fpsSmoothed.toFixed(0)}`;
+  } else {
+    infoOverlay.textContent = `${activeSimulationId} • fps: ${state.fpsSmoothed.toFixed(0)}`;
+  }
 
   lastCameraMode = cameraControl.mode;
   const prismUniforms = prismPass?.uniforms as any;
@@ -1334,9 +1444,11 @@ async function renderVideoCapture(
   if (opts.startAtZero) {
     state.elapsed = 0;
     state.paused = false;
+    state.autoPaused = false;
     sim.reset();
     pipeManager.resetGridSize(sim.config.gridSize);
     pipeManager.sync([], renderSettings);
+    juliaBulbVisual?.reset(room.size, mirrorInset, renderSettings, state.elapsed);
   }
 
   const renderSize = videoResolutionToRenderSize(opts.videoResolution);
@@ -1474,6 +1586,17 @@ function setupGui() {
   gui.title('Pipes 98-ish');
 
   const simFolder = gui.addFolder('Simulation');
+  simFolder
+    .add(simulationUi, 'simulation', {
+      Tubes: 'tubes',
+      Teapot: 'teapot',
+      'Julia bulb': 'juliabulb',
+    })
+    .name('Type')
+    .onChange((v: unknown) => {
+      const id = normalizeSimulationId(v) ?? 'tubes';
+      setActiveSimulation(id);
+    });
   gridSizeController = simFolder
     .add(defaultSimConfig, 'gridSize', 12, 64, 1)
     .name('Grid size')
@@ -1483,11 +1606,13 @@ function setupGui() {
       sim.reset({ gridSize: size });
       pipeManager.resetGridSize(size);
       room.updateSize(size, renderSettings);
+      teapotVisual?.syncToRoom(room.size);
+      juliaBulbVisual?.syncToRoom(room.size, mirrorInset, renderSettings);
       roomMirrors.update(room.size, renderSettings.roomColor);
       disposeGridLines(gridLines);
       scene.remove(gridLines);
       gridLines = createGridOutline(size);
-      gridLines.visible = renderSettings.showGrid;
+      syncGridVisibility();
       scene.add(gridLines);
       const bounds = cameraDistanceBounds();
       cameraControl.distance = clamp(cameraControl.distance, bounds.min, bounds.max);
@@ -1527,7 +1652,9 @@ function setupGui() {
     .onChange((v: boolean) => {
       sim.config.disableTailShrink = v;
     });
-  simFolder.add(state, 'paused').name('Pause');
+  simFolder.add(state, 'paused').name('Pause').onChange((v: boolean) => {
+    if (!v) state.autoPaused = false;
+  });
   simFolder
     .add(
       {
@@ -1535,14 +1662,17 @@ function setupGui() {
           sim.reset();
           pipeManager.resetGridSize(sim.config.gridSize);
           room.updateSize(sim.config.gridSize, renderSettings);
+          teapotVisual?.syncToRoom(room.size);
+          juliaBulbVisual?.reset(room.size, mirrorInset, renderSettings, state.elapsed);
           roomMirrors.update(room.size, renderSettings.roomColor);
           disposeGridLines(gridLines);
           scene.remove(gridLines);
           gridLines = createGridOutline(sim.config.gridSize);
-          gridLines.visible = renderSettings.showGrid;
+          syncGridVisibility();
           scene.add(gridLines);
           refreshCameraDistanceController();
           refreshBokehFocusController();
+          state.autoPaused = false;
           modulation.syncBaseFromTargets();
         },
       },
@@ -1606,10 +1736,12 @@ function setupGui() {
     });
   pipeFolder.add(renderSettings, 'pipeRoughness', 0, 1, 0.01).name('Roughness').onChange((v: number) => {
     pipeMaterial.roughness = v;
+    teapotVisual?.setMaterial({ metalness: renderSettings.pipeMetalness, roughness: v });
     modulationBaseSetters['pipes.roughness']?.(v);
   });
   pipeFolder.add(renderSettings, 'pipeMetalness', 0, 1, 0.01).name('Metalness').onChange((v: number) => {
     pipeMaterial.metalness = v;
+    teapotVisual?.setMaterial({ metalness: v, roughness: renderSettings.pipeRoughness });
     modulationBaseSetters['pipes.metalness']?.(v);
   });
   pipeFolder
@@ -1624,6 +1756,99 @@ function setupGui() {
   });
   pipeFolder.add(renderSettings, 'neonSize', 0.98, 1.2, 0.005).name('Neon size').onChange(() => {
     modulationBaseSetters['pipes.neonSize']?.(renderSettings.neonSize);
+  });
+
+  const juliaFolder = gui.addFolder('Julia bulb');
+  juliaFolder
+    .add(renderSettings, 'juliaBulbCount', 1, MAX_JULIA_BULBS, 1)
+    .name('Bulbs number')
+    .onChange((v: number) => {
+      renderSettings.juliaBulbCount = clamp(Math.round(v), 1, MAX_JULIA_BULBS);
+      modulationBaseSetters['julia.count']?.(renderSettings.juliaBulbCount);
+    });
+  juliaFolder.add(renderSettings, 'juliaScale', 0.12, 0.75, 0.005).name('Size').onChange((v: number) => {
+    renderSettings.juliaScale = clamp(v, 0.12, 0.75);
+    juliaBulbVisual?.syncToRoom(room.size, mirrorInset, renderSettings);
+    modulationBaseSetters['julia.size']?.(renderSettings.juliaScale);
+  });
+  juliaFolder.add(renderSettings, 'juliaSpeed', 0, 0.4, 0.005).name('Speed').onChange((v: number) => {
+    renderSettings.juliaSpeed = clamp(v, 0, 0.4);
+    modulationBaseSetters['julia.speed']?.(renderSettings.juliaSpeed);
+  });
+  juliaFolder.add(renderSettings, 'juliaSpin', -2, 2, 0.01).name('Spin').onChange((v: number) => {
+    renderSettings.juliaSpin = clamp(v, -2, 2);
+    modulationBaseSetters['julia.spin']?.(renderSettings.juliaSpin);
+  });
+  juliaFolder.add(renderSettings, 'juliaPower', 2, 20, 0.01).name('Power').onChange((v: number) => {
+    renderSettings.juliaPower = clamp(v, 2, 20);
+    modulationBaseSetters['julia.power']?.(renderSettings.juliaPower);
+  });
+  juliaFolder.add(renderSettings, 'juliaIterations', 1, 20, 1).name('Iterations').onChange((v: number) => {
+    renderSettings.juliaIterations = clamp(Math.round(v), 1, 20);
+    modulationBaseSetters['julia.iterations']?.(renderSettings.juliaIterations);
+  });
+  juliaFolder.add(renderSettings, 'juliaCX', -2, 2, 0.01).name('C.x').onChange((v: number) => {
+    renderSettings.juliaCX = clamp(v, -2, 2);
+    modulationBaseSetters['julia.cx']?.(renderSettings.juliaCX);
+  });
+  juliaFolder.add(renderSettings, 'juliaCY', -2, 2, 0.01).name('C.y').onChange((v: number) => {
+    renderSettings.juliaCY = clamp(v, -2, 2);
+    modulationBaseSetters['julia.cy']?.(renderSettings.juliaCY);
+  });
+  juliaFolder.add(renderSettings, 'juliaCZ', -2, 2, 0.01).name('C.z').onChange((v: number) => {
+    renderSettings.juliaCZ = clamp(v, -2, 2);
+    modulationBaseSetters['julia.cz']?.(renderSettings.juliaCZ);
+  });
+  juliaFolder.add(renderSettings, 'juliaZoom', 0.4, 2.5, 0.01).name('Zoom').onChange((v: number) => {
+    renderSettings.juliaZoom = clamp(v, 0.4, 2.5);
+    modulationBaseSetters['julia.zoom']?.(renderSettings.juliaZoom);
+  });
+  juliaFolder.add(renderSettings, 'juliaIntensity', 0, 3, 0.01).name('Intensity').onChange((v: number) => {
+    renderSettings.juliaIntensity = clamp(v, 0, 3);
+    modulationBaseSetters['julia.intensity']?.(renderSettings.juliaIntensity);
+  });
+  juliaFolder.add(renderSettings, 'juliaDepthMix', 0, 1, 0.01).name('Depth mix').onChange((v: number) => {
+    renderSettings.juliaDepthMix = clamp(v, 0, 1);
+    modulationBaseSetters['julia.depthMix']?.(renderSettings.juliaDepthMix);
+  });
+  juliaFolder.add(renderSettings, 'juliaDepthCurve', 0.2, 3, 0.01).name('Depth curve').onChange((v: number) => {
+    renderSettings.juliaDepthCurve = clamp(v, 0.2, 3);
+    modulationBaseSetters['julia.depthCurve']?.(renderSettings.juliaDepthCurve);
+  });
+  juliaFolder.add(renderSettings, 'juliaFogDensity', 0, 2.5, 0.01).name('Fog density').onChange((v: number) => {
+    renderSettings.juliaFogDensity = clamp(v, 0, 2.5);
+    modulationBaseSetters['julia.fogDensity']?.(renderSettings.juliaFogDensity);
+  });
+  juliaFolder.add(renderSettings, 'juliaMaxSteps', 8, 128, 1).name('Max steps').onChange((v: number) => {
+    renderSettings.juliaMaxSteps = clamp(Math.round(v), 8, 128);
+    modulationBaseSetters['julia.maxSteps']?.(renderSettings.juliaMaxSteps);
+  });
+  juliaFolder.add(renderSettings, 'juliaSurfaceDistance', 0.00005, 0.01, 0.00005).name('Surface dist').onChange((v: number) => {
+    renderSettings.juliaSurfaceDistance = clamp(v, 0.00005, 0.01);
+    modulationBaseSetters['julia.surfaceDistance']?.(renderSettings.juliaSurfaceDistance);
+  });
+  juliaFolder.addColor(renderSettings, 'juliaColorA').name('Base color').onChange(() => {
+    modulationBaseSetters['julia.hue']?.(hueFromHex(renderSettings.juliaColorA));
+  });
+  juliaFolder.addColor(renderSettings, 'juliaColorB').name('Depth color').onChange(() => {
+    modulationBaseSetters['julia.accentHue']?.(hueFromHex(renderSettings.juliaColorB));
+  });
+  juliaFolder.addColor(renderSettings, 'juliaFogColor').name('Fog color').onChange(() => {
+    modulationBaseSetters['julia.fogHue']?.(hueFromHex(renderSettings.juliaFogColor));
+  });
+
+  const juliaMaterialFolder = juliaFolder.addFolder('Material');
+  juliaMaterialFolder.add(renderSettings, 'juliaReflectivity', 0, 1, 0.01).name('Reflectivity').onChange((v: number) => {
+    renderSettings.juliaReflectivity = clamp(v, 0, 1);
+    modulationBaseSetters['julia.reflectivity']?.(renderSettings.juliaReflectivity);
+  });
+  juliaMaterialFolder.add(renderSettings, 'juliaRoughness', 0, 1, 0.01).name('Roughness').onChange((v: number) => {
+    renderSettings.juliaRoughness = clamp(v, 0, 1);
+    modulationBaseSetters['julia.roughness']?.(renderSettings.juliaRoughness);
+  });
+  juliaMaterialFolder.add(renderSettings, 'juliaMetalness', 0, 1, 0.01).name('Metalness').onChange((v: number) => {
+    renderSettings.juliaMetalness = clamp(v, 0, 1);
+    modulationBaseSetters['julia.metalness']?.(renderSettings.juliaMetalness);
   });
 
   const edgeNeonFolder = gui.addFolder('Edge neon');
@@ -1667,6 +1892,8 @@ function setupGui() {
       roomPadding = Math.min(70, Math.max(0, v));
       roomGuiSettings.wallGap = roomPadding;
       room.updateSize(sim.config.gridSize, renderSettings);
+      teapotVisual?.syncToRoom(room.size);
+      juliaBulbVisual?.syncToRoom(room.size, mirrorInset, renderSettings);
       roomMirrors.update(room.size, renderSettings.roomColor);
       clampCameraToRoom(camera.position);
       const { min, max } = cameraDistanceBounds();
@@ -1756,6 +1983,7 @@ function setupGui() {
       mirrorInset = Math.max(0, v);
       roomMirrors.setInset(mirrorInset);
       roomMirrors.update(room.size, renderSettings.roomColor);
+      juliaBulbVisual?.syncToRoom(room.size, mirrorInset, renderSettings);
       modulationBaseSetters['mirror.inset']?.(mirrorInset);
     });
   mirrorFolder
@@ -1773,8 +2001,8 @@ function setupGui() {
       mirrorFacesPerFrame = Math.max(1, Math.floor(v));
       modulationBaseSetters['mirror.facesPerFrame']?.(mirrorFacesPerFrame);
     });
-  mirrorFolder.add(renderSettings, 'showGrid').name('Show grid').onChange((visible: boolean) => {
-    gridLines.visible = visible;
+  mirrorFolder.add(renderSettings, 'showGrid').name('Show grid').onChange(() => {
+    syncGridVisibility();
   });
 
   const mirrorFractalFolder = mirrorFolder.addFolder('Fractal Warp');
@@ -2475,6 +2703,8 @@ function setupModulationTargets() {
       roomPadding = clamp(v, 0, 70);
       roomGuiSettings.wallGap = roomPadding;
       room.updateSize(sim.config.gridSize, renderSettings);
+      teapotVisual?.syncToRoom(room.size);
+      juliaBulbVisual?.syncToRoom(room.size, mirrorInset, renderSettings);
       roomMirrors.update(room.size, renderSettings.roomColor);
       clampCameraToRoom(camera.position);
       const { min, max } = cameraDistanceBounds();
@@ -2493,6 +2723,7 @@ function setupModulationTargets() {
       mirrorInset = Math.max(0, v);
       roomMirrors.setInset(mirrorInset);
       roomMirrors.update(room.size, renderSettings.roomColor);
+      juliaBulbVisual?.syncToRoom(room.size, mirrorInset, renderSettings);
     },
   });
   register('mirror.maxResolution', 'Mirrors', 'Max resolution', {
@@ -2597,6 +2828,7 @@ function setupModulationTargets() {
     set: (v: number) => {
       renderSettings.pipeMetalness = clamp(v, 0, 1);
       pipeMaterial.metalness = renderSettings.pipeMetalness;
+      teapotVisual?.setMaterial({ metalness: renderSettings.pipeMetalness, roughness: renderSettings.pipeRoughness });
     },
   });
   register('pipes.roughness', 'Pipes', 'Roughness', {
@@ -2607,6 +2839,7 @@ function setupModulationTargets() {
     set: (v: number) => {
       renderSettings.pipeRoughness = clamp(v, 0, 1);
       pipeMaterial.roughness = renderSettings.pipeRoughness;
+      teapotVisual?.setMaterial({ metalness: renderSettings.pipeMetalness, roughness: renderSettings.pipeRoughness });
     },
   });
   register('pipes.neonStrength', 'Pipes', 'Neon strength', {
@@ -2625,6 +2858,206 @@ function setupModulationTargets() {
     get: () => renderSettings.neonSize,
     set: (v: number) => {
       renderSettings.neonSize = clamp(v, 0.98, 1.2);
+    },
+  });
+
+  register('julia.count', 'Julia bulb', 'Bulbs number', {
+    min: 1,
+    max: MAX_JULIA_BULBS,
+    range: MAX_JULIA_BULBS - 1,
+    get: () => renderSettings.juliaBulbCount,
+    set: (v: number) => {
+      renderSettings.juliaBulbCount = clamp(Math.round(v), 1, MAX_JULIA_BULBS);
+    },
+  });
+  register('julia.size', 'Julia bulb', 'Size', {
+    min: 0.12,
+    max: 0.75,
+    range: 0.63,
+    get: () => renderSettings.juliaScale,
+    set: (v: number) => {
+      renderSettings.juliaScale = clamp(v, 0.12, 0.75);
+      juliaBulbVisual?.syncToRoom(room.size, mirrorInset, renderSettings);
+    },
+  });
+  register('julia.speed', 'Julia bulb', 'Speed', {
+    min: 0,
+    max: 0.4,
+    range: 0.4,
+    get: () => renderSettings.juliaSpeed,
+    set: (v: number) => {
+      renderSettings.juliaSpeed = clamp(v, 0, 0.4);
+    },
+  });
+  register('julia.spin', 'Julia bulb', 'Spin', {
+    min: -2,
+    max: 2,
+    range: 4,
+    get: () => renderSettings.juliaSpin,
+    set: (v: number) => {
+      renderSettings.juliaSpin = clamp(v, -2, 2);
+    },
+  });
+  register('julia.power', 'Julia bulb', 'Power', {
+    min: 2,
+    max: 20,
+    range: 18,
+    get: () => renderSettings.juliaPower,
+    set: (v: number) => {
+      renderSettings.juliaPower = clamp(v, 2, 20);
+    },
+  });
+  register('julia.iterations', 'Julia bulb', 'Iterations', {
+    min: 1,
+    max: 20,
+    range: 19,
+    get: () => renderSettings.juliaIterations,
+    set: (v: number) => {
+      renderSettings.juliaIterations = clamp(Math.round(v), 1, 20);
+    },
+  });
+  register('julia.cx', 'Julia bulb', 'C.x', {
+    min: -2,
+    max: 2,
+    range: 4,
+    get: () => renderSettings.juliaCX,
+    set: (v: number) => {
+      renderSettings.juliaCX = clamp(v, -2, 2);
+    },
+  });
+  register('julia.cy', 'Julia bulb', 'C.y', {
+    min: -2,
+    max: 2,
+    range: 4,
+    get: () => renderSettings.juliaCY,
+    set: (v: number) => {
+      renderSettings.juliaCY = clamp(v, -2, 2);
+    },
+  });
+  register('julia.cz', 'Julia bulb', 'C.z', {
+    min: -2,
+    max: 2,
+    range: 4,
+    get: () => renderSettings.juliaCZ,
+    set: (v: number) => {
+      renderSettings.juliaCZ = clamp(v, -2, 2);
+    },
+  });
+  register('julia.zoom', 'Julia bulb', 'Zoom', {
+    min: 0.4,
+    max: 2.5,
+    range: 2.1,
+    get: () => renderSettings.juliaZoom,
+    set: (v: number) => {
+      renderSettings.juliaZoom = clamp(v, 0.4, 2.5);
+    },
+  });
+  register('julia.intensity', 'Julia bulb', 'Intensity', {
+    min: 0,
+    max: 3,
+    range: 3,
+    get: () => renderSettings.juliaIntensity,
+    set: (v: number) => {
+      renderSettings.juliaIntensity = clamp(v, 0, 3);
+    },
+  });
+  register('julia.reflectivity', 'Julia bulb', 'Reflectivity', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.juliaReflectivity,
+    set: (v: number) => {
+      renderSettings.juliaReflectivity = clamp(v, 0, 1);
+    },
+  });
+  register('julia.roughness', 'Julia bulb', 'Roughness', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.juliaRoughness,
+    set: (v: number) => {
+      renderSettings.juliaRoughness = clamp(v, 0, 1);
+    },
+  });
+  register('julia.metalness', 'Julia bulb', 'Metalness', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.juliaMetalness,
+    set: (v: number) => {
+      renderSettings.juliaMetalness = clamp(v, 0, 1);
+    },
+  });
+  register('julia.depthMix', 'Julia bulb', 'Depth mix', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => renderSettings.juliaDepthMix,
+    set: (v: number) => {
+      renderSettings.juliaDepthMix = clamp(v, 0, 1);
+    },
+  });
+  register('julia.depthCurve', 'Julia bulb', 'Depth curve', {
+    min: 0.2,
+    max: 3,
+    range: 2.8,
+    get: () => renderSettings.juliaDepthCurve,
+    set: (v: number) => {
+      renderSettings.juliaDepthCurve = clamp(v, 0.2, 3);
+    },
+  });
+  register('julia.fogDensity', 'Julia bulb', 'Fog density', {
+    min: 0,
+    max: 2.5,
+    range: 2.5,
+    get: () => renderSettings.juliaFogDensity,
+    set: (v: number) => {
+      renderSettings.juliaFogDensity = clamp(v, 0, 2.5);
+    },
+  });
+  register('julia.maxSteps', 'Julia bulb', 'Max steps', {
+    min: 8,
+    max: 128,
+    range: 120,
+    get: () => renderSettings.juliaMaxSteps,
+    set: (v: number) => {
+      renderSettings.juliaMaxSteps = clamp(Math.round(v), 8, 128);
+    },
+  });
+  register('julia.surfaceDistance', 'Julia bulb', 'Surface distance', {
+    min: 0.00005,
+    max: 0.01,
+    range: 0.00995,
+    get: () => renderSettings.juliaSurfaceDistance,
+    set: (v: number) => {
+      renderSettings.juliaSurfaceDistance = clamp(v, 0.00005, 0.01);
+    },
+  });
+  register('julia.hue', 'Julia bulb', 'Base hue', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => hueFromHex(renderSettings.juliaColorA),
+    set: (v: number) => {
+      renderSettings.juliaColorA = applyHueToHex(renderSettings.juliaColorA, v);
+    },
+  });
+  register('julia.accentHue', 'Julia bulb', 'Depth hue', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => hueFromHex(renderSettings.juliaColorB),
+    set: (v: number) => {
+      renderSettings.juliaColorB = applyHueToHex(renderSettings.juliaColorB, v);
+    },
+  });
+  register('julia.fogHue', 'Julia bulb', 'Fog hue', {
+    min: 0,
+    max: 1,
+    range: 1,
+    get: () => hueFromHex(renderSettings.juliaFogColor),
+    set: (v: number) => {
+      renderSettings.juliaFogColor = applyHueToHex(renderSettings.juliaFogColor, v);
     },
   });
 
@@ -3301,7 +3734,7 @@ function rebuildGrid(size: number) {
   disposeGridLines(gridLines);
   scene.remove(gridLines);
   gridLines = createGridOutline(size);
-  gridLines.visible = renderSettings.showGrid;
+  syncGridVisibility();
   scene.add(gridLines);
 }
 
@@ -3524,6 +3957,8 @@ function randomizeAll() {
   });
   pipeManager.resetGridSize(defaultSimConfig.gridSize);
   room.updateSize(defaultSimConfig.gridSize, renderSettings);
+  teapotVisual?.syncToRoom(room.size);
+  juliaBulbVisual?.syncToRoom(room.size, mirrorInset, renderSettings);
   room.material.color.set(renderSettings.roomColor);
   room.material.roughness = renderSettings.roomRoughness;
   room.material.metalness = renderSettings.roomMetalness;
@@ -3538,8 +3973,9 @@ function randomizeAll() {
   bloomPass.threshold = renderSettings.bloomThreshold;
   updateBloomResolution();
 
-  gridLines.visible = renderSettings.showGrid;
+  syncGridVisibility();
   state.paused = false;
+  state.autoPaused = false;
 
   gridSizeController?.setValue(defaultSimConfig.gridSize);
   targetCountController?.setValue(defaultSimConfig.targetPipeCount);
@@ -4188,6 +4624,7 @@ function downloadTextFile(filename: string, text: string, mimeType = 'applicatio
 
 function buildProjectSettings(): ProjectSettings {
   return {
+    simulationId: activeSimulationId,
     simConfig: { ...defaultSimConfig },
     renderSettings: { ...renderSettings },
     roomPadding,
@@ -4226,6 +4663,8 @@ function snapshotProjectSettings(): ProjectSettings {
 }
 
 function applyProjectSettings(settings: ProjectSettings) {
+  const desiredSimulationId = normalizeSimulationId(settings.simulationId) ?? 'tubes';
+
   const cfg = settings.simConfig;
   defaultSimConfig.gridSize = Math.max(8, Math.floor(cfg.gridSize));
   defaultSimConfig.targetPipeCount = Math.max(1, Math.floor(cfg.targetPipeCount));
@@ -4361,13 +4800,18 @@ function applyProjectSettings(settings: ProjectSettings) {
 
   state.elapsed = 0;
   state.paused = false;
+  state.autoPaused = false;
   sim.reset(defaultSimConfig);
   pipeManager.resetGridSize(sim.config.gridSize);
   pipeManager.sync([], renderSettings);
 
   room.updateSize(sim.config.gridSize, renderSettings);
+  teapotVisual?.syncToRoom(room.size);
+  juliaBulbVisual?.reset(room.size, mirrorInset, renderSettings, state.elapsed);
   roomMirrors.update(room.size, renderSettings.roomColor);
   rebuildGrid(sim.config.gridSize);
+
+  setActiveSimulation(desiredSimulationId);
 
   syncPipeVisibilityToMainCamera();
   updatePipeMaterial(renderSettings);
@@ -4489,4 +4933,9 @@ function updatePipeMaterial(settings: RenderSettings) {
   pipeMaterial.envMap = null;
   pipeMaterial.envMapIntensity = 0;
   pipeMaterial.needsUpdate = true;
+
+  if (teapotVisual) {
+    // Share the pipe metal/roughness controls with the teapot so existing modulations work.
+    teapotVisual.setMaterial({ metalness: settings.pipeMetalness, roughness: settings.pipeRoughness });
+  }
 }

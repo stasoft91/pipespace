@@ -93,6 +93,28 @@ export type ProjectRenderSettings = {
   curlStrength: number;
   curlScale: number;
   curlTimeRate: number;
+  juliaBulbCount: number;
+  juliaScale: number;
+  juliaSpeed: number;
+  juliaSpin: number;
+  juliaPower: number;
+  juliaIterations: number;
+  juliaCX: number;
+  juliaCY: number;
+  juliaCZ: number;
+  juliaZoom: number;
+  juliaColorA: string;
+  juliaColorB: string;
+  juliaFogColor: string;
+  juliaFogDensity: number;
+  juliaDepthMix: number;
+  juliaDepthCurve: number;
+  juliaIntensity: number;
+  juliaReflectivity: number;
+  juliaMetalness: number;
+  juliaRoughness: number;
+  juliaMaxSteps: number;
+  juliaSurfaceDistance: number;
 };
 
 export type ProjectMirrorSettings = {
@@ -146,6 +168,10 @@ export type ProjectRailSettings = {
 };
 
 export type ProjectSettings = {
+  /**
+   * Which simulation/scene is active. Optional for backwards compatibility with older projects.
+   */
+  simulationId?: 'tubes' | 'teapot' | 'juliabulb';
   simConfig: SimulationConfig;
   renderSettings: ProjectRenderSettings;
   roomPadding: number;
