@@ -580,6 +580,80 @@ export function initTimeline(options: TimelineInitOptions) {
     lfoContextMenu.style.display = 'block';
   };
 
+  const duplicateSegment = (segmentId: string) => {
+    const lfo = lfoBySegmentId.get(segmentId);
+    const env = envelopeBySegmentId.get(segmentId);
+    const kind: TimelineEventKind | null = lfo ? 'lfo' : env ? 'envelope' : null;
+    if (!kind) return;
+
+    const source = kind === 'lfo' ? lfo : env;
+    if (!source) return;
+
+    const seg = peaks?.segments.getSegment(segmentId);
+    const start = seg?.startTime ?? source.startSeconds ?? 0;
+    const end = seg?.endTime ?? source.endSeconds ?? start + barSeconds();
+    const newSegmentId = `seg-${Math.random().toString(16).slice(2)}`;
+    const target = modulation.getTarget(source.targetId);
+    const labelText = target ? target.label : source.targetId;
+
+    const createdSegment = peaks
+      ? peaks.segments.add({
+          id: newSegmentId,
+          startTime: start,
+          endTime: end,
+          editable: true,
+          markers: true,
+          labelText,
+          color: kind === 'envelope' ? COLOR_ENV : COLOR_LFO,
+        })
+      : null;
+
+    if (kind === 'lfo' && lfo) {
+      const created = modulation.addLfo({
+        targetId: lfo.targetId,
+        wave: lfo.wave,
+        bpmCoefficient: lfo.bpmCoefficient,
+        amount: lfo.amount,
+        offset: lfo.offset,
+        phase: lfo.phase,
+        bipolar: lfo.bipolar,
+        smoothSeconds: lfo.smoothSeconds,
+        enabled: lfo.enabled,
+        startSeconds: start,
+        endSeconds: end,
+      });
+      if (!created) return;
+      const next = created as TimelineLfo;
+      next.segmentId = newSegmentId;
+      next.startSeconds = start;
+      next.endSeconds = end;
+      lfoBySegmentId.set(newSegmentId, next);
+      if (createdSegment) (createdSegment as any).lfoId = next.id;
+    }
+
+    if (kind === 'envelope' && env) {
+      const created = modulation.addEnvelope({
+        targetId: env.targetId,
+        wave: env.wave,
+        min: env.min,
+        max: env.max,
+        enabled: env.enabled,
+        startSeconds: start,
+        endSeconds: end,
+      });
+      if (!created) return;
+      const next = created as TimelineEnvelope;
+      next.segmentId = newSegmentId;
+      next.startSeconds = start;
+      next.endSeconds = end;
+      envelopeBySegmentId.set(newSegmentId, next);
+      if (createdSegment) (createdSegment as any).envelopeId = next.id;
+    }
+
+    if (createdSegment) options.onSegmentInserted?.(createdSegment);
+    selectSegment(newSegmentId);
+  };
+
   const showSegmentContextMenu = (clientX: number, clientY: number, segmentId: string) => {
     const lfo = lfoBySegmentId.get(segmentId);
     const env = envelopeBySegmentId.get(segmentId);
@@ -602,6 +676,15 @@ export function initTimeline(options: TimelineInitOptions) {
       hideContextMenu();
     });
     lfoContextMenu.appendChild(fullTrackBtn);
+
+    const duplicateBtn = document.createElement('button');
+    duplicateBtn.type = 'button';
+    duplicateBtn.textContent = 'Duplicate';
+    duplicateBtn.addEventListener('click', () => {
+      duplicateSegment(segmentId);
+      hideContextMenu();
+    });
+    lfoContextMenu.appendChild(duplicateBtn);
 
     const convertBtn = document.createElement('button');
     convertBtn.type = 'button';
