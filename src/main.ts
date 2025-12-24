@@ -491,6 +491,7 @@ const sim = new Simulation(defaultSimConfig);
 const renderer = new WebGLRenderer({
   antialias: true,
   canvas,
+  powerPreference: 'high-performance',
 });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 const { width: initialWidth, height: initialHeight } = simBounds();
@@ -4872,15 +4873,17 @@ timelineHandle = initTimeline({
   onSaveProject: () => saveProject(),
   onLoadProject: (project) => loadProject(project),
   onRenderVideo: (durationSeconds) => {
+    const safeDuration = Number.isFinite(durationSeconds) ? Math.max(0.1, durationSeconds) : 10;
     const schedule = timelineHandle?.getRenderSchedule();
     if (schedule) {
-      requestBackendRender(schedule).catch((err) => {
+      const scheduleWithDuration = { ...schedule, durationSeconds: safeDuration };
+      requestBackendRender(scheduleWithDuration).catch((err) => {
         console.warn('Backend render failed; falling back to in-browser render', err);
-        renderVideoCapture(durationSeconds, { startAtZero: true, videoResolution: schedule.videoResolution });
+        renderVideoCapture(safeDuration, { startAtZero: true, videoResolution: scheduleWithDuration.videoResolution });
       });
       return;
     }
-    renderVideoCapture(durationSeconds, { startAtZero: true });
+    renderVideoCapture(safeDuration, { startAtZero: true });
   },
 });
 

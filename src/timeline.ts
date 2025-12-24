@@ -137,11 +137,24 @@ export function initTimeline(options: TimelineInitOptions) {
   resolutionLabel.appendChild(resolutionSelect);
   controls.appendChild(resolutionLabel);
 
+  const PREVIEW_RENDER_SECONDS = 21;
+
   const renderBtn = document.createElement('button');
   renderBtn.type = 'button';
   renderBtn.textContent = 'Render Video';
   renderBtn.disabled = true;
   controls.appendChild(renderBtn);
+
+  const previewToggle = document.createElement('input');
+  previewToggle.type = 'checkbox';
+  previewToggle.setAttribute('aria-label', `Render first ${PREVIEW_RENDER_SECONDS}s only`);
+
+  const previewLabel = document.createElement('label');
+  previewLabel.className = 'timeline-preview-toggle';
+  previewLabel.title = `Render only the first ${PREVIEW_RENDER_SECONDS}s`;
+  previewLabel.appendChild(previewToggle);
+  previewLabel.appendChild(document.createTextNode(`Preview ${PREVIEW_RENDER_SECONDS}s`));
+  controls.appendChild(previewLabel);
 
   const saveBtn = document.createElement('button');
   saveBtn.type = 'button';
@@ -1549,7 +1562,9 @@ export function initTimeline(options: TimelineInitOptions) {
   });
 
   renderBtn.addEventListener('click', () => {
-    const duration = audioDurationSeconds ?? 10;
+    const baseDuration =
+      audioDurationSeconds !== null && isFinite(audioDurationSeconds) ? audioDurationSeconds : 10;
+    const duration = previewToggle.checked ? Math.min(PREVIEW_RENDER_SECONDS, baseDuration) : baseDuration;
     options.onRenderVideo?.(duration);
   });
 

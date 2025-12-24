@@ -276,6 +276,18 @@ body {
   padding: 3px 6px;
 }
 
+.timeline-preview-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+  font-size: 11px;
+}
+
+.timeline-preview-toggle input {
+  accent-color: #4fd1ff;
+}
+
 .timeline-zoom {
   display: inline-flex;
   align-items: center;

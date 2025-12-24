@@ -3,6 +3,7 @@ import path from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
+import { spawn } from 'node:child_process';
 import puppeteer from 'puppeteer';
 
 const PORT = Number(process.env.RENDER_PORT ?? 3333);
@@ -67,6 +68,45 @@ const waitForStableFile = async (filePath, timeoutMs) => {
   throw new Error(`Timed out waiting for file: ${filePath}`);
 };
 
+const convertIvfToMp4 = async (ivfPath, base) => {
+  const mp4Path = path.join(path.dirname(ivfPath), `${base}.mp4`);
+  console.log(`[render:${base}] Converting IVF to MP4: ${ivfPath} -> ${mp4Path}`);
+
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn('ffmpeg', [
+      '-y',
+      '-i', ivfPath,
+      '-c:v', 'libx264',
+      '-preset', 'medium',
+      '-crf', '23',
+      '-pix_fmt', 'yuv420p',
+      '-movflags', '+faststart',
+      mp4Path
+    ]);
+
+    let stderr = '';
+    ffmpeg.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    ffmpeg.on('close', (code) => {
+      if (code === 0) {
+        console.log(`[render:${base}] MP4 conversion successful: ${mp4Path}`);
+        resolve(mp4Path);
+      } else {
+        console.error(`[render:${base}] FFmpeg conversion failed with code ${code}`);
+        console.error(stderr);
+        reject(new Error(`FFmpeg conversion failed: ${code}`));
+      }
+    });
+
+    ffmpeg.on('error', (err) => {
+      console.error(`[render:${base}] Failed to spawn ffmpeg:`, err);
+      reject(err);
+    });
+  });
+};
+
 let busy = false;
 
 async function runRenderJob({ schedule, outputBase, appUrl }) {
@@ -79,9 +119,21 @@ async function runRenderJob({ schedule, outputBase, appUrl }) {
   console.log(`[render:${base}] App URL: ${targetUrl}`);
   console.log(`[render:${base}] Output dir: ${RENDER_DIR}`);
 
+  const launchArgs = [];
+  if (process.platform === 'darwin') {
+    launchArgs.push(
+      '--use-angle=metal',
+      '--use-gl=angle',
+      '--enable-features=Metal',
+      '--ignore-gpu-blocklist',
+      '--disable-software-rasterizer'
+    );
+  }
+
   const browser = await puppeteer.launch({
     headless: 'new',
     defaultViewport: { width: 1920, height: 1080, deviceScaleFactor: 1 },
+    args: launchArgs,
     // Long renders can exceed the default CDP call timeout. We'll avoid awaiting
     // long-running page functions, but bump this anyway for safety.
     protocolTimeout: 60 * 60 * 1000,
@@ -133,6 +185,17 @@ async function runRenderJob({ schedule, outputBase, appUrl }) {
     ]);
 
     console.log(`[render:${base}] Done: ${outPath}`);
+
+    // Automatically convert IVF files to MP4
+    if (outPath.endsWith('.ivf')) {
+      try {
+        await convertIvfToMp4(outPath, base);
+      } catch (err) {
+        console.error(`[render:${base}] Failed to convert IVF to MP4:`, err);
+        // Don't fail the entire job if conversion fails
+      }
+    }
+
     return outPath;
   } finally {
     await browser.close();
