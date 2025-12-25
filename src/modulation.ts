@@ -195,6 +195,16 @@ export class ModulationManager {
   setBaseValue(targetId: string, value: number) {
     if (!this.targets.has(targetId)) return;
     this.baseValues.set(targetId, value);
+    const held = this.heldTargets.get(targetId);
+    if (held) {
+      held.baseValue = value;
+    }
+  }
+
+  getBaseValue(targetId: string) {
+    const target = this.targets.get(targetId);
+    if (!target) return undefined;
+    return this.baseValues.get(targetId) ?? target.getCurrent();
   }
 
   syncBaseFromTargets(targetIds?: string[]) {

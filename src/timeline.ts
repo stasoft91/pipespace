@@ -1,9 +1,5 @@
 import Peaks, {
   type PeaksInstance,
-  type Segment,
-  type SegmentDragEvent,
-  type SegmentPointerEvent,
-  type SegmentsInsertEvent,
   type WaveformViewPointerEvent,
 } from 'peaks.js';
 import { ModulationManager, type EnvelopeConfig, type LfoConfig, type ModulationTarget, type Waveform } from './modulation';
@@ -26,10 +22,10 @@ export type TimelineInitOptions = {
   onSaveProject?: () => void;
   onLoadProject?: (project: ProjectFile) => void;
   onBpmChange?: (bpm: number) => void;
-  onSegmentInserted?: (segment: Segment) => void;
-  onSegmentUpdated?: (segment: Segment) => void;
-  onSegmentRemoved?: (segmentId: string) => void;
-  onSegmentSelected?: (segmentId: string | null) => void;
+  onRegionInserted?: (regionId: string) => void;
+  onRegionUpdated?: (regionId: string) => void;
+  onRegionRemoved?: (regionId: string) => void;
+  onRegionSelected?: (regionId: string | null) => void;
 };
 
 type SnapMode = 'round' | 'floor' | 'ceil';
@@ -71,7 +67,7 @@ export function initTimeline(options: TimelineInitOptions) {
   insertLabel.className = 'timeline-insert';
   insertLabel.textContent = 'Insert';
   const insertSelect = document.createElement('select');
-  insertSelect.setAttribute('aria-label', 'Segment insert type');
+  insertSelect.setAttribute('aria-label', 'Region insert modulator type');
   for (const opt of [
     { label: 'LFO', value: 'lfo' as const },
     { label: 'Envelope', value: 'envelope' as const },
@@ -202,6 +198,11 @@ export function initTimeline(options: TimelineInitOptions) {
   zoomviewContainer.className = 'peaks-zoomview';
   waveformStack.appendChild(zoomviewContainer);
 
+  const zoomviewRegionLanesOverlay = document.createElement('div');
+  zoomviewRegionLanesOverlay.className = 'zoomview-region-lanes-overlay';
+  zoomviewRegionLanesOverlay.style.display = 'none';
+  zoomviewContainer.appendChild(zoomviewRegionLanesOverlay);
+
   const audioEl = document.createElement('audio');
   audioEl.className = 'peaks-audio';
   audioEl.preload = 'auto';
@@ -218,26 +219,33 @@ export function initTimeline(options: TimelineInitOptions) {
   let audioDurationSeconds: number | null = null;
   let audioFileName: string | null = null;
   let audioLoadToken = 0;
-  let selectedSegmentId: string | null = null;
-  let isSnapping = false;
+  let selectedRegionId: string | null = null;
+  let selectedModulator: { kind: TimelineEventKind; id: string } | null = null;
   let bpm = Math.max(10, options.bpm);
   const modulation = options.modulation;
 
-  type TimelineLfo = LfoConfig & { startSeconds?: number; endSeconds?: number; segmentId?: string };
-  const lfoBySegmentId = new Map<string, TimelineLfo>();
-  type TimelineEnvelope = EnvelopeConfig & { startSeconds?: number; endSeconds?: number; segmentId?: string };
-  const envelopeBySegmentId = new Map<string, TimelineEnvelope>();
+  type TimelineLfo = LfoConfig & { startSeconds?: number; endSeconds?: number };
+  type TimelineEnvelope = EnvelopeConfig & { startSeconds?: number; endSeconds?: number };
 
-  const COLOR_SELECTED = '#ffd166';
-  const COLOR_LFO = '#4fd1ff';
-  const COLOR_ENV = '#a78bfa';
-
-  const getSegmentKind = (segmentId: string | null): TimelineEventKind | null => {
-    if (!segmentId) return null;
-    if (lfoBySegmentId.has(segmentId)) return 'lfo';
-    if (envelopeBySegmentId.has(segmentId)) return 'envelope';
-    return null;
+  type TimelineRegion = {
+    id: string;
+    startSeconds: number;
+    endSeconds: number;
+    lfos: TimelineLfo[];
+    envelopes: TimelineEnvelope[];
   };
+  const regionsById = new Map<string, TimelineRegion>();
+
+  const getSortedTargets = () =>
+    modulation
+      .getTargets()
+      .slice()
+      .sort((a, b) => {
+        const ga = a.group ?? '';
+        const gb = b.group ?? '';
+        if (ga !== gb) return ga.localeCompare(gb);
+        return a.label.localeCompare(b.label);
+      });
 
   const beatsPerBar = 4;
   const zoomLevels = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
@@ -270,19 +278,6 @@ export function initTimeline(options: TimelineInitOptions) {
     return snapped * bar;
   };
 
-  const applySnapToSegment = (segment: Segment, startMode: SnapMode, endMode: SnapMode) => {
-    const start = snapToBar(segment.startTime, startMode);
-    const endRaw = snapToBar(segment.endTime, endMode);
-    const bar = barSeconds();
-    const end = endRaw <= start ? start + bar : endRaw;
-    if (Math.abs(start - segment.startTime) < 1e-4 && Math.abs(end - segment.endTime) < 1e-4) {
-      return;
-    }
-    isSnapping = true;
-    segment.update({ startTime: start, endTime: end });
-    isSnapping = false;
-  };
-
   const fmtTime = (time: number) => {
     const m = Math.floor(time / 60);
     const s = (time % 60).toFixed(2).padStart(5, '0');
@@ -306,6 +301,33 @@ export function initTimeline(options: TimelineInitOptions) {
     return { min, max, scale, target };
   };
 
+  const TAU = Math.PI * 2;
+
+  const hashStringToSeed = (text: string) => {
+    // FNV-1a 32-bit hash
+    let h = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+      h ^= text.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  };
+
+  const mulberry32 = (seed: number) => {
+    let a = seed >>> 0;
+    return () => {
+      a |= 0;
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+
+  const wrap01 = (v: number) => ((v % 1) + 1) % 1;
+  const expDecayWave = (t: number, k: number) => 2 * Math.exp(-k * t) - 1;
+  const exp2DecayWave = (t: number, k: number) => 2 * Math.exp(-k * t * t) - 1;
+
   const clampTime = (time: number) => {
     let v = Math.max(0, time);
     if (audioDurationSeconds !== null && isFinite(audioDurationSeconds)) {
@@ -314,92 +336,109 @@ export function initTimeline(options: TimelineInitOptions) {
     return v;
   };
 
-  const applyLfoTimeWindow = (lfo: TimelineLfo, startSeconds: number, endSeconds: number) => {
+  const snapRegionWindow = (
+    startSeconds: number,
+    endSeconds: number,
+    startMode: SnapMode,
+    endMode: SnapMode
+  ) => {
     const bar = barSeconds();
-    const snappedStart = snapToBar(clampTime(startSeconds), 'floor');
-    const snappedEndRaw = snapToBar(clampTime(endSeconds), 'ceil');
-    const snappedEnd = snappedEndRaw <= snappedStart ? snappedStart + bar : snappedEndRaw;
-
-    lfo.startSeconds = snappedStart;
-    lfo.endSeconds = snappedEnd;
-
-    if (peaks && lfo.segmentId) {
-      const seg = peaks.segments.getSegment(lfo.segmentId);
-      if (seg) {
-        isSnapping = true;
-        seg.update({ startTime: snappedStart, endTime: snappedEnd });
-        isSnapping = false;
-      }
-    }
-
-    renderLfoList();
-    if (selectedSegmentId === lfo.segmentId) renderLfoEditor();
-    refreshSegmentColors();
+    const start = snapToBar(clampTime(startSeconds), startMode);
+    const endRaw = snapToBar(clampTime(endSeconds), endMode);
+    const end = endRaw <= start ? start + bar : endRaw;
+    return { start, end: clampTime(end) };
   };
 
-  const applyEnvelopeTimeWindow = (env: TimelineEnvelope, startSeconds: number, endSeconds: number) => {
-    const bar = barSeconds();
-    const snappedStart = snapToBar(clampTime(startSeconds), 'floor');
-    const snappedEndRaw = snapToBar(clampTime(endSeconds), 'ceil');
-    const snappedEnd = snappedEndRaw <= snappedStart ? snappedStart + bar : snappedEndRaw;
-
-    env.startSeconds = snappedStart;
-    env.endSeconds = snappedEnd;
-
-    if (peaks && env.segmentId) {
-      const seg = peaks.segments.getSegment(env.segmentId);
-      if (seg) {
-        isSnapping = true;
-        seg.update({ startTime: snappedStart, endTime: snappedEnd });
-        isSnapping = false;
-      }
+  const applyRegionTimeWindow = (
+    region: TimelineRegion,
+    startSeconds: number,
+    endSeconds: number,
+    startMode: SnapMode,
+    endMode: SnapMode
+  ) => {
+    const { start, end } = snapRegionWindow(startSeconds, endSeconds, startMode, endMode);
+    region.startSeconds = start;
+    region.endSeconds = end;
+    for (const lfo of region.lfos) {
+      lfo.startSeconds = start;
+      lfo.endSeconds = end;
     }
-
-    renderLfoList();
-    if (selectedSegmentId === env.segmentId) renderLfoEditor();
-    refreshSegmentColors();
-  };
-
-  const refreshSegmentColors = () => {
-    if (!peaks) return;
-    const zoomView = peaks.views.getView('zoomview');
-    // Peaks keeps segment overlay drag handlers around; explicitly toggle dragging so
-    // only the currently-selected segment is draggable.
-    zoomView?.enableSegmentDragging(false);
-    const segments = peaks.segments.getSegments();
-    for (const seg of segments) {
-      const id = seg.id;
-      if (!id) continue;
-      const kind = getSegmentKind(id);
-      const base = kind === 'envelope' ? COLOR_ENV : COLOR_LFO;
-      const selected = id === selectedSegmentId;
-      seg.update({
-        color: selected ? COLOR_SELECTED : base,
-        editable: selected,
-      });
+    for (const env of region.envelopes) {
+      env.startSeconds = start;
+      env.endSeconds = end;
     }
-    if (selectedSegmentId) {
-      const selectedSeg = peaks.segments.getSegment(selectedSegmentId);
-      if (selectedSeg) {
-        // Ensure the selected segment is above any overlapping segments, so dragging
-        // targets the selected region (not the top-most).
-        const segmentsLayer =
-          (zoomView as any)?.getSegmentsLayer?.() ??
-          (zoomView as any)?._segmentsLayer ??
-          null;
-        const shape = segmentsLayer?.getSegmentShape?.(selectedSeg) ?? null;
-        (shape as any)?._moveToTop?.();
-      }
-    }
-    zoomView?.enableSegmentDragging(true);
-  };
-
-  const selectSegment = (segmentId: string | null) => {
-    selectedSegmentId = segmentId;
-    refreshSegmentColors();
+    renderRegionLanes();
     renderLfoList();
     renderLfoEditor();
-    options.onSegmentSelected?.(segmentId);
+    options.onRegionUpdated?.(region.id);
+  };
+
+  const getSelectedRegion = () => {
+    if (!selectedRegionId) return null;
+    return regionsById.get(selectedRegionId) ?? null;
+  };
+
+  const ensureSelectedModulatorForRegion = (region: TimelineRegion) => {
+    const sel = selectedModulator;
+    if (sel) {
+      const exists =
+        (sel.kind === 'lfo' && region.lfos.some((l) => l.id === sel.id)) ||
+        (sel.kind === 'envelope' && region.envelopes.some((e) => e.id === sel.id));
+      if (exists) return;
+    }
+    const firstLfo = region.lfos[0] ?? null;
+    const firstEnv = region.envelopes[0] ?? null;
+    if (firstLfo) selectedModulator = { kind: 'lfo', id: firstLfo.id };
+    else if (firstEnv) selectedModulator = { kind: 'envelope', id: firstEnv.id };
+    else selectedModulator = null;
+  };
+
+  const scrollSelectedListIntoView = () => {
+    // Prefer scrolling to the selected modulator row; otherwise scroll to the selected region item;
+    // otherwise scroll to the "Initial values" button.
+    const selectedEl =
+      (lfoList.querySelector('.region-mod.selected') as HTMLElement | null) ??
+      (lfoList.querySelector('.lfo-item.selected') as HTMLElement | null) ??
+      (lfoList.querySelector('.lfo-list-initial.selected') as HTMLElement | null);
+    if (!selectedEl) return;
+
+    const container = lfoList;
+    const c = container.getBoundingClientRect();
+    const r = selectedEl.getBoundingClientRect();
+    const pad = 8;
+    const above = r.top < c.top + pad;
+    const below = r.bottom > c.bottom - pad;
+    if (!above && !below) return;
+
+    // Use nearest to avoid jumping too far when the element is partially visible.
+    selectedEl.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
+  };
+
+  const selectRegion = (regionId: string | null) => {
+    selectedRegionId = regionId;
+    if (!regionId) {
+      selectedModulator = null;
+    } else {
+      const region = regionsById.get(regionId);
+      if (region) ensureSelectedModulatorForRegion(region);
+    }
+    renderRegionLanes();
+    renderLfoList();
+    scrollSelectedListIntoView();
+    renderLfoEditor();
+    options.onRegionSelected?.(regionId);
+  };
+
+  const selectModulatorInRegion = (regionId: string, modulator: { kind: TimelineEventKind; id: string }) => {
+    selectedRegionId = regionId;
+    selectedModulator = modulator;
+    const region = regionsById.get(regionId);
+    if (region) ensureSelectedModulatorForRegion(region);
+    renderRegionLanes();
+    renderLfoList();
+    scrollSelectedListIntoView();
+    renderLfoEditor();
+    options.onRegionSelected?.(regionId);
   };
 
   const hideContextMenu = () => {
@@ -408,24 +447,19 @@ export function initTimeline(options: TimelineInitOptions) {
   };
 
   const convertSelectedEvent = (toKind: TimelineEventKind) => {
-    const segmentId = selectedSegmentId;
-    if (!segmentId) return;
+    const region = getSelectedRegion();
+    if (!region) return;
+    const selected = selectedModulator;
+    if (!selected) return;
+    if (selected.kind === toKind) return;
 
-    const existingLfo = lfoBySegmentId.get(segmentId);
-    const existingEnv = envelopeBySegmentId.get(segmentId);
-    if (toKind === 'envelope' && !existingLfo) return;
-    if (toKind === 'lfo' && !existingEnv) return;
+    const start = region.startSeconds;
+    const end = region.endSeconds;
 
-    const seg = peaks?.segments.getSegment(segmentId);
-    const getWindow = (startSeconds?: number, endSeconds?: number) => {
-      const start = seg?.startTime ?? startSeconds ?? 0;
-      const end = seg?.endTime ?? endSeconds ?? start + barSeconds();
-      return { start, end };
-    };
-
-    if (toKind === 'envelope' && existingLfo) {
-      const lfo = existingLfo;
-      const { start, end } = getWindow(lfo.startSeconds, lfo.endSeconds);
+    if (toKind === 'envelope' && selected.kind === 'lfo') {
+      const idx = region.lfos.findIndex((l) => l.id === selected.id);
+      if (idx < 0) return;
+      const lfo = region.lfos[idx];
       const target = modulation.getTarget(lfo.targetId);
       const base = target ? target.getCurrent() : 0;
       const delta = computeDeltaRange(lfo);
@@ -446,7 +480,7 @@ export function initTimeline(options: TimelineInitOptions) {
       }
 
       modulation.removeLfo(lfo.id);
-      lfoBySegmentId.delete(segmentId);
+      region.lfos.splice(idx, 1);
 
       const created = modulation.addEnvelope({
         targetId: lfo.targetId,
@@ -459,20 +493,16 @@ export function initTimeline(options: TimelineInitOptions) {
       });
       if (!created) return;
       const env = created as TimelineEnvelope;
-      env.segmentId = segmentId;
       env.startSeconds = start;
       env.endSeconds = end;
-      envelopeBySegmentId.set(segmentId, env);
-      (seg as any)?.update?.({ labelText: target ? target.label : env.targetId });
-      if (seg) {
-        (seg as any).envelopeId = env.id;
-        delete (seg as any).lfoId;
-      }
+      region.envelopes.push(env);
+      selectedModulator = { kind: 'envelope', id: env.id };
     }
 
-    if (toKind === 'lfo' && existingEnv) {
-      const env = existingEnv;
-      const { start, end } = getWindow(env.startSeconds, env.endSeconds);
+    if (toKind === 'lfo' && selected.kind === 'envelope') {
+      const idx = region.envelopes.findIndex((e) => e.id === selected.id);
+      if (idx < 0) return;
+      const env = region.envelopes[idx];
       const duration = Math.max(1e-6, end - start);
       const target = modulation.getTarget(env.targetId);
       const base = target ? target.getCurrent() : (env.min + env.max) * 0.5;
@@ -494,7 +524,7 @@ export function initTimeline(options: TimelineInitOptions) {
       const phase = effectiveFreq <= 0 ? 0 : -start * effectiveFreq * Math.PI * 2;
 
       modulation.removeEnvelope(env.id);
-      envelopeBySegmentId.delete(segmentId);
+      region.envelopes.splice(idx, 1);
 
       const created = modulation.addLfo({
         targetId: env.targetId,
@@ -511,24 +541,52 @@ export function initTimeline(options: TimelineInitOptions) {
       });
       if (!created) return;
       const lfo = created as TimelineLfo;
-      lfo.segmentId = segmentId;
       lfo.startSeconds = start;
       lfo.endSeconds = end;
-      lfoBySegmentId.set(segmentId, lfo);
-      (seg as any)?.update?.({ labelText: target ? target.label : lfo.targetId });
-      if (seg) {
-        (seg as any).lfoId = lfo.id;
-        delete (seg as any).envelopeId;
-      }
+      region.lfos.push(lfo);
+      selectedModulator = { kind: 'lfo', id: lfo.id };
     }
 
+    renderRegionLanes();
     renderLfoList();
     renderLfoEditor();
-    refreshSegmentColors();
   };
 
-  const addEventAtTime = (timeSeconds: number, anchor: 'start' | 'end') => {
-    if (!peaks) return;
+  const createRegionId = () => `reg-${Math.random().toString(16).slice(2)}`;
+
+  const addModulatorToRegion = (region: TimelineRegion, kind: TimelineEventKind) => {
+    if (kind === 'lfo') {
+      const created = modulation.addLfo({
+        startSeconds: region.startSeconds,
+        endSeconds: region.endSeconds,
+      });
+      if (!created) return;
+      const lfo = created as TimelineLfo;
+      lfo.startSeconds = region.startSeconds;
+      lfo.endSeconds = region.endSeconds;
+      region.lfos.push(lfo);
+      selectedRegionId = region.id;
+      selectedModulator = { kind: 'lfo', id: lfo.id };
+    } else {
+      const created = modulation.addEnvelope({
+        startSeconds: region.startSeconds,
+        endSeconds: region.endSeconds,
+      });
+      if (!created) return;
+      const env = created as TimelineEnvelope;
+      env.startSeconds = region.startSeconds;
+      env.endSeconds = region.endSeconds;
+      region.envelopes.push(env);
+      selectedRegionId = region.id;
+      selectedModulator = { kind: 'envelope', id: env.id };
+    }
+    renderRegionLanes();
+    renderLfoList();
+    renderLfoEditor();
+    options.onRegionUpdated?.(region.id);
+  };
+
+  const addRegionAtTime = (timeSeconds: number, anchor: 'start' | 'end') => {
     const bar = barSeconds();
     if (!isFinite(bar) || bar <= 0) return;
 
@@ -552,17 +610,18 @@ export function initTimeline(options: TimelineInitOptions) {
     }
     if (end <= start) return;
 
-    const seg = peaks.segments.add({
-      startTime: start,
-      endTime: end,
-      // Markers + draggable overlay are created at segment construction time in Peaks,
-      // so keep these enabled and then hide/lock via selection state.
-      editable: true,
-      markers: true,
-      color: insertKind === 'envelope' ? COLOR_ENV : COLOR_LFO,
-    });
-    createEventForSegment(seg);
-    options.onSegmentInserted?.(seg);
+    const regionId = createRegionId();
+    const region: TimelineRegion = {
+      id: regionId,
+      startSeconds: start,
+      endSeconds: end,
+      lfos: [],
+      envelopes: [],
+    };
+    regionsById.set(regionId, region);
+    addModulatorToRegion(region, insertKind);
+    selectRegion(regionId);
+    options.onRegionInserted?.(regionId);
   };
 
   const showTimelineContextMenu = (clientX: number, clientY: number, timeSeconds: number) => {
@@ -572,18 +631,18 @@ export function initTimeline(options: TimelineInitOptions) {
 
     const startBtn = document.createElement('button');
     startBtn.type = 'button';
-    startBtn.textContent = `New ${kindLabel}: use this as START`;
+    startBtn.textContent = `New region (${kindLabel}): use this as START`;
     startBtn.addEventListener('click', () => {
-      addEventAtTime(timeSeconds, 'start');
+      addRegionAtTime(timeSeconds, 'start');
       hideContextMenu();
     });
     lfoContextMenu.appendChild(startBtn);
 
     const endBtn = document.createElement('button');
     endBtn.type = 'button';
-    endBtn.textContent = `New ${kindLabel}: use this as END`;
+    endBtn.textContent = `New region (${kindLabel}): use this as END`;
     endBtn.addEventListener('click', () => {
-      addEventAtTime(timeSeconds, 'end');
+      addRegionAtTime(timeSeconds, 'end');
       hideContextMenu();
     });
     lfoContextMenu.appendChild(endBtn);
@@ -593,35 +652,30 @@ export function initTimeline(options: TimelineInitOptions) {
     lfoContextMenu.style.display = 'block';
   };
 
-  const duplicateSegment = (segmentId: string) => {
-    const lfo = lfoBySegmentId.get(segmentId);
-    const env = envelopeBySegmentId.get(segmentId);
-    const kind: TimelineEventKind | null = lfo ? 'lfo' : env ? 'envelope' : null;
-    if (!kind) return;
+  const duplicateRegion = (regionId: string, startOverride?: number, endOverride?: number) => {
+    const region = regionsById.get(regionId);
+    if (!region) return;
 
-    const source = kind === 'lfo' ? lfo : env;
-    if (!source) return;
+    let start = clampTime(startOverride ?? region.startSeconds);
+    let end = clampTime(endOverride ?? region.endSeconds);
+    if (end <= start) {
+      const bar = barSeconds();
+      if (isFinite(bar) && bar > 0) {
+        end = clampTime(start + bar);
+      }
+    }
+    if (end <= start) return;
 
-    const seg = peaks?.segments.getSegment(segmentId);
-    const start = seg?.startTime ?? source.startSeconds ?? 0;
-    const end = seg?.endTime ?? source.endSeconds ?? start + barSeconds();
-    const newSegmentId = `seg-${Math.random().toString(16).slice(2)}`;
-    const target = modulation.getTarget(source.targetId);
-    const labelText = target ? target.label : source.targetId;
+    const newRegionId = createRegionId();
+    const nextRegion: TimelineRegion = {
+      id: newRegionId,
+      startSeconds: start,
+      endSeconds: end,
+      lfos: [],
+      envelopes: [],
+    };
 
-    const createdSegment = peaks
-      ? peaks.segments.add({
-          id: newSegmentId,
-          startTime: start,
-          endTime: end,
-          editable: true,
-          markers: true,
-          labelText,
-          color: kind === 'envelope' ? COLOR_ENV : COLOR_LFO,
-        })
-      : null;
-
-    if (kind === 'lfo' && lfo) {
+    for (const lfo of region.lfos) {
       const created = modulation.addLfo({
         targetId: lfo.targetId,
         wave: lfo.wave,
@@ -635,16 +689,14 @@ export function initTimeline(options: TimelineInitOptions) {
         startSeconds: start,
         endSeconds: end,
       });
-      if (!created) return;
+      if (!created) continue;
       const next = created as TimelineLfo;
-      next.segmentId = newSegmentId;
       next.startSeconds = start;
       next.endSeconds = end;
-      lfoBySegmentId.set(newSegmentId, next);
-      if (createdSegment) (createdSegment as any).lfoId = next.id;
+      nextRegion.lfos.push(next);
     }
 
-    if (kind === 'envelope' && env) {
+    for (const env of region.envelopes) {
       const created = modulation.addEnvelope({
         targetId: env.targetId,
         wave: env.wave,
@@ -654,25 +706,103 @@ export function initTimeline(options: TimelineInitOptions) {
         startSeconds: start,
         endSeconds: end,
       });
-      if (!created) return;
+      if (!created) continue;
       const next = created as TimelineEnvelope;
-      next.segmentId = newSegmentId;
       next.startSeconds = start;
       next.endSeconds = end;
-      envelopeBySegmentId.set(newSegmentId, next);
-      if (createdSegment) (createdSegment as any).envelopeId = next.id;
+      nextRegion.envelopes.push(next);
     }
 
-    if (createdSegment) options.onSegmentInserted?.(createdSegment);
-    selectSegment(newSegmentId);
+    if (nextRegion.lfos.length + nextRegion.envelopes.length <= 0) return;
+    regionsById.set(newRegionId, nextRegion);
+    selectRegion(newRegionId);
+    options.onRegionInserted?.(newRegionId);
   };
 
-  const showSegmentContextMenu = (clientX: number, clientY: number, segmentId: string) => {
-    const lfo = lfoBySegmentId.get(segmentId);
-    const env = envelopeBySegmentId.get(segmentId);
-    const kind: TimelineEventKind | null = lfo ? 'lfo' : env ? 'envelope' : null;
-    if (!kind) return;
+  const duplicateRegionNext = (regionId: string) => {
+    const region = regionsById.get(regionId);
+    if (!region) return;
+    const start = region.startSeconds;
+    const end = region.endSeconds;
+    const duration = Math.max(1e-6, end - start);
+    duplicateRegion(regionId, end, end + duration);
+  };
+
+  const removeModulatorFromRegion = (regionId: string, modulator: { kind: TimelineEventKind; id: string }) => {
+    const region = regionsById.get(regionId);
+    if (!region) return;
+
+    if (modulator.kind === 'lfo') {
+      const idx = region.lfos.findIndex((l) => l.id === modulator.id);
+      if (idx >= 0) {
+        const lfo = region.lfos[idx];
+        modulation.removeLfo(lfo.id);
+        region.lfos.splice(idx, 1);
+      }
+    } else {
+      const idx = region.envelopes.findIndex((e) => e.id === modulator.id);
+      if (idx >= 0) {
+        const env = region.envelopes[idx];
+        modulation.removeEnvelope(env.id);
+        region.envelopes.splice(idx, 1);
+      }
+    }
+
+    const remaining = region.lfos.length + region.envelopes.length;
+    if (remaining <= 0) {
+      removeRegion(regionId);
+      return;
+    }
+
+    if (selectedRegionId === regionId && selectedModulator?.id === modulator.id && selectedModulator?.kind === modulator.kind) {
+      ensureSelectedModulatorForRegion(region);
+    }
+
+    renderRegionLanes();
+    renderLfoList();
+    renderLfoEditor();
+    options.onRegionUpdated?.(regionId);
+  };
+
+  const removeRegion = (regionId: string) => {
+    const region = regionsById.get(regionId);
+    if (!region) return;
+    for (const lfo of region.lfos) modulation.removeLfo(lfo.id);
+    for (const env of region.envelopes) modulation.removeEnvelope(env.id);
+    regionsById.delete(regionId);
+    if (selectedRegionId === regionId) {
+      selectedRegionId = null;
+      selectedModulator = null;
+      options.onRegionSelected?.(null);
+    }
+    renderRegionLanes();
+    renderLfoList();
+    renderLfoEditor();
+    options.onRegionRemoved?.(regionId);
+  };
+
+  const showRegionContextMenu = (clientX: number, clientY: number, regionId: string) => {
+    const region = regionsById.get(regionId);
+    if (!region) return;
     lfoContextMenu.textContent = '';
+
+    const addLfoBtn = document.createElement('button');
+    addLfoBtn.type = 'button';
+    addLfoBtn.textContent = 'Add LFO to region';
+    addLfoBtn.addEventListener('click', () => {
+      addModulatorToRegion(region, 'lfo');
+      hideContextMenu();
+    });
+    lfoContextMenu.appendChild(addLfoBtn);
+
+    const addEnvBtn = document.createElement('button');
+    addEnvBtn.type = 'button';
+    addEnvBtn.textContent = 'Add Envelope to region';
+    addEnvBtn.addEventListener('click', () => {
+      addModulatorToRegion(region, 'envelope');
+      hideContextMenu();
+    });
+    lfoContextMenu.appendChild(addEnvBtn);
 
     const fullTrackBtn = document.createElement('button');
     fullTrackBtn.type = 'button';
@@ -680,12 +810,8 @@ export function initTimeline(options: TimelineInitOptions) {
     const duration = audioDurationSeconds;
     fullTrackBtn.disabled = duration === null || !isFinite(duration);
     fullTrackBtn.addEventListener('click', () => {
-      const end =
-        duration ??
-        (kind === 'lfo' ? lfo?.endSeconds : env?.endSeconds) ??
-        0;
-      if (kind === 'lfo' && lfo) applyLfoTimeWindow(lfo, 0, end);
-      if (kind === 'envelope' && env) applyEnvelopeTimeWindow(env, 0, end);
+      const end = duration ?? region.endSeconds ?? 0;
+      applyRegionTimeWindow(region, 0, end, 'floor', 'ceil');
       hideContextMenu();
     });
     lfoContextMenu.appendChild(fullTrackBtn);
@@ -694,20 +820,28 @@ export function initTimeline(options: TimelineInitOptions) {
     duplicateBtn.type = 'button';
     duplicateBtn.textContent = 'Duplicate';
     duplicateBtn.addEventListener('click', () => {
-      duplicateSegment(segmentId);
+      duplicateRegion(regionId);
       hideContextMenu();
     });
     lfoContextMenu.appendChild(duplicateBtn);
 
-    const convertBtn = document.createElement('button');
-    convertBtn.type = 'button';
-    convertBtn.textContent = kind === 'lfo' ? 'Convert to Envelope' : 'Convert to LFO';
-    convertBtn.addEventListener('click', () => {
-      selectSegment(segmentId);
-      convertSelectedEvent(kind === 'lfo' ? 'envelope' : 'lfo');
+    const duplicateNextBtn = document.createElement('button');
+    duplicateNextBtn.type = 'button';
+    duplicateNextBtn.textContent = 'Duplicate next';
+    duplicateNextBtn.addEventListener('click', () => {
+      duplicateRegionNext(regionId);
       hideContextMenu();
     });
-    lfoContextMenu.appendChild(convertBtn);
+    lfoContextMenu.appendChild(duplicateNextBtn);
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.textContent = 'Delete region';
+    deleteBtn.addEventListener('click', () => {
+      removeRegion(regionId);
+      hideContextMenu();
+    });
+    lfoContextMenu.appendChild(deleteBtn);
 
     lfoContextMenu.style.left = `${clientX}px`;
     lfoContextMenu.style.top = `${clientY}px`;
@@ -720,46 +854,351 @@ export function initTimeline(options: TimelineInitOptions) {
     if (e.key === 'Escape') hideContextMenu();
   });
 
+  type DraggedModulatorPayload = { fromRegionId: string; kind: TimelineEventKind; id: string };
+  let draggingModulator: DraggedModulatorPayload | null = null;
+
+  const clearRegionListDragOver = () => {
+    for (const el of Array.from(lfoList.querySelectorAll('.lfo-item.drag-over'))) {
+      el.classList.remove('drag-over');
+    }
+  };
+
+  const readDraggedModulator = (e: DragEvent): DraggedModulatorPayload | null => {
+    if (draggingModulator) return draggingModulator;
+    const dt = e.dataTransfer;
+    if (!dt) return null;
+    const raw =
+      dt.getData('application/x-pipes-modulator') ||
+      dt.getData('text/plain') ||
+      '';
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as Partial<DraggedModulatorPayload>;
+      if (!parsed || typeof parsed !== 'object') return null;
+      if (typeof parsed.fromRegionId !== 'string') return null;
+      if (parsed.kind !== 'lfo' && parsed.kind !== 'envelope') return null;
+      if (typeof parsed.id !== 'string') return null;
+      return parsed as DraggedModulatorPayload;
+    } catch {
+      return null;
+    }
+  };
+
+  const moveModulatorBetweenRegions = (payload: DraggedModulatorPayload, toRegionId: string) => {
+    const from = regionsById.get(payload.fromRegionId);
+    const to = regionsById.get(toRegionId);
+    if (!from || !to) return;
+    if (from.id === to.id) return;
+
+    let moved: TimelineLfo | TimelineEnvelope | null = null;
+
+    if (payload.kind === 'lfo') {
+      const idx = from.lfos.findIndex((l) => l.id === payload.id);
+      if (idx < 0) return;
+      moved = from.lfos.splice(idx, 1)[0] ?? null;
+      if (moved) {
+        moved.startSeconds = to.startSeconds;
+        moved.endSeconds = to.endSeconds;
+        to.lfos.push(moved as TimelineLfo);
+      }
+    } else {
+      const idx = from.envelopes.findIndex((env) => env.id === payload.id);
+      if (idx < 0) return;
+      moved = from.envelopes.splice(idx, 1)[0] ?? null;
+      if (moved) {
+        moved.startSeconds = to.startSeconds;
+        moved.endSeconds = to.endSeconds;
+        to.envelopes.push(moved as TimelineEnvelope);
+      }
+    }
+    if (!moved) return;
+
+    const fromNowEmpty = from.lfos.length + from.envelopes.length <= 0;
+    if (fromNowEmpty) {
+      regionsById.delete(from.id);
+      options.onRegionRemoved?.(from.id);
+    } else {
+      options.onRegionUpdated?.(from.id);
+    }
+    options.onRegionUpdated?.(to.id);
+
+    // If the moved modulator was selected, keep it selected in its new region.
+    if (
+      selectedRegionId === from.id &&
+      selectedModulator?.kind === payload.kind &&
+      selectedModulator?.id === payload.id
+    ) {
+      selectModulatorInRegion(to.id, { kind: payload.kind, id: payload.id });
+      return;
+    }
+
+    // If the selected region was deleted by moving the last modulator out, keep selection sensible.
+    if (fromNowEmpty && selectedRegionId === from.id) {
+      selectRegion(to.id);
+      return;
+    }
+
+    renderRegionLanes();
+    renderLfoList();
+    renderLfoEditor();
+  };
+
+  type RegionDragMode = 'move' | 'resize-start' | 'resize-end';
+  type RegionDragState = {
+    regionId: string;
+    mode: RegionDragMode;
+    startClientX: number;
+    originStart: number;
+    originEnd: number;
+    secondsPerPx: number;
+  };
+
+  let regionDrag: RegionDragState | null = null;
+
+  const REGION_ROW_HEIGHT_PX = 22;
+  const REGION_LANES_MAX_HEIGHT_PX = 160;
+
+  const beginRegionDrag = (regionId: string, mode: RegionDragMode, secondsPerPx: number, e: PointerEvent) => {
+    const region = regionsById.get(regionId);
+    if (!region) return;
+    e.preventDefault();
+    e.stopPropagation();
+    hideContextMenu();
+    selectRegion(regionId);
+    regionDrag = {
+      regionId,
+      mode,
+      startClientX: e.clientX,
+      originStart: region.startSeconds,
+      originEnd: region.endSeconds,
+      secondsPerPx,
+    };
+  };
+
+  const packRegionsIntoRows = (regions: TimelineRegion[]) => {
+    const sorted = regions
+      .slice()
+      .sort((a, b) => a.startSeconds - b.startSeconds || a.endSeconds - b.endSeconds || a.id.localeCompare(b.id));
+    const rowsEnd: number[] = [];
+    const rowByRegionId = new Map<string, number>();
+    for (const region of sorted) {
+      let row = -1;
+      for (let i = 0; i < rowsEnd.length; i++) {
+        const rowEnd = rowsEnd[i] ?? -Infinity;
+        if (region.startSeconds >= rowEnd - 1e-6) {
+          row = i;
+          break;
+        }
+      }
+      if (row < 0) {
+        row = rowsEnd.length;
+        rowsEnd.push(region.endSeconds);
+      } else {
+        rowsEnd[row] = Math.max(rowsEnd[row] ?? -Infinity, region.endSeconds);
+      }
+      rowByRegionId.set(region.id, row);
+    }
+    return { rowByRegionId, rowCount: rowsEnd.length };
+  };
+
+  const renderRegionLanes = () => {
+    zoomviewRegionLanesOverlay.textContent = '';
+
+    // Lanes are aligned to the zoomview so they match the main waveform timeline.
+    const laneView = peaks?.views.getView('zoomview') ?? null;
+    if (!laneView) {
+      zoomviewRegionLanesOverlay.style.display = 'none';
+      return;
+    }
+
+    const viewStart = laneView.getStartTime();
+    const viewEnd = laneView.getEndTime();
+    const laneAny = laneView as any;
+    const viewWidthPx =
+      (typeof laneAny.getWidth === 'function' ? Number(laneAny.getWidth()) : 0) ||
+      zoomviewContainer.clientWidth ||
+      Math.round(zoomviewContainer.getBoundingClientRect().width);
+    if (!isFinite(viewStart) || !isFinite(viewEnd) || viewEnd <= viewStart || viewWidthPx <= 0) {
+      zoomviewRegionLanesOverlay.style.display = 'none';
+      return;
+    }
+
+    const regions = Array.from(regionsById.values());
+    if (regions.length === 0) {
+      zoomviewRegionLanesOverlay.style.display = 'none';
+      return;
+    }
+
+    const { rowByRegionId, rowCount } = packRegionsIntoRows(regions);
+    const safeRowCount = Math.max(1, rowCount);
+    // Avoid vertical scrollbars (which can steal horizontal width and cause alignment drift).
+    // Instead, compress rows to always fit inside the max overlay height.
+    // NOTE: Keep a minimum tall enough to show a visible bar even with top/bottom insets.
+    const rowHeightPx = Math.max(
+      10,
+      Math.min(REGION_ROW_HEIGHT_PX, Math.floor(REGION_LANES_MAX_HEIGHT_PX / safeRowCount))
+    );
+    const contentHeight = safeRowCount * rowHeightPx;
+    zoomviewRegionLanesOverlay.style.display = 'block';
+    zoomviewRegionLanesOverlay.style.height = `${contentHeight}px`;
+
+    const timeToOffset = (timeSeconds: number) => {
+      if (typeof laneAny.timeToPixelOffset === 'function') {
+        return Number(laneAny.timeToPixelOffset(timeSeconds));
+      }
+      // Fallback: linear mapping over the visible time span.
+      const t = (timeSeconds - viewStart) / (viewEnd - viewStart);
+      return t * viewWidthPx;
+    };
+
+    const secondsPerPx =
+      typeof laneAny.pixelsToTime === 'function'
+        ? Number(laneAny.pixelsToTime(1))
+        : (viewEnd - viewStart) / Math.max(1, viewWidthPx);
+
+    const rows: HTMLDivElement[] = [];
+    for (let i = 0; i < safeRowCount; i++) {
+      const row = document.createElement('div');
+      row.className = 'region-lane-row';
+      row.style.height = `${rowHeightPx}px`;
+      row.style.width = `${viewWidthPx}px`;
+      zoomviewRegionLanesOverlay.appendChild(row);
+      rows.push(row);
+    }
+
+    for (const region of regions) {
+      const rowIdx = rowByRegionId.get(region.id) ?? 0;
+      const row = rows[Math.max(0, Math.min(rows.length - 1, rowIdx))];
+      if (!row) continue;
+
+      const leftRaw = timeToOffset(region.startSeconds);
+      const rightRaw = timeToOffset(region.endSeconds);
+      const left = Math.max(0, leftRaw);
+      const right = Math.min(viewWidthPx, rightRaw);
+      if (right <= 0 || left >= viewWidthPx) continue;
+      const width = Math.max(1, right - left);
+
+      const block = document.createElement('div');
+      const selected = region.id === selectedRegionId;
+      block.className = `region-block${selected ? ' selected' : ''}`;
+      block.style.left = `${left}px`;
+      block.style.width = `${width}px`;
+      // When row height gets compressed, reduce the inner inset so bars stay visible.
+      const inset = Math.max(1, Math.min(3, Math.floor(rowHeightPx / 5)));
+      block.style.top = `${inset}px`;
+      block.style.bottom = `${inset}px`;
+      block.title = `${fmtTime(region.startSeconds)} → ${fmtTime(region.endSeconds)}`;
+
+      const modCount = region.lfos.length + region.envelopes.length;
+      const label = document.createElement('div');
+      label.className = 'region-label';
+      label.textContent = `${modCount} mod${modCount === 1 ? '' : 's'}`;
+      if (rowHeightPx < 14) {
+        label.style.display = 'none';
+      }
+      block.appendChild(label);
+
+      block.addEventListener('click', (e) => {
+        e.stopPropagation();
+        selectRegion(region.id);
+      });
+      block.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        selectRegion(region.id);
+        showRegionContextMenu(e.clientX, e.clientY, region.id);
+      });
+
+      if (selected) {
+        const startHandle = document.createElement('div');
+        startHandle.className = 'region-handle start';
+        block.appendChild(startHandle);
+
+        const endHandle = document.createElement('div');
+        endHandle.className = 'region-handle end';
+        block.appendChild(endHandle);
+
+        block.addEventListener('pointerdown', (e) => beginRegionDrag(region.id, 'move', secondsPerPx, e));
+        startHandle.addEventListener('pointerdown', (e) => beginRegionDrag(region.id, 'resize-start', secondsPerPx, e));
+        endHandle.addEventListener('pointerdown', (e) => beginRegionDrag(region.id, 'resize-end', secondsPerPx, e));
+      }
+
+      row.appendChild(block);
+    }
+  };
+
+  const onRegionPointerMove = (e: PointerEvent) => {
+    const drag = regionDrag;
+    if (!drag) return;
+    const region = regionsById.get(drag.regionId);
+    if (!region) return;
+    e.preventDefault();
+
+    const dx = e.clientX - drag.startClientX;
+    const dt = dx * drag.secondsPerPx;
+
+    let nextStart = drag.originStart;
+    let nextEnd = drag.originEnd;
+    if (drag.mode === 'move') {
+      nextStart = drag.originStart + dt;
+      nextEnd = drag.originEnd + dt;
+    } else if (drag.mode === 'resize-start') {
+      nextStart = drag.originStart + dt;
+    } else {
+      nextEnd = drag.originEnd + dt;
+    }
+
+    applyRegionTimeWindow(region, nextStart, nextEnd, 'round', 'round');
+  };
+
+  const onRegionPointerUp = () => {
+    regionDrag = null;
+  };
+
+  window.addEventListener('pointermove', onRegionPointerMove);
+  window.addEventListener('pointerup', onRegionPointerUp);
+
   const renderLfoList = () => {
     lfoList.textContent = '';
-    type Entry =
-      | { kind: 'lfo'; segmentId: string; config: TimelineLfo }
-      | { kind: 'envelope'; segmentId: string; config: TimelineEnvelope };
 
-    const entries: Entry[] = [
-      ...Array.from(lfoBySegmentId.entries()).map(([segmentId, lfo]) => ({
-        kind: 'lfo' as const,
-        segmentId,
-        config: lfo,
-      })),
-      ...Array.from(envelopeBySegmentId.entries()).map(([segmentId, env]) => ({
-        kind: 'envelope' as const,
-        segmentId,
-        config: env,
-      })),
-    ].sort((a, b) => {
-      const sa = a.config.startSeconds ?? 0;
-      const sb = b.config.startSeconds ?? 0;
-      return sa - sb;
-    });
+    const header = document.createElement('div');
+    header.className = 'lfo-list-header';
+    const title = document.createElement('span');
+    title.textContent = 'Regions';
+    header.appendChild(title);
+    const initialBtn = document.createElement('button');
+    initialBtn.type = 'button';
+    initialBtn.className = 'lfo-list-initial';
+    initialBtn.textContent = 'Initial values';
+    if (!selectedRegionId) {
+      initialBtn.classList.add('selected');
+    }
+    initialBtn.addEventListener('click', () => selectRegion(null));
+    header.appendChild(initialBtn);
+    lfoList.appendChild(header);
 
-    for (const entry of entries) {
-      const { segmentId } = entry;
+    const regions = Array.from(regionsById.values()).sort((a, b) => a.startSeconds - b.startSeconds);
+    if (!regions.length) {
+      const empty = document.createElement('div');
+      empty.className = 'lfo-empty';
+      empty.textContent = 'No regions yet — right click the waveform to add one.';
+      lfoList.appendChild(empty);
+      return;
+    }
+
+    for (const region of regions) {
       const item = document.createElement('div');
-      item.className = `lfo-item${segmentId === selectedSegmentId ? ' selected' : ''}`;
+      item.className = `lfo-item${region.id === selectedRegionId ? ' selected' : ''}`;
 
       const title = document.createElement('div');
       title.className = 'lfo-title';
-      const target = modulation.getTarget(entry.config.targetId);
-      const kindLabel = entry.kind === 'lfo' ? 'LFO' : 'ENV';
-      title.textContent = `${kindLabel} • ${target ? target.label : entry.config.targetId}`;
+      const modCount = region.lfos.length + region.envelopes.length;
+      title.textContent = `${modCount} mod${modCount === 1 ? '' : 's'}`;
       item.appendChild(title);
 
       const times = document.createElement('div');
       times.className = 'lfo-times';
-      const start = entry.config.startSeconds ?? 0;
-      const end = entry.config.endSeconds ?? start;
-      times.textContent = `${fmtTime(start)} → ${fmtTime(end)}`;
+      times.textContent = `${fmtTime(region.startSeconds)} → ${fmtTime(region.endSeconds)}`;
       item.appendChild(times);
 
       const removeBtn = document.createElement('button');
@@ -768,47 +1207,228 @@ export function initTimeline(options: TimelineInitOptions) {
       removeBtn.textContent = '✕';
       removeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        if (peaks) {
-          peaks.segments.removeById(segmentId);
-        } else {
-          if (entry.kind === 'lfo') {
-            const existing = lfoBySegmentId.get(segmentId);
-            if (existing) modulation.removeLfo(existing.id);
-            lfoBySegmentId.delete(segmentId);
-          } else {
-            const existing = envelopeBySegmentId.get(segmentId);
-            if (existing) modulation.removeEnvelope(existing.id);
-            envelopeBySegmentId.delete(segmentId);
-          }
-          if (selectedSegmentId === segmentId) selectedSegmentId = null;
-          renderLfoList();
-          renderLfoEditor();
-        }
+        removeRegion(region.id);
       });
       item.appendChild(removeBtn);
 
-      item.addEventListener('click', () => selectSegment(segmentId));
+      const mods = document.createElement('div');
+      mods.className = 'region-modulators';
+
+      const addModEntry = (kind: TimelineEventKind, id: string, labelText: string) => {
+        const mod = document.createElement('div');
+        const isSelected =
+          region.id === selectedRegionId &&
+          selectedModulator?.kind === kind &&
+          selectedModulator?.id === id;
+        mod.className = `region-mod${isSelected ? ' selected' : ''}`;
+        mod.draggable = true;
+        const text = document.createElement('span');
+        text.textContent = labelText;
+        mod.appendChild(text);
+
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'region-mod-remove';
+        removeBtn.textContent = '✕';
+        removeBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          removeModulatorFromRegion(region.id, { kind, id });
+        });
+        removeBtn.draggable = false;
+        mod.appendChild(removeBtn);
+        mod.addEventListener('click', (e) => {
+          e.stopPropagation();
+          selectModulatorInRegion(region.id, { kind, id });
+        });
+        mod.addEventListener('dragstart', (e) => {
+          const evt = e as DragEvent;
+          const payload: DraggedModulatorPayload = { fromRegionId: region.id, kind, id };
+          draggingModulator = payload;
+          mod.classList.add('dragging');
+          const dt = evt.dataTransfer;
+          if (dt) {
+            dt.effectAllowed = 'move';
+            const json = JSON.stringify(payload);
+            dt.setData('application/x-pipes-modulator', json);
+            dt.setData('text/plain', json);
+          }
+          clearRegionListDragOver();
+        });
+        mod.addEventListener('dragend', () => {
+          draggingModulator = null;
+          mod.classList.remove('dragging');
+          clearRegionListDragOver();
+        });
+        mods.appendChild(mod);
+      };
+
+      for (const lfo of region.lfos) {
+        const target = modulation.getTarget(lfo.targetId);
+        addModEntry('lfo', lfo.id, `LFO • ${target ? target.label : lfo.targetId}`);
+      }
+      for (const env of region.envelopes) {
+        const target = modulation.getTarget(env.targetId);
+        addModEntry('envelope', env.id, `ENV • ${target ? target.label : env.targetId}`);
+      }
+
+      item.appendChild(mods);
+
+      item.addEventListener('dragover', (e) => {
+        const evt = e as DragEvent;
+        const payload = readDraggedModulator(evt);
+        if (!payload) return;
+        if (payload.fromRegionId === region.id) return;
+        e.preventDefault();
+        (evt.dataTransfer as DataTransfer | null)?.dropEffect && ((evt.dataTransfer as DataTransfer).dropEffect = 'move');
+        item.classList.add('drag-over');
+      });
+      item.addEventListener('dragleave', () => {
+        item.classList.remove('drag-over');
+      });
+      item.addEventListener('drop', (e) => {
+        const evt = e as DragEvent;
+        const payload = readDraggedModulator(evt);
+        item.classList.remove('drag-over');
+        clearRegionListDragOver();
+        if (!payload) return;
+        e.preventDefault();
+        e.stopPropagation();
+        moveModulatorBetweenRegions(payload, region.id);
+      });
+
+      item.addEventListener('click', () => selectRegion(region.id));
       item.addEventListener('contextmenu', (e) => {
         e.preventDefault();
         e.stopPropagation();
-        selectSegment(segmentId);
-        showSegmentContextMenu(e.clientX, e.clientY, segmentId);
+        selectRegion(region.id);
+        showRegionContextMenu(e.clientX, e.clientY, region.id);
       });
+
       lfoList.appendChild(item);
+    }
+  };
+
+  const renderInitialValuesEditor = () => {
+    const header = document.createElement('div');
+    header.className = 'initial-values-title';
+    header.textContent = 'Initial values (00:00:00)';
+    lfoEditor.appendChild(header);
+
+    const hint = document.createElement('div');
+    hint.className = 'initial-values-hint';
+    hint.textContent = 'Edit base values used at the start of the timeline.';
+    lfoEditor.appendChild(hint);
+
+    const actions = document.createElement('div');
+    actions.className = 'initial-values-actions';
+
+    const captureBtn = document.createElement('button');
+    captureBtn.type = 'button';
+    captureBtn.textContent = 'Capture current values';
+    captureBtn.addEventListener('click', () => {
+      for (const target of getSortedTargets()) {
+        const current = target.getCurrent();
+        if (!isFinite(current)) continue;
+        modulation.setBaseValue(target.id, current);
+      }
+      renderLfoEditor();
+    });
+    actions.appendChild(captureBtn);
+
+    const jumpBtn = document.createElement('button');
+    jumpBtn.type = 'button';
+    jumpBtn.textContent = 'Jump 00:00';
+    jumpBtn.addEventListener('click', () => {
+      if (peaks) {
+        peaks.player.pause();
+        const seek = (peaks.player as any)?.seek;
+        if (typeof seek === 'function') {
+          seek.call(peaks.player, 0);
+        }
+      }
+      audioEl.currentTime = 0;
+      updatePlayBtn();
+    });
+    actions.appendChild(jumpBtn);
+
+    lfoEditor.appendChild(actions);
+
+    const targets = getSortedTargets();
+    const grouped = new Map<string, ModulationTarget[]>();
+    for (const target of targets) {
+      const group = target.group ?? 'Other';
+      const bucket = grouped.get(group) ?? [];
+      bucket.push(target);
+      grouped.set(group, bucket);
+    }
+
+    const groupNames = Array.from(grouped.keys()).sort((a, b) => a.localeCompare(b));
+    for (const groupName of groupNames) {
+      const group = document.createElement('div');
+      group.className = 'initial-values-group';
+      const groupTitle = document.createElement('div');
+      groupTitle.className = 'initial-values-group-title';
+      groupTitle.textContent = groupName;
+      group.appendChild(groupTitle);
+
+      const items = grouped.get(groupName) ?? [];
+      for (const target of items) {
+        const row = document.createElement('label');
+        row.className = 'initial-values-row';
+        const text = document.createElement('span');
+        text.textContent = target.label;
+        row.appendChild(text);
+
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.step = '0.01';
+        if (target.min !== undefined) input.min = String(target.min);
+        if (target.max !== undefined) input.max = String(target.max);
+
+        const syncValue = () => {
+          const base = modulation.getBaseValue(target.id);
+          const value = typeof base === 'number' && isFinite(base) ? base : target.getCurrent();
+          input.value = String(value);
+        };
+        syncValue();
+
+        input.addEventListener('change', () => {
+          const raw = Number(input.value);
+          if (!isFinite(raw)) {
+            syncValue();
+            return;
+          }
+          let next = raw;
+          if (target.min !== undefined) next = Math.max(target.min, next);
+          if (target.max !== undefined) next = Math.min(target.max, next);
+          input.value = String(next);
+          target.apply(next);
+          modulation.setBaseValue(target.id, next);
+        });
+
+        row.appendChild(input);
+        group.appendChild(row);
+      }
+      lfoEditor.appendChild(group);
     }
   };
 
   const renderLfoEditor = () => {
     lfoEditor.textContent = '';
-    if (!selectedSegmentId) {
-      const empty = document.createElement('div');
-      empty.className = 'lfo-empty';
-      empty.textContent = 'Select a segment';
-      lfoEditor.appendChild(empty);
+    if (!selectedRegionId) {
+      renderInitialValuesEditor();
       return;
     }
-    const lfo = lfoBySegmentId.get(selectedSegmentId);
-    const env = envelopeBySegmentId.get(selectedSegmentId);
+    const region = regionsById.get(selectedRegionId) ?? null;
+    if (!region) {
+      renderInitialValuesEditor();
+      return;
+    }
+    ensureSelectedModulatorForRegion(region);
+    const selection = selectedModulator;
+    if (!selection) return;
+    const lfo = selection.kind === 'lfo' ? region.lfos.find((l) => l.id === selection.id) ?? null : null;
+    const env = selection.kind === 'envelope' ? region.envelopes.find((e) => e.id === selection.id) ?? null : null;
     if (!lfo && !env) return;
 
     const addRow = (labelText: string, input: HTMLElement) => {
@@ -822,15 +1442,7 @@ export function initTimeline(options: TimelineInitOptions) {
       return input;
     };
 
-    const targets = modulation
-      .getTargets()
-      .slice()
-      .sort((a, b) => {
-        const ga = a.group ?? '';
-        const gb = b.group ?? '';
-        if (ga !== gb) return ga.localeCompare(gb);
-        return a.label.localeCompare(b.label);
-      });
+    const targets = getSortedTargets();
     const waveOpts: Array<{ label: string; value: Waveform }> = [
       { label: 'Sine', value: 'sine' },
       { label: 'Triangle', value: 'triangle' },
@@ -844,6 +1456,8 @@ export function initTimeline(options: TimelineInitOptions) {
       { label: 'Inv exp2 decay', value: 'invExp2Decay' },
     ];
     if (lfo) {
+      let schedulePreviewDraw = () => {};
+
       const header = document.createElement('div');
       header.className = 'lfo-editor-title';
       const title = document.createElement('span');
@@ -873,11 +1487,10 @@ export function initTimeline(options: TimelineInitOptions) {
       if (audioDurationSeconds !== null && isFinite(audioDurationSeconds)) {
         startInput.max = String(audioDurationSeconds);
       }
-      startInput.value = String(lfo.startSeconds ?? 0);
+      startInput.value = String(region.startSeconds);
       startInput.addEventListener('change', () => {
         const nextStart = Number(startInput.value) || 0;
-        const nextEnd = lfo.endSeconds ?? nextStart;
-        applyLfoTimeWindow(lfo, nextStart, nextEnd);
+        applyRegionTimeWindow(region, nextStart, region.endSeconds, 'floor', 'ceil');
       });
       addRow('Start (s)', startInput);
 
@@ -888,11 +1501,10 @@ export function initTimeline(options: TimelineInitOptions) {
       if (audioDurationSeconds !== null && isFinite(audioDurationSeconds)) {
         endInput.max = String(audioDurationSeconds);
       }
-      endInput.value = String(lfo.endSeconds ?? lfo.startSeconds ?? 0);
+      endInput.value = String(region.endSeconds);
       endInput.addEventListener('change', () => {
         const nextEnd = Number(endInput.value) || 0;
-        const nextStart = lfo.startSeconds ?? 0;
-        applyLfoTimeWindow(lfo, nextStart, nextEnd);
+        applyRegionTimeWindow(region, region.startSeconds, nextEnd, 'floor', 'ceil');
       });
       addRow('End (s)', endInput);
 
@@ -906,11 +1518,6 @@ export function initTimeline(options: TimelineInitOptions) {
       targetSelect.value = lfo.targetId;
       targetSelect.addEventListener('change', () => {
         lfo.targetId = targetSelect.value;
-        if (peaks && selectedSegmentId) {
-          const seg = peaks.segments.getSegment(selectedSegmentId);
-          const target = modulation.getTarget(lfo.targetId);
-          if (seg) seg.update({ labelText: target ? target.label : lfo.targetId });
-        }
         renderLfoList();
         renderLfoEditor();
       });
@@ -926,6 +1533,7 @@ export function initTimeline(options: TimelineInitOptions) {
       waveSelect.value = lfo.wave;
       waveSelect.addEventListener('change', () => {
         lfo.wave = waveSelect.value as Waveform;
+        schedulePreviewDraw();
       });
       addRow('Wave', waveSelect);
 
@@ -939,6 +1547,7 @@ export function initTimeline(options: TimelineInitOptions) {
       const setBpmCoeff = (value: number) => {
         lfo.bpmCoefficient = Math.max(1e-6, value);
         updatePresetSelections();
+        schedulePreviewDraw();
       };
 
       const addPresetRow = (labelText: string, presets: Array<{ label: string; value: number }>) => {
@@ -964,40 +1573,32 @@ export function initTimeline(options: TimelineInitOptions) {
         { label: '1/1', value: 1 },
         { label: '2/1', value: 2 },
         { label: '4/1', value: 4 },
+        { label: '8/1', value: 8 },
       ];
       const dottedPresets: Array<{ label: string; value: number }> = [
         { label: '1/16.', value: (1 / 16) * 1.5 },
         { label: '1/8.', value: (1 / 8) * 1.5 },
         { label: '1/4.', value: (1 / 4) * 1.5 },
         { label: '1/2.', value: (1 / 2) * 1.5 },
+        { label: '1/1.', value: 1 * 1.5 },
+        { label: '2/1.', value: 2 * 1.5 },
+        { label: '4/1.', value: 4 * 1.5 },
+        { label: '8/1.', value: 8 * 1.5 },
+      ];
+      const tripletPresets: Array<{ label: string; value: number }> = [
+        { label: '1/16t', value: (1 / 16) * (2 / 3) },
+        { label: '1/8t', value: (1 / 8) * (2 / 3) },
+        { label: '1/4t', value: (1 / 4) * (2 / 3) },
+        { label: '1/2t', value: (1 / 2) * (2 / 3) },
+        { label: '1/1t', value: 1 * (2 / 3) },
+        { label: '2/1t', value: 2 * (2 / 3) },
+        { label: '4/1t', value: 4 * (2 / 3) },
+        { label: '8/1t', value: 8 * (2 / 3) },
       ];
       addPresetRow('Quick', basePresets);
       addPresetRow('Dotted', dottedPresets);
+      addPresetRow('Triplet', tripletPresets);
       updatePresetSelections();
-
-      const amountInput = document.createElement('input');
-      amountInput.type = 'number';
-      amountInput.step = '0.01';
-      amountInput.min = '0';
-      amountInput.max = '4';
-      amountInput.value = String(lfo.amount);
-      amountInput.addEventListener('change', () => {
-        lfo.amount = Math.max(0, Number(amountInput.value) || 0);
-        updateRangeDisplay();
-      });
-      addRow('Amount', amountInput);
-
-      const offsetInput = document.createElement('input');
-      offsetInput.type = 'number';
-      offsetInput.step = '0.01';
-      offsetInput.min = '-2';
-      offsetInput.max = '2';
-      offsetInput.value = String(lfo.offset);
-      offsetInput.addEventListener('change', () => {
-        lfo.offset = Number(offsetInput.value) || 0;
-        updateRangeDisplay();
-      });
-      addRow('Offset', offsetInput);
 
       const phaseInput = document.createElement('input');
       phaseInput.type = 'number';
@@ -1007,15 +1608,86 @@ export function initTimeline(options: TimelineInitOptions) {
       phaseInput.value = String(lfo.phase);
       phaseInput.addEventListener('change', () => {
         lfo.phase = Number(phaseInput.value) || 0;
+        schedulePreviewDraw();
       });
       addRow('Phase (rad)', phaseInput);
+
+      const rangeDisplay = document.createElement('div');
+      rangeDisplay.className = 'lfo-range';
+      lfoEditor.appendChild(rangeDisplay);
+
+      const rangeMinInput = document.createElement('input');
+      rangeMinInput.type = 'number';
+      rangeMinInput.step = '0.01';
+
+      const rangeMaxInput = document.createElement('input');
+      rangeMaxInput.type = 'number';
+      rangeMaxInput.step = '0.01';
+
+      const applyDeltaRange = (deltaMin: number, deltaMax: number) => {
+        if (!isFinite(deltaMin) || !isFinite(deltaMax)) return;
+        let min = deltaMin;
+        let max = deltaMax;
+        if (min > max) {
+          const tmp = min;
+          min = max;
+          max = tmp;
+        }
+        const target = modulation.getTarget(lfo.targetId);
+        const rawScale = target ? getTargetScale(target) : 1;
+        const scale = isFinite(rawScale) && Math.abs(rawScale) > 1e-9 ? rawScale : 1;
+
+        let offsetAbs: number;
+        let amountAbs: number;
+        if (lfo.bipolar) {
+          offsetAbs = (min + max) * 0.5;
+          amountAbs = (max - min) * 0.5;
+        } else {
+          offsetAbs = min;
+          amountAbs = max - min;
+        }
+        lfo.offset = offsetAbs / scale;
+        lfo.amount = Math.max(0, amountAbs / scale);
+      };
+
+      const getLfoBaseValue = () => {
+        const target = modulation.getTarget(lfo.targetId);
+        const base = modulation.getBaseValue(lfo.targetId);
+        const baseValue =
+          typeof base === 'number' && isFinite(base) ? base : target ? target.getCurrent() : 0;
+        return isFinite(baseValue) ? baseValue : 0;
+      };
+
+      const updateRangeBounds = () => {
+        const target = modulation.getTarget(lfo.targetId);
+        const min = target?.min;
+        const max = target?.max;
+        if (min !== undefined) {
+          rangeMinInput.min = String(min);
+          rangeMaxInput.min = String(min);
+        } else {
+          rangeMinInput.removeAttribute('min');
+          rangeMaxInput.removeAttribute('min');
+        }
+        if (max !== undefined) {
+          rangeMinInput.max = String(max);
+          rangeMaxInput.max = String(max);
+        } else {
+          rangeMinInput.removeAttribute('max');
+          rangeMaxInput.removeAttribute('max');
+        }
+      };
 
       const bipolarInput = document.createElement('input');
       bipolarInput.type = 'checkbox';
       bipolarInput.checked = lfo.bipolar;
       bipolarInput.addEventListener('change', () => {
+        // Preserve the current Δ range when switching modes.
+        const before = computeDeltaRange(lfo);
         lfo.bipolar = bipolarInput.checked;
+        applyDeltaRange(before.min, before.max);
         updateRangeDisplay();
+        schedulePreviewDraw();
       });
       addRow('Bipolar', bipolarInput);
 
@@ -1027,23 +1699,259 @@ export function initTimeline(options: TimelineInitOptions) {
       smoothInput.value = String(lfo.smoothSeconds);
       smoothInput.addEventListener('change', () => {
         lfo.smoothSeconds = Math.max(0, Number(smoothInput.value) || 0);
+        schedulePreviewDraw();
       });
       addRow('Smooth (s)', smoothInput);
 
-      const rangeDisplay = document.createElement('div');
-      rangeDisplay.className = 'lfo-range';
-      lfoEditor.appendChild(rangeDisplay);
+      const preview = document.createElement('div');
+      preview.className = 'mod-preview';
+      const canvas = document.createElement('canvas');
+      canvas.className = 'mod-preview-canvas';
+      preview.appendChild(canvas);
+      lfoEditor.appendChild(preview);
+
+      schedulePreviewDraw = () => {
+        // Defer to next frame so layout (clientWidth) is available.
+        requestAnimationFrame(() => {
+          const ctx = canvas.getContext('2d');
+          if (!ctx) return;
+          const style = getComputedStyle(preview);
+          const padLeft = parseFloat(style.paddingLeft) || 0;
+          const padRight = parseFloat(style.paddingRight) || 0;
+          const cssW = Math.max(1, (preview.clientWidth || 240) - padLeft - padRight);
+          const cssH = 64;
+          const dpr = window.devicePixelRatio || 1;
+          canvas.width = Math.max(1, Math.floor(cssW * dpr));
+          canvas.height = Math.max(1, Math.floor(cssH * dpr));
+          canvas.style.width = '100%';
+          canvas.style.height = `${cssH}px`;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+          // Background
+          ctx.clearRect(0, 0, cssW, cssH);
+          ctx.fillStyle = 'rgba(8, 12, 18, 0.65)';
+          ctx.fillRect(0, 0, cssW, cssH);
+
+          // Preview should always render a fixed 8/1 window (8 bars) so changing
+          // the LFO length (bpmCoefficient) doesn't change the preview waveform.
+          const PREVIEW_BARS = 8;
+          const startTime = 0;
+          const duration = Math.max(1e-6, barSeconds() * PREVIEW_BARS);
+          const samples = 220;
+          const dt = duration / Math.max(1, samples - 1);
+
+          const beatsPerSecond = bpm / 60;
+          const beatsPerBar = 4;
+          const coeff = PREVIEW_BARS; // 8/1
+          const effectiveFreq =
+            coeff > 0 ? beatsPerSecond / (beatsPerBar * coeff) : 0;
+
+          const rng = mulberry32(hashStringToSeed(lfo.id));
+          let lastValue = 0;
+          let holdValue = rng() * 2 - 1;
+          let lastHoldTime = startTime;
+          const smooth = Math.max(0, lfo.smoothSeconds);
+
+          const baseValue = getLfoBaseValue();
+          const { min: deltaMinRaw, max: deltaMaxRaw, scale } = computeDeltaRange(lfo);
+          let absMin = baseValue + deltaMinRaw;
+          let absMax = baseValue + deltaMaxRaw;
+          if (!isFinite(absMin) || !isFinite(absMax) || Math.abs(absMax - absMin) < 1e-9) {
+            absMin = baseValue - 1;
+            absMax = baseValue + 1;
+          }
+          if (absMin > absMax) {
+            const tmp = absMin;
+            absMin = absMax;
+            absMax = tmp;
+          }
+          // Slight padding so the line doesn't touch edges
+          const padY = 6;
+          const denom = absMax - absMin;
+          const yFor = (v: number) => {
+            const t = denom !== 0 ? (v - absMin) / denom : 0.5;
+            const clamped = Math.min(1, Math.max(0, t));
+            return padY + (1 - clamped) * (cssH - padY * 2);
+          };
+
+          // Grid: base value (0 delta) if in range
+          if (baseValue > absMin && baseValue < absMax) {
+            ctx.strokeStyle = 'rgba(220, 231, 255, 0.12)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(0, yFor(baseValue));
+            ctx.lineTo(cssW, yFor(baseValue));
+            ctx.stroke();
+          }
+
+          ctx.strokeStyle = 'rgba(79, 209, 255, 0.95)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+
+          for (let i = 0; i < samples; i++) {
+            const timeSeconds = startTime + (i / Math.max(1, samples - 1)) * duration;
+            const phase = effectiveFreq <= 0 ? lfo.phase : timeSeconds * effectiveFreq * TAU + lfo.phase;
+
+            let raw: number;
+            switch (lfo.wave) {
+              case 'triangle':
+                raw = (2 / Math.PI) * Math.asin(Math.sin(phase));
+                break;
+              case 'square':
+                raw = Math.sign(Math.sin(phase)) || 1;
+                break;
+              case 'saw': {
+                const t = wrap01(phase / TAU);
+                raw = t * 2 - 1;
+                break;
+              }
+              case 'expDecay': {
+                const t = wrap01(phase / TAU);
+                raw = expDecayWave(t, 6);
+                break;
+              }
+              case 'invExpDecay': {
+                const t = wrap01(phase / TAU);
+                raw = -expDecayWave(t, 6);
+                break;
+              }
+              case 'exp2Decay': {
+                const t = wrap01(phase / TAU);
+                raw = exp2DecayWave(t, 6);
+                break;
+              }
+              case 'invExp2Decay': {
+                const t = wrap01(phase / TAU);
+                raw = -exp2DecayWave(t, 6);
+                break;
+              }
+              case 'noise':
+                raw = rng() * 2 - 1;
+                break;
+              case 'sampleHold': {
+                const interval = 1 / Math.max(0.0001, effectiveFreq || 0.0001);
+                if (timeSeconds - lastHoldTime >= interval) {
+                  holdValue = rng() * 2 - 1;
+                  lastHoldTime = timeSeconds;
+                }
+                raw = holdValue;
+                break;
+              }
+              case 'sine':
+              default:
+                raw = Math.sin(phase);
+                break;
+            }
+
+            if (smooth > 0 && dt > 0) {
+              const alpha = Math.min(1, Math.max(0, 1 - Math.exp(-dt / smooth)));
+              raw = lastValue + (raw - lastValue) * alpha;
+            }
+            lastValue = raw;
+
+            const normalized = lfo.bipolar ? raw : raw * 0.5 + 0.5;
+            const delta = lfo.offset * scale + normalized * lfo.amount * scale;
+            const out = baseValue + delta;
+
+            const x = (i / Math.max(1, samples - 1)) * cssW;
+            const y = yFor(out);
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        });
+      };
+
+      rangeMinInput.addEventListener('change', () => {
+        const minAbsRaw = Number(rangeMinInput.value);
+        const maxAbsRaw = Number(rangeMaxInput.value);
+        if (!isFinite(minAbsRaw) || !isFinite(maxAbsRaw)) {
+          updateRangeDisplay();
+          return;
+        }
+        updateRangeBounds();
+        const target = modulation.getTarget(lfo.targetId);
+        let minAbs = minAbsRaw;
+        let maxAbs = maxAbsRaw;
+        if (target?.min !== undefined) {
+          minAbs = Math.max(target.min, minAbs);
+          maxAbs = Math.max(target.min, maxAbs);
+        }
+        if (target?.max !== undefined) {
+          minAbs = Math.min(target.max, minAbs);
+          maxAbs = Math.min(target.max, maxAbs);
+        }
+        if (minAbs > maxAbs) {
+          const tmp = minAbs;
+          minAbs = maxAbs;
+          maxAbs = tmp;
+        }
+        const base = getLfoBaseValue();
+        applyDeltaRange(minAbs - base, maxAbs - base);
+        updateRangeDisplay();
+        schedulePreviewDraw();
+      });
+
+      rangeMaxInput.addEventListener('change', () => {
+        const minAbsRaw = Number(rangeMinInput.value);
+        const maxAbsRaw = Number(rangeMaxInput.value);
+        if (!isFinite(minAbsRaw) || !isFinite(maxAbsRaw)) {
+          updateRangeDisplay();
+          return;
+        }
+        updateRangeBounds();
+        const target = modulation.getTarget(lfo.targetId);
+        let minAbs = minAbsRaw;
+        let maxAbs = maxAbsRaw;
+        if (target?.min !== undefined) {
+          minAbs = Math.max(target.min, minAbs);
+          maxAbs = Math.max(target.min, maxAbs);
+        }
+        if (target?.max !== undefined) {
+          minAbs = Math.min(target.max, minAbs);
+          maxAbs = Math.min(target.max, maxAbs);
+        }
+        if (minAbs > maxAbs) {
+          const tmp = minAbs;
+          minAbs = maxAbs;
+          maxAbs = tmp;
+        }
+        const base = getLfoBaseValue();
+        applyDeltaRange(minAbs - base, maxAbs - base);
+        updateRangeDisplay();
+        schedulePreviewDraw();
+      });
+
+      addRow('Min', rangeMinInput);
+      addRow('Max', rangeMaxInput);
 
       const updateRangeDisplay = () => {
+        updateRangeBounds();
+        const base = getLfoBaseValue();
         const { min, max, target } = computeDeltaRange(lfo);
         const fmt = (v: number) => v.toFixed(3);
-        rangeDisplay.textContent = `Δ range: ${fmt(min)} … ${fmt(max)}${target ? ` (${target.label})` : ''}`;
+        const absMin = base + min;
+        const absMax = base + max;
+        rangeDisplay.textContent =
+          `Range: ${fmt(absMin)} … ${fmt(absMax)}` +
+          `  |  Δ: ${fmt(min)} … ${fmt(max)}` +
+          `${target ? ` (${target.label})` : ''}`;
+        // Keep the inputs in sync unless the user is actively editing one.
+        if (document.activeElement !== rangeMinInput) {
+          rangeMinInput.value = String(Number.isFinite(absMin) ? absMin : 0);
+        }
+        if (document.activeElement !== rangeMaxInput) {
+          rangeMaxInput.value = String(Number.isFinite(absMax) ? absMax : 0);
+        }
+        schedulePreviewDraw();
       };
       updateRangeDisplay();
       return;
     }
 
     if (env) {
+      let schedulePreviewDraw = () => {};
+
       const header = document.createElement('div');
       header.className = 'lfo-editor-title';
       const title = document.createElement('span');
@@ -1073,11 +1981,10 @@ export function initTimeline(options: TimelineInitOptions) {
       if (audioDurationSeconds !== null && isFinite(audioDurationSeconds)) {
         startInput.max = String(audioDurationSeconds);
       }
-      startInput.value = String(env.startSeconds ?? 0);
+      startInput.value = String(region.startSeconds);
       startInput.addEventListener('change', () => {
         const nextStart = Number(startInput.value) || 0;
-        const nextEnd = env.endSeconds ?? nextStart;
-        applyEnvelopeTimeWindow(env, nextStart, nextEnd);
+        applyRegionTimeWindow(region, nextStart, region.endSeconds, 'floor', 'ceil');
       });
       addRow('Start (s)', startInput);
 
@@ -1088,11 +1995,10 @@ export function initTimeline(options: TimelineInitOptions) {
       if (audioDurationSeconds !== null && isFinite(audioDurationSeconds)) {
         endInput.max = String(audioDurationSeconds);
       }
-      endInput.value = String(env.endSeconds ?? env.startSeconds ?? 0);
+      endInput.value = String(region.endSeconds);
       endInput.addEventListener('change', () => {
         const nextEnd = Number(endInput.value) || 0;
-        const nextStart = env.startSeconds ?? 0;
-        applyEnvelopeTimeWindow(env, nextStart, nextEnd);
+        applyRegionTimeWindow(region, region.startSeconds, nextEnd, 'floor', 'ceil');
       });
       addRow('End (s)', endInput);
 
@@ -1106,11 +2012,6 @@ export function initTimeline(options: TimelineInitOptions) {
       targetSelect.value = env.targetId;
       targetSelect.addEventListener('change', () => {
         env.targetId = targetSelect.value;
-        if (peaks && selectedSegmentId) {
-          const seg = peaks.segments.getSegment(selectedSegmentId);
-          const target = modulation.getTarget(env.targetId);
-          if (seg) seg.update({ labelText: target ? target.label : env.targetId });
-        }
         renderLfoList();
         renderLfoEditor();
       });
@@ -1126,6 +2027,7 @@ export function initTimeline(options: TimelineInitOptions) {
       waveSelect.value = env.wave;
       waveSelect.addEventListener('change', () => {
         env.wave = waveSelect.value as Waveform;
+        schedulePreviewDraw();
       });
       addRow('Wave', waveSelect);
 
@@ -1141,6 +2043,12 @@ export function initTimeline(options: TimelineInitOptions) {
 
       const rangeDisplay = document.createElement('div');
       rangeDisplay.className = 'lfo-range';
+
+      const preview = document.createElement('div');
+      preview.className = 'mod-preview';
+      const canvas = document.createElement('canvas');
+      canvas.className = 'mod-preview-canvas';
+      preview.appendChild(canvas);
 
       const updateBounds = () => {
         const target = modulation.getTarget(env.targetId);
@@ -1168,6 +2076,122 @@ export function initTimeline(options: TimelineInitOptions) {
         rangeDisplay.textContent = `Range: ${fmt(env.min)} … ${fmt(env.max)}${target ? ` (${target.label})` : ''}`;
       };
 
+      schedulePreviewDraw = () => {
+        requestAnimationFrame(() => {
+          const ctx = canvas.getContext('2d');
+          if (!ctx) return;
+          const style = getComputedStyle(preview);
+          const padLeft = parseFloat(style.paddingLeft) || 0;
+          const padRight = parseFloat(style.paddingRight) || 0;
+          const cssW = Math.max(1, (preview.clientWidth || 240) - padLeft - padRight);
+          const cssH = 64;
+          const dpr = window.devicePixelRatio || 1;
+          canvas.width = Math.max(1, Math.floor(cssW * dpr));
+          canvas.height = Math.max(1, Math.floor(cssH * dpr));
+          canvas.style.width = '100%';
+          canvas.style.height = `${cssH}px`;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+          ctx.clearRect(0, 0, cssW, cssH);
+          ctx.fillStyle = 'rgba(8, 12, 18, 0.65)';
+          ctx.fillRect(0, 0, cssW, cssH);
+
+          const startTime = region.startSeconds;
+          const endTime = region.endSeconds;
+          const duration = Math.max(1e-6, endTime - startTime);
+          const samples = 220;
+
+          let minV = Math.min(env.min, env.max);
+          let maxV = Math.max(env.min, env.max);
+          if (!isFinite(minV) || !isFinite(maxV) || Math.abs(maxV - minV) < 1e-9) {
+            minV = 0;
+            maxV = 1;
+          }
+          const padY = 6;
+          const denom = maxV - minV;
+          const yFor = (v: number) => {
+            const t = denom !== 0 ? (v - minV) / denom : 0.5;
+            const clamped = Math.min(1, Math.max(0, t));
+            return padY + (1 - clamped) * (cssH - padY * 2);
+          };
+
+          const rng = mulberry32(hashStringToSeed(env.id));
+          let holdValue = rng() * 2 - 1;
+          let lastHoldTime = startTime;
+
+          ctx.strokeStyle = 'rgba(167, 139, 250, 0.95)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+
+          for (let i = 0; i < samples; i++) {
+            const u = i / Math.max(1, samples - 1);
+            const timeSeconds = startTime + u * duration;
+            const tNorm = Math.min(1, Math.max(0, (timeSeconds - startTime) / duration));
+            const phase = tNorm * TAU;
+
+            let raw: number;
+            switch (env.wave) {
+              case 'triangle':
+                raw = (2 / Math.PI) * Math.asin(Math.sin(phase));
+                break;
+              case 'square':
+                raw = Math.sign(Math.sin(phase)) || 1;
+                break;
+              case 'saw': {
+                const t = wrap01(phase / TAU);
+                raw = t * 2 - 1;
+                break;
+              }
+              case 'expDecay': {
+                const t = wrap01(phase / TAU);
+                raw = expDecayWave(t, 6);
+                break;
+              }
+              case 'invExpDecay': {
+                const t = wrap01(phase / TAU);
+                raw = -expDecayWave(t, 6);
+                break;
+              }
+              case 'exp2Decay': {
+                const t = wrap01(phase / TAU);
+                raw = exp2DecayWave(t, 6);
+                break;
+              }
+              case 'invExp2Decay': {
+                const t = wrap01(phase / TAU);
+                raw = -exp2DecayWave(t, 6);
+                break;
+              }
+              case 'noise':
+                raw = rng() * 2 - 1;
+                break;
+              case 'sampleHold': {
+                const interval = duration;
+                if (timeSeconds - lastHoldTime >= interval) {
+                  holdValue = rng() * 2 - 1;
+                  lastHoldTime = timeSeconds;
+                }
+                raw = holdValue;
+                break;
+              }
+              case 'sine':
+              default:
+                raw = Math.sin(phase);
+                break;
+            }
+
+            const normalized = raw * 0.5 + 0.5;
+            const value = env.min + normalized * (env.max - env.min);
+
+            const x = u * cssW;
+            const y = yFor(value);
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        });
+      };
+
       const syncRangeFromInputs = () => {
         const nextMin = Number(minInput.value);
         const nextMax = Number(maxInput.value);
@@ -1181,6 +2205,7 @@ export function initTimeline(options: TimelineInitOptions) {
           maxInput.value = String(env.max);
         }
         updateRangeDisplay();
+        schedulePreviewDraw();
       };
 
       minInput.addEventListener('change', syncRangeFromInputs);
@@ -1191,107 +2216,18 @@ export function initTimeline(options: TimelineInitOptions) {
       addRow('Min', minInput);
       addRow('Max', maxInput);
       lfoEditor.appendChild(rangeDisplay);
+      lfoEditor.appendChild(preview);
+      schedulePreviewDraw();
     }
-  };
-
-  const ensureSegmentId = (segment: Segment) => {
-    if (segment.id) return segment.id;
-    const id = `seg-${Math.random().toString(16).slice(2)}`;
-    (segment as any).id = id;
-    return id;
-  };
-
-  const createLfoForSegment = (segment: Segment) => {
-    const segmentId = ensureSegmentId(segment);
-    if (envelopeBySegmentId.has(segmentId)) return null;
-    if (lfoBySegmentId.has(segmentId)) return lfoBySegmentId.get(segmentId) ?? null;
-    const created = modulation.addLfo({});
-    if (!created) return null;
-    const lfo = created as TimelineLfo;
-    lfo.startSeconds = segment.startTime;
-    lfo.endSeconds = segment.endTime;
-    lfo.segmentId = segmentId;
-    lfoBySegmentId.set(segmentId, lfo);
-    (segment as any).lfoId = lfo.id;
-    segment.update({ labelText: `LFO ${lfoBySegmentId.size}` });
-    renderLfoList();
-    selectSegment(segmentId);
-    return lfo;
-  };
-
-  const createEnvelopeForSegment = (segment: Segment) => {
-    const segmentId = ensureSegmentId(segment);
-    if (lfoBySegmentId.has(segmentId)) return null;
-    if (envelopeBySegmentId.has(segmentId)) return envelopeBySegmentId.get(segmentId) ?? null;
-    const created = modulation.addEnvelope({});
-    if (!created) return null;
-    const env = created as TimelineEnvelope;
-    env.startSeconds = segment.startTime;
-    env.endSeconds = segment.endTime;
-    env.segmentId = segmentId;
-    envelopeBySegmentId.set(segmentId, env);
-    (segment as any).envelopeId = env.id;
-    segment.update({ labelText: `ENV ${envelopeBySegmentId.size}` });
-    renderLfoList();
-    selectSegment(segmentId);
-    return env;
-  };
-
-  const createEventForSegment = (segment: Segment) => {
-    return insertKind === 'envelope' ? createEnvelopeForSegment(segment) : createLfoForSegment(segment);
-  };
-
-  const updateEventFromSegment = (segment: Segment) => {
-    const segmentId = segment.id;
-    if (!segmentId) return;
-    const lfo = lfoBySegmentId.get(segmentId);
-    if (lfo) {
-      lfo.startSeconds = segment.startTime;
-      lfo.endSeconds = segment.endTime;
-    } else {
-      const env = envelopeBySegmentId.get(segmentId);
-      if (!env) return;
-      env.startSeconds = segment.startTime;
-      env.endSeconds = segment.endTime;
-    }
-    renderLfoList();
-    if (selectedSegmentId === segmentId) renderLfoEditor();
-  };
-
-  const removeEventsForSegments = (segments: Segment[]) => {
-    for (const seg of segments) {
-      const id = seg.id;
-      if (!id) continue;
-      const lfo = lfoBySegmentId.get(id);
-      if (lfo) {
-        modulation.removeLfo(lfo.id);
-        lfoBySegmentId.delete(id);
-        continue;
-      }
-      const env = envelopeBySegmentId.get(id);
-      if (env) {
-        modulation.removeEnvelope(env.id);
-        envelopeBySegmentId.delete(id);
-      }
-    }
-    renderLfoList();
-    renderLfoEditor();
   };
 
   const clearSchedule = () => {
-    if (lfoBySegmentId.size) {
-      for (const lfo of lfoBySegmentId.values()) {
-        modulation.removeLfo(lfo.id);
-      }
-      lfoBySegmentId.clear();
+    for (const region of regionsById.values()) {
+      for (const lfo of region.lfos) modulation.removeLfo(lfo.id);
+      for (const env of region.envelopes) modulation.removeEnvelope(env.id);
     }
-    if (envelopeBySegmentId.size) {
-      for (const env of envelopeBySegmentId.values()) {
-        modulation.removeEnvelope(env.id);
-      }
-      envelopeBySegmentId.clear();
-    }
-    selectSegment(null);
+    regionsById.clear();
+    selectRegion(null);
   };
 
   const destroyPeaks = (keepAudio = false) => {
@@ -1308,6 +2244,9 @@ export function initTimeline(options: TimelineInitOptions) {
     }
     overviewContainer.textContent = '';
     zoomviewContainer.textContent = '';
+    zoomviewContainer.appendChild(zoomviewRegionLanesOverlay);
+    zoomviewRegionLanesOverlay.textContent = '';
+    zoomviewRegionLanesOverlay.style.display = 'none';
     updateRenderEnabled();
   };
 
@@ -1333,17 +2272,21 @@ export function initTimeline(options: TimelineInitOptions) {
         webAudio: { audioBuffer, multiChannel: false },
         overview: {
           container: overviewContainer,
-          enableSegments: true,
+          enableSegments: false,
           enablePoints: false,
           showAxisLabels: true,
+          waveformColor: 'rgba(220, 231, 255, 0.14)',
+          playedWaveformColor: 'rgba(220, 231, 255, 0.08)',
         },
         zoomview: {
           container: zoomviewContainer,
-          enableSegments: true,
+          enableSegments: false,
           enablePoints: false,
           wheelMode: 'scroll',
           autoScroll: true,
           showAxisLabels: true,
+          waveformColor: 'rgba(220, 231, 255, 0.12)',
+          playedWaveformColor: 'rgba(220, 231, 255, 0.06)',
         },
         segmentOptions: {
           overlay: true,
@@ -1363,86 +2306,27 @@ export function initTimeline(options: TimelineInitOptions) {
           return;
         }
         peaks = instance;
+        // Peaks/Konva may replace the zoomview container contents during init;
+        // ensure our DOM overlays are attached *after* Peaks has created its stage.
+        zoomviewContainer.appendChild(zoomviewRegionLanesOverlay);
         zoomRange.max = String(zoomLevels.length - 1);
         zoomRange.disabled = false;
         syncZoomControls();
         const zoomView = peaks.views.getView('zoomview');
-        zoomView?.enableSegmentDragging(true);
-        zoomView?.setSegmentDragMode('overlap');
-        zoomView?.setMinSegmentDragWidth(3);
-        // Left click should seek/select, not insert new segments (insertion is via context menu).
         zoomView?.setWaveformDragMode('scroll');
         updatePlayBtn();
 
         peaks.on('player.timeupdate', updatePlayBtn);
         peaks.on('player.pause', updatePlayBtn);
         peaks.on('player.playing', updatePlayBtn);
-        peaks.on('zoom.update', (event) => {
-          syncZoomControls(event.currentZoom);
+        peaks.on('zoom.update', () => {
+          // Peaks emits zoom.update.currentZoom as the scale (samples-per-pixel), not the zoom index.
+          // Keep our slider synced to the actual zoom index.
+          syncZoomControls();
+          renderRegionLanes();
         });
-
-        // If a project was loaded before audio, re-create segments now.
-        for (const [segmentId, lfo] of lfoBySegmentId.entries()) {
-          const start = lfo.startSeconds ?? 0;
-          const end = lfo.endSeconds ?? start + barSeconds();
-          const target = modulation.getTarget(lfo.targetId);
-          peaks.segments.add({
-            id: segmentId,
-            startTime: start,
-            endTime: end,
-            // Markers + draggable overlay are created at segment construction time in Peaks.
-            // We hide markers and "lock" editing via selection state in refreshSegmentColors().
-            editable: true,
-            markers: true,
-            labelText: target ? target.label : lfo.targetId,
-            color: segmentId === selectedSegmentId ? COLOR_SELECTED : COLOR_LFO,
-          });
-        }
-        for (const [segmentId, env] of envelopeBySegmentId.entries()) {
-          const start = env.startSeconds ?? 0;
-          const end = env.endSeconds ?? start + barSeconds();
-          const target = modulation.getTarget(env.targetId);
-          peaks.segments.add({
-            id: segmentId,
-            startTime: start,
-            endTime: end,
-            editable: true,
-            markers: true,
-            labelText: target ? target.label : env.targetId,
-            color: segmentId === selectedSegmentId ? COLOR_SELECTED : COLOR_ENV,
-          });
-        }
-        refreshSegmentColors();
-
-        peaks.on('segments.insert', (event: SegmentsInsertEvent) => {
-          if (isSnapping) return;
-          applySnapToSegment(event.segment, 'floor', 'ceil');
-          createEventForSegment(event.segment);
-          options.onSegmentInserted?.(event.segment);
-        });
-
-        const onDragged = (event: SegmentDragEvent) => {
-          if (isSnapping) return;
-          applySnapToSegment(event.segment, 'round', 'round');
-          updateEventFromSegment(event.segment);
-          options.onSegmentUpdated?.(event.segment);
-        };
-
-        peaks.on('segments.dragged', onDragged);
-        peaks.on('segments.dragend', onDragged);
-
-        peaks.on('segments.click', (event) => {
-          selectSegment(event.segment.id ?? null);
-        });
-
-        peaks.on('segments.contextmenu', (event: SegmentPointerEvent) => {
-          event.evt.preventDefault();
-          event.evt.stopPropagation();
-          event.preventViewEvent();
-          const segmentId = event.segment.id ?? null;
-          if (!segmentId) return;
-          selectSegment(segmentId);
-          showSegmentContextMenu(event.evt.clientX, event.evt.clientY, segmentId);
+        peaks.on('zoomview.update', () => {
+          renderRegionLanes();
         });
 
         const onWaveformContextMenu = (event: WaveformViewPointerEvent) => {
@@ -1453,15 +2337,9 @@ export function initTimeline(options: TimelineInitOptions) {
         peaks.on('zoomview.contextmenu', onWaveformContextMenu);
         peaks.on('overview.contextmenu', onWaveformContextMenu);
 
-        peaks.on('segments.remove', (event) => {
-          removeEventsForSegments(event.segments);
-          for (const seg of event.segments) {
-            options.onSegmentRemoved?.(seg.id ?? '');
-          }
-          if (selectedSegmentId && event.segments.some((s) => s.id === selectedSegmentId)) {
-            selectSegment(null);
-          }
-        });
+        renderRegionLanes();
+        renderLfoList();
+        renderLfoEditor();
       }
     );
   };
@@ -1527,13 +2405,23 @@ export function initTimeline(options: TimelineInitOptions) {
     bpm = next;
     bpmInput.value = String(next);
     options.onBpmChange?.(next);
-    if (peaks) {
-      for (const seg of peaks.segments.getSegments()) {
-        applySnapToSegment(seg, 'floor', 'ceil');
-        updateEventFromSegment(seg);
+    // Re-snap all region windows to the new bar duration.
+    for (const region of regionsById.values()) {
+      const { start, end } = snapRegionWindow(region.startSeconds, region.endSeconds, 'floor', 'ceil');
+      region.startSeconds = start;
+      region.endSeconds = end;
+      for (const lfo of region.lfos) {
+        lfo.startSeconds = start;
+        lfo.endSeconds = end;
       }
-      refreshSegmentColors();
+      for (const env of region.envelopes) {
+        env.startSeconds = start;
+        env.endSeconds = end;
+      }
     }
+    renderRegionLanes();
+    renderLfoList();
+    renderLfoEditor();
   });
 
   zoomOutBtn.addEventListener('click', () => {
@@ -1592,6 +2480,7 @@ export function initTimeline(options: TimelineInitOptions) {
   const fitWaveforms = () => {
     peaks?.views.getView('overview')?.fitToContainer();
     peaks?.views.getView('zoomview')?.fitToContainer();
+    renderRegionLanes();
   };
 
   const resizeObserver = new ResizeObserver(() => fitWaveforms());
@@ -1599,14 +2488,15 @@ export function initTimeline(options: TimelineInitOptions) {
 
   return {
     getPeaks: () => peaks,
-    getSelectedSegmentId: () => selectedSegmentId,
+    getSelectedRegionId: () => selectedRegionId,
     getPlayheadSeconds: () => {
       if (!audioEl.src) return null;
       return audioEl.currentTime;
     },
     getRenderSchedule: (): RenderSchedule | null => {
       if (audioDurationSeconds === null || !isFinite(audioDurationSeconds) || audioDurationSeconds <= 0) return null;
-      const lfos: LfoConfig[] = Array.from(lfoBySegmentId.values()).map((lfo) => ({
+      const lfos: LfoConfig[] = Array.from(regionsById.values()).flatMap((region) =>
+        region.lfos.map((lfo) => ({
         id: lfo.id,
         targetId: lfo.targetId,
         wave: lfo.wave,
@@ -1617,24 +2507,28 @@ export function initTimeline(options: TimelineInitOptions) {
         bipolar: lfo.bipolar,
         smoothSeconds: lfo.smoothSeconds,
         enabled: lfo.enabled,
-        startSeconds: lfo.startSeconds,
-        endSeconds: lfo.endSeconds,
-      }));
-      const envelopes: EnvelopeConfig[] = Array.from(envelopeBySegmentId.values()).map((env) => ({
+          startSeconds: region.startSeconds,
+          endSeconds: region.endSeconds,
+        }))
+      );
+      const envelopes: EnvelopeConfig[] = Array.from(regionsById.values()).flatMap((region) =>
+        region.envelopes.map((env) => ({
         id: env.id,
         targetId: env.targetId,
         wave: env.wave,
         min: env.min,
         max: env.max,
         enabled: env.enabled,
-        startSeconds: env.startSeconds,
-        endSeconds: env.endSeconds,
-      }));
+          startSeconds: region.startSeconds,
+          endSeconds: region.endSeconds,
+        }))
+      );
       return { bpm, durationSeconds: audioDurationSeconds, lfos, envelopes, videoResolution };
     },
     getProjectTimeline: (): ProjectTimeline => {
-      const lfos = Array.from(lfoBySegmentId.entries()).map(([segmentId, lfo]) => ({
-        segmentId,
+      const lfos = Array.from(regionsById.values()).flatMap((region) =>
+        region.lfos.map((lfo) => ({
+          segmentId: region.id,
         lfo: {
           id: lfo.id,
           targetId: lfo.targetId,
@@ -1646,12 +2540,14 @@ export function initTimeline(options: TimelineInitOptions) {
           bipolar: lfo.bipolar,
           smoothSeconds: lfo.smoothSeconds,
           enabled: lfo.enabled,
-          startSeconds: lfo.startSeconds,
-          endSeconds: lfo.endSeconds,
+            startSeconds: region.startSeconds,
+            endSeconds: region.endSeconds,
         } satisfies Partial<LfoConfig>,
-      }));
-      const envelopes = Array.from(envelopeBySegmentId.entries()).map(([segmentId, env]) => ({
-        segmentId,
+        }))
+      );
+      const envelopes = Array.from(regionsById.values()).flatMap((region) =>
+        region.envelopes.map((env) => ({
+          segmentId: region.id,
         envelope: {
           id: env.id,
           targetId: env.targetId,
@@ -1659,10 +2555,11 @@ export function initTimeline(options: TimelineInitOptions) {
           min: env.min,
           max: env.max,
           enabled: env.enabled,
-          startSeconds: env.startSeconds,
-          endSeconds: env.endSeconds,
+            startSeconds: region.startSeconds,
+            endSeconds: region.endSeconds,
         } satisfies Partial<EnvelopeConfig>,
-      }));
+        }))
+      );
       return {
         bpm,
         durationSeconds: audioDurationSeconds && isFinite(audioDurationSeconds) ? audioDurationSeconds : 0,
@@ -1688,27 +2585,75 @@ export function initTimeline(options: TimelineInitOptions) {
       updateAudioLabel();
       updateRenderEnabled();
 
+      const ensureRegion = (regionId: string, startSeconds: number, endSeconds: number) => {
+        const existing = regionsById.get(regionId);
+        if (existing) {
+          existing.startSeconds = Math.min(existing.startSeconds, startSeconds);
+          existing.endSeconds = Math.max(existing.endSeconds, endSeconds);
+          return existing;
+        }
+        const region: TimelineRegion = {
+          id: regionId,
+          startSeconds,
+          endSeconds,
+          lfos: [],
+          envelopes: [],
+        };
+        regionsById.set(regionId, region);
+        return region;
+      };
+
       for (const entry of timeline.lfos ?? []) {
         const created = modulation.addLfo(entry.lfo);
         if (!created) continue;
-        const segmentId = entry.segmentId || created.id;
+        const regionId = entry.segmentId || created.id;
         const lfo = created as TimelineLfo;
-        lfo.segmentId = segmentId;
-        lfoBySegmentId.set(segmentId, lfo);
+        const start = typeof lfo.startSeconds === 'number' && isFinite(lfo.startSeconds) ? lfo.startSeconds : 0;
+        const endRaw = typeof lfo.endSeconds === 'number' && isFinite(lfo.endSeconds) ? lfo.endSeconds : start + barSeconds();
+        const region = ensureRegion(regionId, start, endRaw);
+        region.lfos.push(lfo);
       }
+
       for (const entry of timeline.envelopes ?? []) {
         const created = modulation.addEnvelope(entry.envelope);
         if (!created) continue;
-        const segmentId = entry.segmentId || created.id;
+        const regionId = entry.segmentId || created.id;
         const env = created as TimelineEnvelope;
-        env.segmentId = segmentId;
-        envelopeBySegmentId.set(segmentId, env);
+        const start = typeof env.startSeconds === 'number' && isFinite(env.startSeconds) ? env.startSeconds : 0;
+        const endRaw = typeof env.endSeconds === 'number' && isFinite(env.endSeconds) ? env.endSeconds : start + barSeconds();
+        const region = ensureRegion(regionId, start, endRaw);
+        region.envelopes.push(env);
       }
+
+      // Normalize all modulators to share their region's window, then snap to bars.
+      for (const region of regionsById.values()) {
+        const { start, end } = snapRegionWindow(region.startSeconds, region.endSeconds, 'floor', 'ceil');
+        region.startSeconds = start;
+        region.endSeconds = end;
+        for (const lfo of region.lfos) {
+          lfo.startSeconds = start;
+          lfo.endSeconds = end;
+        }
+        for (const env of region.envelopes) {
+          env.startSeconds = start;
+          env.endSeconds = end;
+        }
+      }
+
       renderLfoList();
-      selectSegment(timeline.lfos?.[0]?.segmentId ?? timeline.envelopes?.[0]?.segmentId ?? null);
+      const preferred =
+        timeline.lfos?.[0]?.segmentId ??
+        timeline.envelopes?.[0]?.segmentId ??
+        Array.from(regionsById.values()).sort((a, b) => a.startSeconds - b.startSeconds)[0]?.id ??
+        null;
+      selectRegion(preferred);
     },
     destroy: () => {
       resizeObserver.disconnect();
+      window.removeEventListener('pointermove', onRegionPointerMove);
+      window.removeEventListener('pointerup', onRegionPointerUp);
+      document.removeEventListener('click', hideContextMenu);
+      window.removeEventListener('blur', hideContextMenu);
       destroyPeaks();
       clearSchedule();
     },
