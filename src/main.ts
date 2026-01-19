@@ -44,6 +44,7 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import GUI from 'lil-gui';
 import { ModulationManager } from './modulation';
 import { initTimeline, type RenderSchedule } from './timeline';
+import { initBasicTimelineDemo } from './modulation-basic-demo';
 import { PROJECT_VERSION, stringifyProjectFile, type ProjectFile, type ProjectSettings } from './project';
 import { Pipe, Simulation } from './simulation';
 import type { SimulationConfig, Vec3 } from './simulation';
@@ -70,10 +71,13 @@ const FRACTAL_COLOR_SCHEME_MAP: Record<FractalColorScheme, number> = {
   escape: 1,
 };
 
+const urlParams = new URLSearchParams(window.location.search);
+
 // Optional URL override for quick switching (e.g. `?sim=teapot`). Project/schedule settings still take precedence.
 const simulationUi = {
-  simulation: (normalizeSimulationId(new URLSearchParams(window.location.search).get('sim')) ?? 'tubes') as SimulationId,
+  simulation: (normalizeSimulationId(urlParams.get('sim')) ?? 'tubes') as SimulationId,
 };
+const useBasicTimeline = urlParams.get('timeline') === 'basic';
 let activeSimulationId: SimulationId = simulationUi.simulation;
 
 type RenderSettings = {
@@ -181,14 +185,19 @@ type MirrorRenderer = 'raster' | 'ray' | 'rayAllFaces' | 'physicalRay';
 const modulation = new ModulationManager();
 const modulationGlobals = { bpm: 120 };
 let modulationBaseSetters: Record<string, (v: number) => void> = {};
-let timelineHandle: ReturnType<typeof initTimeline> | null = null;
+type TimelineHandle = ReturnType<typeof initTimeline> | ReturnType<typeof initBasicTimelineDemo>;
+let timelineHandle: TimelineHandle | null = null;
 let ignoreAudioForModulation = false;
 const BACKEND_RENDER_URL = 'http://localhost:3333/render';
 
 async function requestBackendRender(schedule: RenderSchedule) {
   if (videoCaptureSettings.recording) return;
   console.log('Requesting backend render…');
-  const scheduleWithSettings: RenderSchedule = { ...schedule, settings: snapshotProjectSettings() };
+  const scheduleWithSettings: RenderSchedule = {
+    ...schedule,
+    videoFps: schedule.videoFps ?? videoCaptureSettings.fps,
+    settings: snapshotProjectSettings(),
+  };
   const res = await fetch(BACKEND_RENDER_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -274,6 +283,9 @@ const simBounds = () => {
 const infoOverlay = document.createElement('div');
 infoOverlay.id = 'info';
 document.body.appendChild(infoOverlay);
+
+const captureCanvas = document.createElement('canvas');
+const captureCtx = captureCanvas.getContext('2d');
 
 const recordingOverlay = document.createElement('div');
 recordingOverlay.id = 'recording-progress';
@@ -711,7 +723,19 @@ const state = {
 };
 const videoCaptureSettings = {
   durationSeconds: 10,
+  fps: 60,
   recording: false,
+};
+const isHeadless =
+  typeof navigator !== 'undefined' &&
+  /HeadlessChrome/i.test(navigator.userAgent);
+// Headless Chrome's MediaRecorder is flaky; allow WebCodecs there and convert to WebM server-side.
+const FORCE_WEBM_CAPTURE = !isHeadless;
+
+type IvfWriter = {
+  begin: (meta: { base: string; width: number; height: number; fps: number; frameCount: number }) => Promise<void> | void;
+  write: (data: Uint8Array) => Promise<void> | void;
+  end: (frameCount: number) => Promise<void> | void;
 };
 let rafHandle: number;
 let frameIndex = 0;
@@ -1098,11 +1122,14 @@ window.addEventListener('pointerleave', onPointerUp);
 window.addEventListener('wheel', onWheel, { passive: true });
 
 function frame(now: number) {
+  if (videoCaptureSettings.recording) return;
   const dtRaw = (now - lastTime) / 1000;
   const dt = Math.min(dtRaw, 0.05); // clamp to avoid large physics jumps on tab switches
   lastTime = now;
   stepFrame(dt);
-  rafHandle = requestAnimationFrame(frame);
+  if (!videoCaptureSettings.recording) {
+    rafHandle = requestAnimationFrame(frame);
+  }
 }
 
 function stepFrame(dt: number) {
@@ -1304,10 +1331,22 @@ function pickRecordingMimeType() {
 }
 
 function supportsWebCodecs() {
-  return typeof VideoEncoder !== 'undefined' && typeof createImageBitmap !== 'undefined';
+  return (
+    typeof VideoEncoder !== 'undefined' &&
+    typeof VideoFrame !== 'undefined'
+  );
 }
 
-const CAPTURE_FPS = 60;
+const CAPTURE_FPS_OPTIONS = [60, 120] as const;
+const DEFAULT_CAPTURE_FPS = 60;
+
+function normalizeCaptureFps(value: unknown) {
+  const rounded = Math.round(Number(value));
+  if ((CAPTURE_FPS_OPTIONS as readonly number[]).includes(rounded)) {
+    return rounded;
+  }
+  return DEFAULT_CAPTURE_FPS;
+}
 
 function estimateCaptureBitrate(width: number, height: number, fps: number) {
   // Scale bitrate with pixel throughput so low-res renders are faster and smaller,
@@ -1347,68 +1386,36 @@ function videoResolutionToRenderSize(value: unknown): { width: number; height: n
   return { width, height };
 }
 
-async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | null> {
-  if (!supportsWebCodecs()) return null;
-  const width = canvas.width;
-  const height = canvas.height;
-  const safeDuration = Math.max(0.1, durationSeconds);
-  const totalFrames = Math.max(1, Math.round(safeDuration * CAPTURE_FPS));
-  const bitrate = estimateCaptureBitrate(width, height, CAPTURE_FPS);
-
-  const chunks: BlobPart[] = [];
-  const encoder = new VideoEncoder({
-    output: (chunk) => {
-      const frameHeader = new ArrayBuffer(12);
-      const headerView = new DataView(frameHeader);
-      headerView.setUint32(0, chunk.byteLength, true);
-      headerView.setBigUint64(4, BigInt(chunk.timestamp), true);
-
-      const data = new Uint8Array(chunk.byteLength);
-      chunk.copyTo(data);
-      chunks.push(frameHeader, data);
-    },
-    error: (e) => {
-      console.error('WebCodecs encoder error', e);
-    },
-  });
-
-  encoder.configure({
-    codec: 'vp09.00.10.08',
-    width,
-    height,
-    bitrate,
-    framerate: CAPTURE_FPS,
-  });
-
-  // Pause RAF during offline render
-  const wasRunning = typeof rafHandle === 'number';
-  if (wasRunning) cancelAnimationFrame(rafHandle);
-
-  for (let i = 0; i < totalFrames; i++) {
-    setRecordingProgress(i / totalFrames, 'Encoding (WebCodecs)');
-    stepFrame(1 / CAPTURE_FPS);
-    const frame = new VideoFrame(canvas, { timestamp: i });
-    encoder.encode(frame);
-    frame.close();
-    if (i > 0 && i % 120 === 0) {
-      await encoder.flush();
-      await new Promise((r) => setTimeout(r, 0));
-    }
+function syncCaptureCanvasSize() {
+  if (!captureCtx) return;
+  if (captureCanvas.width !== canvas.width || captureCanvas.height !== canvas.height) {
+    captureCanvas.width = canvas.width;
+    captureCanvas.height = canvas.height;
+    captureCtx.imageSmoothingEnabled = false;
   }
+}
 
-  await encoder.flush();
-  encoder.close();
+function copyFrameToCaptureCanvas() {
+  const gl = renderer.getContext();
+  gl.finish();
+  if (!captureCtx) return;
+  syncCaptureCanvasSize();
+  captureCtx.drawImage(canvas, 0, 0, captureCanvas.width, captureCanvas.height);
+}
 
-  if (!chunks.length) {
-    console.warn('WebCodecs produced no chunks');
-    if (wasRunning) rafHandle = requestAnimationFrame(frame);
-    return null;
+function captureCanvasFrame(timestamp: number, duration: number) {
+  if (!captureCtx) {
+    const gl = renderer.getContext();
+    gl.finish();
+    return new VideoFrame(canvas, { timestamp, duration });
   }
+  copyFrameToCaptureCanvas();
+  return new VideoFrame(captureCanvas, { timestamp, duration });
+}
 
-  // Build IVF container (simple and widely supported)
-  const frameCount = totalFrames;
-  const header = new ArrayBuffer(32);
-  const view = new DataView(header);
+function buildIvfHeader(width: number, height: number, fps: number, frameCount: number, fourcc = 'VP90') {
+  const header = new Uint8Array(32);
+  const view = new DataView(header.buffer);
   // Signature 'DKIF'
   view.setUint8(0, 'D'.charCodeAt(0));
   view.setUint8(1, 'K'.charCodeAt(0));
@@ -1416,30 +1423,194 @@ async function encodeIvfWithWebCodecs(durationSeconds: number): Promise<Blob | n
   view.setUint8(3, 'F'.charCodeAt(0));
   view.setUint16(4, 0, true); // version
   view.setUint16(6, 32, true); // header size
-  view.setUint8(8, 'V'.charCodeAt(0));
-  view.setUint8(9, 'P'.charCodeAt(0));
-  view.setUint8(10, '9'.charCodeAt(0));
-  view.setUint8(11, '0'.charCodeAt(0));
+  const code = `${fourcc}`.padEnd(4, ' ').slice(0, 4);
+  view.setUint8(8, code.charCodeAt(0));
+  view.setUint8(9, code.charCodeAt(1));
+  view.setUint8(10, code.charCodeAt(2));
+  view.setUint8(11, code.charCodeAt(3));
   view.setUint16(12, width, true);
   view.setUint16(14, height, true);
-  view.setUint32(16, CAPTURE_FPS, true); // framerate
+  view.setUint32(16, fps, true); // framerate
   view.setUint32(20, 1, true); // timescale
   view.setUint32(24, frameCount, true); // frame count
   view.setUint32(28, 0, true); // unused
+  return header;
+}
 
+type WebCodecsChoice = {
+  config: VideoEncoderConfig;
+  fourcc: string;
+};
+
+async function pickWebCodecsConfig(
+  width: number,
+  height: number,
+  bitrate: number,
+  fps: number
+): Promise<WebCodecsChoice | null> {
+  const base: VideoEncoderConfig = { width, height, bitrate, framerate: fps };
+  const ordered = isHeadless
+    ? [
+        { codec: 'vp8', fourcc: 'VP80', latencyMode: 'realtime' as const },
+        { codec: 'vp8', fourcc: 'VP80' },
+        { codec: 'vp09.00.10.08', fourcc: 'VP90', latencyMode: 'realtime' as const },
+        { codec: 'vp09.00.10.08', fourcc: 'VP90' },
+      ]
+    : [
+        { codec: 'vp09.00.10.08', fourcc: 'VP90', latencyMode: 'realtime' as const },
+        { codec: 'vp09.00.10.08', fourcc: 'VP90' },
+        { codec: 'vp8', fourcc: 'VP80', latencyMode: 'realtime' as const },
+        { codec: 'vp8', fourcc: 'VP80' },
+      ];
+
+  for (const candidate of ordered) {
+    const config = {
+      ...base,
+      codec: candidate.codec,
+      ...(candidate.latencyMode ? { latencyMode: candidate.latencyMode } : {}),
+    } as VideoEncoderConfig;
+    try {
+      if (typeof (VideoEncoder as any).isConfigSupported === 'function') {
+        const support = await (VideoEncoder as any).isConfigSupported(config);
+        if (support?.supported) {
+          return { config: support.config ?? config, fourcc: candidate.fourcc };
+        }
+      } else {
+        return { config, fourcc: candidate.fourcc };
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+  return null;
+}
+
+async function encodeIvfWithWebCodecs(
+  durationSeconds: number,
+  captureFps: number,
+  filenameBase?: string
+): Promise<{ blob?: Blob; streamed?: boolean } | null> {
+  if (!supportsWebCodecs()) return null;
+  const width = canvas.width;
+  const height = canvas.height;
+  const safeDuration = Math.max(0.1, durationSeconds);
+  const totalFrames = Math.max(1, Math.round(safeDuration * captureFps));
+  const bitrate = estimateCaptureBitrate(width, height, captureFps);
+  const frameDurationUs = Math.round(1_000_000 / captureFps);
+  const choice = await pickWebCodecsConfig(width, height, bitrate, captureFps);
+  if (!choice) {
+    console.warn('WebCodecs config unsupported; falling back');
+    return null;
+  }
+
+  const chunks: BlobPart[] = [];
+  const ivfWriter = (window as any).__pipesIvfWriter as IvfWriter | undefined;
+  const canStream =
+    ivfWriter &&
+    typeof ivfWriter.begin === 'function' &&
+    typeof ivfWriter.write === 'function' &&
+    typeof ivfWriter.end === 'function';
+  let writeChain = Promise.resolve();
+  const writeChunk = (data: Uint8Array) => {
+    if (!canStream) return;
+    const payload = Array.from(data);
+    writeChain = writeChain.then(() => ivfWriter.write(payload));
+  };
+  let encodedFrames = 0;
+  const encoder = new VideoEncoder({
+    output: (chunk) => {
+      const frameHeader = new Uint8Array(12);
+      const headerView = new DataView(frameHeader.buffer);
+      headerView.setUint32(0, chunk.byteLength, true);
+      headerView.setBigUint64(4, BigInt(encodedFrames), true);
+
+      const data = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(data);
+      if (canStream) {
+        writeChunk(frameHeader);
+        writeChunk(data);
+      } else {
+        chunks.push(frameHeader, data);
+      }
+      encodedFrames++;
+    },
+    error: (e) => {
+      console.error('WebCodecs encoder error', e);
+    },
+  });
+
+  encoder.configure(choice.config);
+
+  // Pause RAF during offline render
+  const wasRunning = typeof rafHandle === 'number';
+  if (wasRunning) cancelAnimationFrame(rafHandle);
+
+  if (canStream) {
+    const base = filenameBase ?? `render-${Date.now()}`;
+    await ivfWriter.begin({ base, width, height, fps: captureFps, frameCount: totalFrames });
+    writeChunk(buildIvfHeader(width, height, captureFps, 0, choice.fourcc));
+  }
+
+  const forceKeyframes = isHeadless;
+  for (let i = 0; i < totalFrames; i++) {
+    setRecordingProgress(i / totalFrames, `Encoding (${captureFps}fps)`);
+    stepFrame(1 / captureFps);
+    const timestamp = Math.round((i * 1_000_000) / captureFps);
+    const frame = captureCanvasFrame(timestamp, frameDurationUs);
+    encoder.encode(frame, { keyFrame: forceKeyframes || i === 0 });
+    frame.close();
+    if (i > 0 && i % 120 === 0) {
+      await encoder.flush();
+      if (canStream) {
+        await writeChain;
+      }
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+
+  await encoder.flush();
+  encoder.close();
+
+  if (encodedFrames === 0) {
+    console.warn('WebCodecs produced no frames');
+    if (canStream) {
+      await writeChain;
+      await ivfWriter.end(0);
+    }
+    if (wasRunning) rafHandle = requestAnimationFrame(frame);
+    setRecordingProgress(null, '');
+    return null;
+  }
+
+  if (canStream) {
+    await writeChain;
+    await ivfWriter.end(encodedFrames);
+    if (wasRunning) rafHandle = requestAnimationFrame(frame);
+    setRecordingProgress(null, '');
+    return { streamed: true };
+  }
+
+  if (!chunks.length) {
+    console.warn('WebCodecs produced no chunks');
+    if (wasRunning) rafHandle = requestAnimationFrame(frame);
+    return null;
+  }
+
+  const header = buildIvfHeader(width, height, captureFps, encodedFrames, choice.fourcc);
   const blob = new Blob([header, ...chunks], { type: 'video/x-ivf' });
   if (wasRunning) rafHandle = requestAnimationFrame(frame);
   setRecordingProgress(null, '');
-  return blob;
+  return { blob };
 }
 
 async function renderVideoCapture(
   durationSeconds: number,
-  opts: { startAtZero?: boolean; filenameBase?: string; videoResolution?: number } = {}
+  opts: { startAtZero?: boolean; filenameBase?: string; videoResolution?: number; fps?: number } = {}
 ) {
   if (videoCaptureSettings.recording) return;
 
   const safeDuration = Math.max(0.1, durationSeconds);
+  const captureFps = normalizeCaptureFps(opts.fps ?? videoCaptureSettings.fps);
   const prevIgnoreAudio = ignoreAudioForModulation;
   ignoreAudioForModulation = true;
   if (opts.startAtZero) {
@@ -1463,13 +1634,23 @@ async function renderVideoCapture(
       resize();
     }
 
+    const useWebCodecs = !FORCE_WEBM_CAPTURE && supportsWebCodecs();
     // Prefer offline WebCodecs encoding (decoupled from real-time)
-    if (supportsWebCodecs()) {
+    if (useWebCodecs) {
       videoCaptureSettings.recording = true;
       try {
-        const blob = await encodeIvfWithWebCodecs(safeDuration);
-        if (blob) {
-          const url = URL.createObjectURL(blob);
+        let result: { blob?: Blob; streamed?: boolean } | null = null;
+        try {
+          result = await encodeIvfWithWebCodecs(safeDuration, captureFps, opts.filenameBase);
+        } catch (err) {
+          console.warn('WebCodecs render failed; falling back to MediaRecorder', err);
+        }
+        if (result?.streamed) {
+          setRecordingProgress(null, '');
+          return;
+        }
+        if (result?.blob) {
+          const url = URL.createObjectURL(result.blob);
           const download = document.createElement('a');
           download.href = url;
           const base = opts.filenameBase ?? `pipes-${safeDuration.toFixed(2)}s-${Date.now()}`;
@@ -1495,16 +1676,18 @@ async function renderVideoCapture(
     return;
   }
 
-  const stream = canvas.captureStream(CAPTURE_FPS);
+  syncCaptureCanvasSize();
+  const captureSource = captureCtx ? captureCanvas : canvas;
+  const stream = captureSource.captureStream(captureFps);
   const track = stream.getVideoTracks()[0];
   if (track && (track as any).applyConstraints) {
-    (track as any).applyConstraints({ frameRate: CAPTURE_FPS }).catch(() => {
+    (track as any).applyConstraints({ frameRate: captureFps }).catch(() => {
       /* ignore constraint failures */
     });
   }
   const chunks: BlobPart[] = [];
   let recorder: MediaRecorder;
-  const bitsPerSecond = estimateCaptureBitrate(canvas.width, canvas.height, CAPTURE_FPS);
+  const bitsPerSecond = estimateCaptureBitrate(canvas.width, canvas.height, captureFps);
   try {
     recorder = new MediaRecorder(stream, {
       mimeType,
@@ -1537,15 +1720,24 @@ async function renderVideoCapture(
     recorder.start();
     // Allow recorder to initialize
     await new Promise((r) => setTimeout(r, 0));
-    const totalFrames = Math.max(1, Math.round(targetDuration * 60));
+    const totalFrames = Math.max(1, Math.round(targetDuration * captureFps));
+    const frameDurationMs = 1000 / captureFps;
+    let nextFrameTime = performance.now();
     for (let i = 0; i < totalFrames; i++) {
-      setRecordingProgress(i / totalFrames, 'Recording (MediaRecorder)');
-      stepFrame(1 / 60);
+      setRecordingProgress(i / totalFrames, `Recording (${captureFps}fps)`);
+      stepFrame(1 / captureFps);
+      // Ensure the frame is fully rendered before the capture track snapshots it.
+      copyFrameToCaptureCanvas();
       if (track && (track as any).requestFrame) {
         (track as any).requestFrame();
       }
-      // Yield to let the capture track publish the frame; rAF keeps cadence stable.
-      await new Promise((r) => requestAnimationFrame(() => r(undefined)));
+      nextFrameTime += frameDurationMs;
+      const delay = Math.max(0, nextFrameTime - performance.now());
+      if (delay > 0) {
+        await new Promise((r) => setTimeout(r, delay));
+      } else {
+        await new Promise((r) => setTimeout(r, 0));
+      }
     }
     recorder.stop();
     await stopped;
@@ -1691,16 +1883,17 @@ function setupGui() {
     )
     .name('Randomize all');
   simFolder.add(videoCaptureSettings, 'durationSeconds', 5, 20, 1).name('Video length (s)');
+  simFolder.add(videoCaptureSettings, 'fps', CAPTURE_FPS_OPTIONS).name('Video FPS');
   simFolder
     .add(
       {
         renderVideo: () => {
-          renderVideoCapture(videoCaptureSettings.durationSeconds);
+          renderVideoCapture(videoCaptureSettings.durationSeconds, { fps: videoCaptureSettings.fps });
         },
       },
       'renderVideo'
     )
-    .name('Render 60fps video');
+    .name('Render video');
 
   const pipeFolder = gui.addFolder('Pipes');
   pipeFolder
@@ -4862,30 +5055,50 @@ function loadProject(project: ProjectFile) {
   timelineHandle?.loadProjectTimeline(project.timeline);
 }
 
-timelineHandle = initTimeline({
-  container: timelinePane,
-  bpm: modulationGlobals.bpm,
-  modulation,
-  onBpmChange: (bpm) => {
-    modulationGlobals.bpm = bpm;
-    modulation.setGlobalBpm(bpm);
-  },
-  onSaveProject: () => saveProject(),
-  onLoadProject: (project) => loadProject(project),
-  onRenderVideo: (durationSeconds) => {
-    const safeDuration = Number.isFinite(durationSeconds) ? Math.max(0.1, durationSeconds) : 10;
-    const schedule = timelineHandle?.getRenderSchedule();
-    if (schedule) {
-      const scheduleWithDuration = { ...schedule, durationSeconds: safeDuration };
-      requestBackendRender(scheduleWithDuration).catch((err) => {
-        console.warn('Backend render failed; falling back to in-browser render', err);
-        renderVideoCapture(safeDuration, { startAtZero: true, videoResolution: scheduleWithDuration.videoResolution });
-      });
-      return;
-    }
-    renderVideoCapture(safeDuration, { startAtZero: true });
-  },
-});
+if (useBasicTimeline) {
+  timelineHandle = initBasicTimelineDemo({
+    container: timelinePane,
+    bpm: modulationGlobals.bpm,
+    modulation,
+    onBpmChange: (bpm) => {
+      modulationGlobals.bpm = bpm;
+      modulation.setGlobalBpm(bpm);
+    },
+  });
+} else {
+  timelineHandle = initTimeline({
+    container: timelinePane,
+    bpm: modulationGlobals.bpm,
+    modulation,
+    onBpmChange: (bpm) => {
+      modulationGlobals.bpm = bpm;
+      modulation.setGlobalBpm(bpm);
+    },
+    onSaveProject: () => saveProject(),
+    onLoadProject: (project) => loadProject(project),
+    onRenderVideo: (durationSeconds) => {
+      const safeDuration = Number.isFinite(durationSeconds) ? Math.max(0.1, durationSeconds) : 10;
+      const schedule = timelineHandle?.getRenderSchedule();
+      if (schedule) {
+        const scheduleWithDuration = {
+          ...schedule,
+          durationSeconds: safeDuration,
+          videoFps: videoCaptureSettings.fps,
+        };
+        requestBackendRender(scheduleWithDuration).catch((err) => {
+          console.warn('Backend render failed; falling back to in-browser render', err);
+          renderVideoCapture(safeDuration, {
+            startAtZero: true,
+            videoResolution: scheduleWithDuration.videoResolution,
+            fps: videoCaptureSettings.fps,
+          });
+        });
+        return;
+      }
+      renderVideoCapture(safeDuration, { startAtZero: true, fps: videoCaptureSettings.fps });
+    },
+  });
+}
 
 function applyRenderSchedule(schedule: RenderSchedule) {
   if (schedule.settings) {
@@ -4920,6 +5133,7 @@ function applyRenderSchedule(schedule: RenderSchedule) {
       startAtZero: true,
       filenameBase,
       videoResolution: schedule.videoResolution,
+      fps: schedule.videoFps ?? videoCaptureSettings.fps,
     });
   },
 };

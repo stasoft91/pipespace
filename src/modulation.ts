@@ -69,8 +69,7 @@ type HeldTargetState = {
    */
   baseValue: number;
   /**
-   * Last value applied while a segment was active. When the segment ends, this
-   * value is committed into the base so the parameter holds the last modulated value.
+   * Last value applied while a segment was active. Kept for continuity/debugging.
    */
   lastApplied: number;
 };
@@ -258,11 +257,10 @@ export class ModulationManager {
       }
     }
 
-    // If a target was held previously but is no longer driven now, commit the last driven value
-    // into the base so the parameter "sticks" after the segment ends.
-    for (const [targetId, hold] of this.heldTargets) {
+    // If a target was held previously but is no longer driven now, release the hold
+    // so base values stay stable across playback/project loads.
+    for (const targetId of this.heldTargets.keys()) {
       if (!activeTargets.has(targetId)) {
-        this.baseValues.set(targetId, hold.lastApplied);
         this.heldTargets.delete(targetId);
       }
     }

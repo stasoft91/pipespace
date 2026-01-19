@@ -1,7 +1,7 @@
 import http from 'node:http';
 import path from 'node:path';
-import { mkdirSync } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { mkdirSync, createWriteStream } from 'node:fs';
+import { stat, open } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { spawn } from 'node:child_process';
 import puppeteer from 'puppeteer';
@@ -68,20 +68,16 @@ const waitForStableFile = async (filePath, timeoutMs) => {
   throw new Error(`Timed out waiting for file: ${filePath}`);
 };
 
-const convertIvfToMp4 = async (ivfPath, base) => {
-  const mp4Path = path.join(path.dirname(ivfPath), `${base}.mp4`);
-  console.log(`[render:${base}] Converting IVF to MP4: ${ivfPath} -> ${mp4Path}`);
+const convertIvfToWebm = async (ivfPath, base) => {
+  const webmPath = path.join(path.dirname(ivfPath), `${base}.webm`);
+  console.log(`[render:${base}] Converting IVF to WebM: ${ivfPath} -> ${webmPath}`);
 
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn('ffmpeg', [
       '-y',
       '-i', ivfPath,
-      '-c:v', 'libx264',
-      '-preset', 'medium',
-      '-crf', '23',
-      '-pix_fmt', 'yuv420p',
-      '-movflags', '+faststart',
-      mp4Path
+      '-c:v', 'copy',
+      webmPath
     ]);
 
     let stderr = '';
@@ -91,8 +87,8 @@ const convertIvfToMp4 = async (ivfPath, base) => {
 
     ffmpeg.on('close', (code) => {
       if (code === 0) {
-        console.log(`[render:${base}] MP4 conversion successful: ${mp4Path}`);
-        resolve(mp4Path);
+        console.log(`[render:${base}] WebM conversion successful: ${webmPath}`);
+        resolve(webmPath);
       } else {
         console.error(`[render:${base}] FFmpeg conversion failed with code ${code}`);
         console.error(stderr);
@@ -141,6 +137,8 @@ async function runRenderJob({ schedule, outputBase, appUrl }) {
 
   try {
     const page = await browser.newPage();
+    let ivfPath = null;
+    let ivfStream = null;
     page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
     page.setDefaultTimeout(NAV_TIMEOUT_MS);
     page.on('console', (msg) => {
@@ -153,11 +151,118 @@ async function runRenderJob({ schedule, outputBase, appUrl }) {
     const client = await page.target().createCDPSession();
     await client.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: RENDER_DIR });
 
+    await page.exposeFunction('__pipesIvfBegin', async (meta) => {
+      const safeBase = sanitizeBase(meta?.base || base);
+      ivfPath = path.join(RENDER_DIR, `${safeBase}.ivf`);
+      ivfStream = createWriteStream(ivfPath);
+      await new Promise((resolve, reject) => {
+        ivfStream.once('open', resolve);
+        ivfStream.once('error', reject);
+      });
+      return true;
+    });
+
+    const toBuffer = (data) => {
+      if (Buffer.isBuffer(data)) return data;
+      if (data instanceof ArrayBuffer) return Buffer.from(data);
+      if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+      if (data && typeof data === 'object' && data.buffer) {
+        const buf = data.buffer;
+        if (Buffer.isBuffer(buf)) {
+          const offset = Number(data.byteOffset) || 0;
+          const length = Number(data.byteLength) || buf.length - offset;
+          return Buffer.from(buf).subarray(offset, offset + length);
+        }
+        if (buf instanceof ArrayBuffer) {
+          const offset = Number(data.byteOffset) || 0;
+          const length = Number(data.byteLength) || buf.byteLength - offset;
+          return Buffer.from(buf, offset, length);
+        }
+        if (ArrayBuffer.isView(buf)) {
+          return Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+        }
+        if (buf && Array.isArray(buf.data)) {
+          const offset = Number(data.byteOffset) || 0;
+          const length = Number(data.byteLength) || buf.data.length - offset;
+          return Buffer.from(buf.data).subarray(offset, offset + length);
+        }
+      }
+      if (data && data.type === 'Buffer' && Array.isArray(data.data)) return Buffer.from(data.data);
+      if (data && data.data && data.data.type === 'Buffer' && Array.isArray(data.data.data)) {
+        return Buffer.from(data.data.data);
+      }
+      if (Array.isArray(data)) return Buffer.from(data);
+      if (data && typeof data.length === 'number') return Buffer.from(Array.from(data));
+      if (data && typeof data.byteLength === 'number') {
+        const len = Math.max(0, Math.floor(data.byteLength));
+        const arr = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+          const v = data[i];
+          arr[i] = typeof v === 'number' ? v : 0;
+        }
+        return Buffer.from(arr.buffer);
+      }
+      if (data && typeof data === 'object') {
+        const numericKeys = Object.keys(data).filter((k) => /^\d+$/.test(k));
+        if (numericKeys.length) {
+          numericKeys.sort((a, b) => Number(a) - Number(b));
+          const arr = new Uint8Array(numericKeys.length);
+          for (let i = 0; i < numericKeys.length; i++) {
+            arr[i] = Number(data[numericKeys[i]]) || 0;
+          }
+          return Buffer.from(arr.buffer);
+        }
+        console.error('[render] Unsupported IVF chunk payload', {
+          keys: Object.keys(data),
+          ctor: data?.constructor?.name,
+          bufferCtor: data?.buffer?.constructor?.name,
+        });
+      }
+      throw new Error('Unsupported IVF chunk type');
+    };
+
+    await page.exposeFunction('__pipesIvfWrite', async (data) => {
+      if (!ivfStream) throw new Error('IVF stream not initialized');
+      const buffer = toBuffer(data);
+      await new Promise((resolve, reject) => {
+        ivfStream.write(buffer, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      return true;
+    });
+
+    await page.exposeFunction('__pipesIvfEnd', async (frameCount) => {
+      if (!ivfStream || !ivfPath) return false;
+      await new Promise((resolve, reject) => {
+        ivfStream.end((err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      ivfStream = null;
+      const fd = await open(ivfPath, 'r+');
+      const buf = Buffer.alloc(4);
+      buf.writeUInt32LE(Number(frameCount) || 0, 0);
+      await fd.write(buf, 0, 4, 24);
+      await fd.close();
+      return true;
+    });
+
     const nav = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
     if (nav && !nav.ok()) {
       throw new Error(`Navigation failed: ${nav.status()} ${nav.statusText()}`);
     }
     await page.waitForFunction(() => window.__pipesBackend?.ready === true, { timeout: NAV_TIMEOUT_MS });
+
+    await page.evaluate(() => {
+      window.__pipesIvfWriter = {
+        begin: window.__pipesIvfBegin,
+        write: window.__pipesIvfWrite,
+        end: window.__pipesIvfEnd,
+      };
+    });
 
     await page.evaluate(() => {
       const timeline = document.getElementById('timeline-pane');
@@ -179,23 +284,22 @@ async function runRenderJob({ schedule, outputBase, appUrl }) {
     );
 
     const timeoutMs = 60 * 60 * 1000;
-    const outPath = await Promise.any([
+    let outPath = await Promise.any([
       waitForStableFile(expectedIvf, timeoutMs).then(() => expectedIvf),
       waitForStableFile(expectedWebm, timeoutMs).then(() => expectedWebm),
     ]);
 
-    console.log(`[render:${base}] Done: ${outPath}`);
-
-    // Automatically convert IVF files to MP4
+    // Automatically convert IVF files to WebM
     if (outPath.endsWith('.ivf')) {
       try {
-        await convertIvfToMp4(outPath, base);
+        outPath = await convertIvfToWebm(outPath, base);
       } catch (err) {
-        console.error(`[render:${base}] Failed to convert IVF to MP4:`, err);
+        console.error(`[render:${base}] Failed to convert IVF to WebM:`, err);
         // Don't fail the entire job if conversion fails
       }
     }
 
+    console.log(`[render:${base}] Done: ${outPath}`);
     return outPath;
   } finally {
     await browser.close();

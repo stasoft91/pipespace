@@ -70,6 +70,7 @@ const FRAGMENT_SHADER = /* glsl */ `
   uniform float fogDensity;
   uniform mat4 invModelMatrix;
   uniform mat4 modelMatrixWorld;
+  uniform mat4 projectionMatrix;
   uniform vec3 edgeColor;
   uniform float edgeStrength;
   uniform float roomHalfSize;
@@ -253,6 +254,10 @@ const FRAGMENT_SHADER = /* glsl */ `
     float edgeGlow = 1.0 - smoothstep(0.0, edgeFalloff, wallDist);
     col += edgeColor * edgeStrength * edgeGlow;
 
+    vec4 clipPos = projectionMatrix * viewMatrix * vec4(worldPos, 1.0);
+    float ndcDepth = clipPos.z / clipPos.w;
+    gl_FragDepth = ndcDepth * 0.5 + 0.5;
+
     gl_FragColor = vec4(col, 1.0);
     #include <tonemapping_fragment>
     #include <colorspace_fragment>
@@ -290,6 +295,7 @@ export function createJuliaBulbVisual(layer: number, initialRoomSize: number): J
       },
       vertexShader: VERTEX_SHADER,
       fragmentShader: FRAGMENT_SHADER,
+      extensions: { fragDepth: true },
     });
     material.side = BackSide;
     material.toneMapped = true;

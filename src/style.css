@@ -457,6 +457,26 @@ body {
   min-height: 0;
 }
 
+.basic-timeline-view {
+  flex: 1 1 auto;
+  min-height: 160px;
+  position: relative;
+  margin: 6px;
+  border: 1px dashed rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  background: rgba(10, 16, 26, 0.5);
+  overflow: hidden;
+}
+
+.basic-timeline-axis {
+  position: absolute;
+  top: 6px;
+  left: 8px;
+  font-size: 10px;
+  opacity: 0.65;
+  pointer-events: none;
+}
+
 .peaks-overview {
   flex: 0 0 64px;
   height: 64px;
